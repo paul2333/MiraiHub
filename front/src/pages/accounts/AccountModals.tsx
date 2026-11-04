@@ -1,5 +1,5 @@
-import { Alert, App as AntdApp, Button, Checkbox, Input, InputNumber, Modal, Segmented, Space, Spin, Table, Tag, Typography, Upload } from 'antd'
-import { useEffect, useState } from 'react'
+import { Alert, App as AntdApp, Button, Checkbox, Input, InputNumber, Modal, Progress, Segmented, Space, Spin, Table, Tag, Typography, Upload } from 'antd'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../../api/client'
 import { downloadText, exportName } from '../../utils/download'
 import { copyText } from '../../utils/clipboard'
@@ -59,7 +59,28 @@ export function ManualAddModal({ open, onClose, onDone }: { open: boolean; onClo
   )
 }
 
-/** 批量导入：文本粘贴 + 文件上传（前端解析 JSON/JSONL；storage 缺省为 WorkBuddy） */
+/** 导入进度状态（分批提交的实时视图） */
+interface ImportProgress {
+  total: number
+  done: number
+  added: number
+  updated: number
+  failed: number
+  errors: string[]
+  running: boolean
+  cancelled: boolean
+}
+
+const mmss = (sec: number) =>
+  sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`
+
+/**
+ * 批量导入：文本粘贴 + 文件上传（前端解析 JSON/JSONL；storage 缺省为 WorkBuddy）。
+ *
+ * **分批提交**：账号多时一条大请求会跑几分钟（后端逐条做真实上游验证），
+ * 中途零反馈像假死、超时还会整单报错。这里把条目切片逐批 POST，
+ * 进度条实时汇报、可中途取消（已导入的不回滚），失败明细留在弹窗里。
+ */
 export function ImportModal({
   open,
   onClose,
@@ -76,7 +97,17 @@ export function ImportModal({
 }) {
   const { message } = AntdApp.useApp()
   const [text, setText] = useState('')
-  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState<ImportProgress | null>(null)
+  const [elapsed, setElapsed] = useState(0)
+  const cancelRef = useRef(false)
+  const runningRef = useRef(false)
+
+  // 运行中每秒跳一次已耗时
+  useEffect(() => {
+    if (!progress?.running) return
+    const timer = window.setInterval(() => setElapsed((s) => s + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [progress?.running])
 
   /**
    * 解析导入内容为批量条目 `{name?, payload}`。
@@ -115,33 +146,81 @@ export function ImportModal({
       message.warning('没有可导入的账号')
       return
     }
-    const isWb = storage === 'workbuddy'
-    const body = {
-      items: items.map((it) => {
-        const named = it.name !== undefined ? { name: it.name } : {}
-        return isWb
-          ? { ...named, auth_json: typeof it.payload === 'string' ? it.payload : JSON.stringify(it.payload) }
-          : { ...named, credential: it.payload }
-      }),
+    if (runningRef.current) {
+      message.warning('已有导入任务在进行中，请先等待完成或取消')
+      return
     }
-    setBusy(true)
-    try {
-      const r = await api<{ added?: number; updated?: number; errors?: unknown[] }>(
-        isWb ? '/api/accounts/batch' : `/api/${storage}/batch${realm ? `?realm=${encodeURIComponent(realm)}` : ''}`,
-        {
-          method: 'POST',
-          body,
-          timeout: 120000,
-        })
-      message.success(`导入完成：新增 ${fmtInt(r.added ?? 0)}，更新 ${fmtInt(r.updated ?? 0)}${r.errors?.length ? `，失败 ${r.errors.length}` : ''}`)
+    const isWb = storage === 'workbuddy'
+    const endpoint = isWb
+      ? '/api/accounts/batch'
+      : `/api/${storage}/batch${realm ? `?realm=${encodeURIComponent(realm)}` : ''}`
+    // WorkBuddy 逐条真实验证较慢，批切小一点
+    const batchSize = isWb ? 5 : 10
+    const pack = (it: { name?: string; payload: unknown }) => {
+      const named = it.name !== undefined ? { name: it.name } : {}
+      return isWb
+        ? { ...named, auth_json: typeof it.payload === 'string' ? it.payload : JSON.stringify(it.payload) }
+        : { ...named, credential: it.payload }
+    }
+
+    cancelRef.current = false
+    runningRef.current = true
+    setElapsed(0)
+    setProgress({ total: items.length, done: 0, added: 0, updated: 0, failed: 0, errors: [], running: true, cancelled: false })
+    const acc = { added: 0, updated: 0, failed: 0, errors: [] as string[] }
+    let cancelled = false
+
+    for (let start = 0; start < items.length; start += batchSize) {
+      if (cancelRef.current) {
+        cancelled = true
+        break
+      }
+      const slice = items.slice(start, start + batchSize)
+      try {
+        const r = await api<{ added?: number; updated?: number; errors?: { index?: number; error?: string }[] }>(
+          endpoint,
+          { method: 'POST', body: { items: slice.map(pack) }, timeout: 180000 },
+        )
+        acc.added += r.added ?? 0
+        acc.updated += r.updated ?? 0
+        for (const e of r.errors ?? []) {
+          acc.failed += 1
+          const no = start + (typeof e.index === 'number' ? e.index : 0) + 1
+          acc.errors.push(`第 ${no} 条：${e.error || '未知错误'}`)
+        }
+      } catch (e) {
+        // 单批失败不拖垮整批：记入失败明细，继续下一批
+        acc.failed += slice.length
+        acc.errors.push(`第 ${start + 1}-${start + slice.length} 条提交失败：${(e as Error).message || '网络错误'}`)
+      }
+      setProgress((p) =>
+        p
+          ? {
+              ...p,
+              done: Math.min(start + batchSize, items.length),
+              added: acc.added,
+              updated: acc.updated,
+              failed: acc.failed,
+              errors: [...acc.errors],
+            }
+          : p,
+      )
+    }
+
+    runningRef.current = false
+    setProgress((p) => (p ? { ...p, running: false, cancelled } : p))
+    if (!acc.errors.length) {
+      message.success(
+        cancelled
+          ? `已取消导入：完成 ${fmtInt(acc.added + acc.updated)} / ${fmtInt(items.length)}`
+          : `导入完成：新增 ${fmtInt(acc.added)}，更新 ${fmtInt(acc.updated)}`,
+      )
       setText('')
+      setProgress(null)
       onDone?.()
       onClose()
-    } catch (e) {
-      message.error((e as Error).message || '导入失败')
-    } finally {
-      setBusy(false)
     }
+    // 有失败明细：弹窗留在「结果视图」，由用户看完手动关闭（见 finishClose）
   }
 
   const submitText = async () => {
@@ -152,32 +231,142 @@ export function ImportModal({
     }
   }
 
+  /** 结果视图的关闭：清状态 + 通知刷新 */
+  const finishClose = () => {
+    setProgress(null)
+    setText('')
+    onDone?.()
+    onClose()
+  }
+
+  /** 运行中点右上角 ×：等价于「取消」——当前批次跑完即停，已导入的保留 */
+  const handleCancel = () => {
+    if (progress?.running) {
+      cancelRef.current = true
+      return
+    }
+    onClose()
+  }
+
+  const percent = progress ? Math.round((progress.done / Math.max(progress.total, 1)) * 100) : 0
+
   return (
-    <Modal title="导入账号" open={open} onCancel={onClose} footer={null} width={680}>
-      <Space orientation="vertical" size={12} style={{ width: '100%' }}>
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          支持粘贴 JSON 数组或 JSONL（每行一个完整登录态对象）。
-        </Typography.Text>
-        <Input.TextArea rows={8} placeholder='{"id": "...", "tokens": {...}}' value={text} onChange={(e) => setText(e.target.value)} />
-        <Space>
-          <Button type="primary" loading={busy} onClick={() => void submitText()}>
-            导入文本
-          </Button>
-          <Upload
-            showUploadList={false}
-            multiple
-            beforeUpload={(file) => {
-              void file
-                .text()
-                .then((t) => submit(parseItems(t)))
-                .catch(() => message.error(`${file.name} 解析失败`))
-              return false
-            }}
-          >
-            <Button>从文件导入（可多选）</Button>
-          </Upload>
+    <Modal
+      title="导入账号"
+      open={open}
+      onCancel={handleCancel}
+      footer={null}
+      width={680}
+      maskClosable={false}
+      closable={!progress?.running}
+    >
+      {progress ? (
+        /* ---- 进度 / 结果视图 ---- */
+        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Progress
+            percent={percent}
+            status={progress.running ? 'active' : progress.failed ? 'exception' : 'success'}
+          />
+          <Space wrap size={16}>
+            <Typography.Text>
+              已导入 <span className="num">{fmtInt(progress.done)}</span> / {fmtInt(progress.total)}
+            </Typography.Text>
+            <Typography.Text type="secondary">
+              新增 {fmtInt(progress.added)} · 更新 {fmtInt(progress.updated)}
+              {progress.failed > 0 && (
+                <Typography.Text type="danger"> · 失败 {fmtInt(progress.failed)}</Typography.Text>
+              )}
+            </Typography.Text>
+            <Typography.Text type="secondary" className="num">
+              已耗时 {mmss(elapsed)}
+            </Typography.Text>
+          </Space>
+          {progress.running ? (
+            <Space align="center">
+              <Spin size="small" />
+              <Typography.Text type="secondary">正在验证上游登录态，请勿关闭页面…</Typography.Text>
+              <Button
+                danger
+                size="small"
+                onClick={() => {
+                  cancelRef.current = true
+                }}
+              >
+                取消导入
+              </Button>
+            </Space>
+          ) : (
+            <>
+              {progress.cancelled && (
+                <Alert type="warning" showIcon message="已取消：当前批次完成后停止，已导入的账号保留" />
+              )}
+              {progress.errors.length > 0 && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message={`${progress.errors.length} 条失败（其余已入库）`}
+                  description={
+                    <div style={{ maxHeight: 160, overflow: 'auto' }}>
+                      {progress.errors.slice(0, 50).map((e, i) => (
+                        <Typography.Paragraph key={i} style={{ margin: 0, fontSize: 12 }}>
+                          {e}
+                        </Typography.Paragraph>
+                      ))}
+                      {progress.errors.length > 50 && (
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          …其余 {progress.errors.length - 50} 条略
+                        </Typography.Text>
+                      )}
+                    </div>
+                  }
+                />
+              )}
+              <Space>
+                <Button type="primary" onClick={finishClose}>
+                  完成
+                </Button>
+                {progress.errors.length > 0 && (
+                  <Button
+                    onClick={() =>
+                      void copyText(progress.errors.join('\n')).then((ok) =>
+                        ok ? message.success('已复制失败明细') : message.error('复制失败'),
+                      )
+                    }
+                  >
+                    复制失败明细
+                  </Button>
+                )}
+              </Space>
+            </>
+          )}
         </Space>
-      </Space>
+      ) : (
+        /* ---- 录入视图 ---- */
+        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            支持粘贴 JSON 数组或 JSONL（每行一个完整登录态对象）。账号多时会分批提交并显示进度。
+          </Typography.Text>
+          <Input.TextArea rows={8} placeholder='{"id": "...", "tokens": {...}}' value={text} onChange={(e) => setText(e.target.value)} />
+          <Space>
+            <Button type="primary" onClick={() => void submitText()}>
+              导入文本
+            </Button>
+            <Upload
+              showUploadList={false}
+              multiple
+              beforeUpload={(file) => {
+                void file
+                  .text()
+                  .then((t) => submit(parseItems(t)))
+                  .catch(() => message.error(`${file.name} 解析失败`))
+                return false
+              }}
+            >
+              <Button>从文件导入（可多选）</Button>
+            </Upload>
+          </Space>
+        </Space>
+      )}
     </Modal>
   )
 }
