@@ -3,6 +3,7 @@ import { LockOutlined } from '@ant-design/icons'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
+import { usePlatform } from '../context/PlatformContext'
 import PageHeader from '../components/PageHeader'
 
 interface RuntimeField {
@@ -22,6 +23,7 @@ interface RuntimeField {
 
 export default function SettingsPage() {
   const { message, modal } = AntdApp.useApp()
+  const { localFeatures } = usePlatform()
   const navigate = useNavigate()
   const [fields, setFields] = useState<RuntimeField[]>([])
   const [group, setGroup] = useState('')
@@ -202,14 +204,16 @@ export default function SettingsPage() {
             </Button>
           </Card>
         </Col>
-        <Col xs={24} md={12}>
-          <Card size="small" style={{ height: '100%' }} title="逆向产物工具">
-            <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-              客户端拆包、产物检索与注册凭证管理等开发工具已归入 <Tag>调试 → 逆向产物</Tag>。
-            </Typography.Paragraph>
-            <Button onClick={() => navigate('/app-source')}>打开逆向产物</Button>
-          </Card>
-        </Col>
+        {localFeatures && (
+          <Col xs={24} md={12}>
+            <Card size="small" style={{ height: '100%' }} title="逆向产物工具">
+              <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+                客户端拆包、产物检索与注册凭证管理等开发工具已归入 <Tag>调试 → 逆向产物</Tag>。
+              </Typography.Paragraph>
+              <Button onClick={() => navigate('/app-source')}>打开逆向产物</Button>
+            </Card>
+          </Col>
+        )}
       </Row>
       <Modal
         title="修改登录密码"

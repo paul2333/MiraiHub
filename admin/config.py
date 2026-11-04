@@ -104,6 +104,14 @@ class Settings:
     #: 本地排障要看文档时设 `ADMIN_ENABLE_DOCS=1`。
     ENABLE_DOCS = os.getenv("ADMIN_ENABLE_DOCS", "0") == "1"
 
+    #: 本机客户端相关功能（逆向产物 / 扫描本机 / 导入本机）的总开关。
+    #:
+    #: 服务器 / 容器部署没有本机客户端，这些入口点进去只会是空结果；
+    #: 默认**开启**是为桌面本机部署保持开箱即用。服务器部署设
+    #: `ADMIN_LOCAL_CLIENT_FEATURES=0`（或在「设置」面板里关闭），
+    #: 控制台随即隐藏这些入口。
+    LOCAL_CLIENT_FEATURES = os.getenv("ADMIN_LOCAL_CLIENT_FEATURES", "1") == "1"
+
     # /v1/messages（Anthropic Messages API）的模型档次映射。
     # Claude Code 发的是 claude-opus-* / claude-sonnet-* / claude-haiku-* 这类名字，
     # 上游不认；这里按档次落到本后台白名单里的模型名。

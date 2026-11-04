@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from admin.db import get_db
+from admin.platform import transfer
 from admin.platform.loomy.services import accounts as loomy_accounts
 from admin.platform.loomy.services import scan as loomy_scan
 from admin.security import require_admin
@@ -83,6 +84,42 @@ def import_account(body: ImportIn, _: bool = Depends(require_admin),
         return loomy_accounts.import_record(db, body.credential)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc)) from exc
+
+
+class BatchIn(BaseModel):
+    #: 每条 `{"credential": {...}}`（或直接凭证对象 / auth_json 字符串）。
+    items: list[object] = []
+
+
+@router.post("/batch")
+def batch_import(body: BatchIn, realm: str = "", _: bool = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    """批量导入凭证（与 WorkBuddy 账号池的批量导入对齐）。"""
+    target = _realm_or_400(realm) or "cn"
+
+    def _one(record: dict) -> bool:
+        payload = dict(record)
+        payload.setdefault("realm", target)
+        existed = transfer.existed_uid(db, "loomy", payload)
+        loomy_accounts.import_record(db, payload)
+        return not existed
+
+    return transfer.batch_import(db, body.items, _one)
+
+
+class ExportIn(BaseModel):
+    ids: list[int] = []
+    include_disabled: bool = False
+
+
+@router.post("/export")
+def export_accounts(body: ExportIn, realm: str = "",
+                    _: bool = Depends(require_admin),
+                    db: Session = Depends(get_db)):
+    """导出账号凭证（JSONL 就绪），可再原样导回 `/batch`。"""
+    return transfer.export_accounts(db, "loomy", _realm_or_400(realm),
+                                    ids=body.ids or None,
+                                    include_disabled=body.include_disabled)
 
 
 @router.get("/accounts")

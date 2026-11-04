@@ -28,7 +28,7 @@ const ACTION_LABELS: Record<string, { label: string; icon: React.ReactNode; tip?
 /** 平台动作按钮区（能力由 /api/platforms 的 spec.actions 声明） */
 export default function PlatformActionsBar({ spec, onChanged }: { spec?: PlatformSpec; onChanged?: () => void }) {
   const { message, modal } = AntdApp.useApp()
-  const { current, refreshCounts } = usePlatform()
+  const { current, refreshCounts, localFeatures } = usePlatform()
   const [busy, setBusy] = useState('')
   const [authOpen, setAuthOpen] = useState(false)
   const [cookieOpen, setCookieOpen] = useState(false)
@@ -40,7 +40,18 @@ export default function PlatformActionsBar({ spec, onChanged }: { spec?: Platfor
   const realm = current.realm || undefined
   const actions = spec.actions || []
 
-  const run = async (name: string, fn: () => Promise<unknown>) => {
+/** 从结果对象推断动态列（只取基本类型字段，对象字段 JSON 序列化展示） */
+const dynCols = (row: Record<string, unknown>) =>
+  Object.keys(row ?? {})
+    .slice(0, 8)
+    .map((k) => ({
+      title: k,
+      dataIndex: k,
+      ellipsis: true,
+      render: (v: unknown) => (typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '—')),
+    }))
+
+const run = async (name: string, fn: () => Promise<unknown>) => {
     setBusy(name)
     try {
       await fn()
@@ -54,17 +65,35 @@ export default function PlatformActionsBar({ spec, onChanged }: { spec?: Platfor
   const doScan = () =>
     run('scan', async () => {
       const r = await platformScanLocal(storage, realm)
-      const found = Number((r as Record<string, number>).found ?? (r as Record<string, unknown>).count ?? 0)
-      modal.info({
-        title: '扫描完成',
-        content: (
-          <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>
-            {typeof r === 'object' ? JSON.stringify(r, null, 2).slice(0, 2000) : String(r)}
-          </Typography.Paragraph>
-        ),
-        width: 640,
-      })
-      void found
+      const o = r as Record<string, unknown>
+      const accounts = Array.isArray(o.accounts) ? (o.accounts as Record<string, unknown>[]) : []
+      const found = Number(o.found ?? o.count ?? accounts.length ?? 0)
+      if (accounts.length) {
+        // 扫描结果表格化：账号 / 区域 / 状态一目了然，不再糊一屏 JSON
+        modal.info({
+          title: `扫描完成：发现 ${found} 个本机登录态`,
+          width: 680,
+          content: (
+            <Table
+              size="small"
+              rowKey={(_, i) => String(i)}
+              dataSource={accounts.slice(0, 100)}
+              pagination={{ pageSize: 8 }}
+              columns={dynCols(accounts[0])}
+            />
+          ),
+        })
+      } else {
+        modal.info({
+          title: '扫描完成',
+          content: (
+            <Typography.Text type="secondary">
+              {typeof o.summary === 'string' && o.summary ? o.summary : `未发现本机登录态（${storage.toUpperCase()}）`}
+            </Typography.Text>
+          ),
+          width: 560,
+        })
+      }
     })
 
   const doImport = () =>
@@ -102,7 +131,44 @@ export default function PlatformActionsBar({ spec, onChanged }: { spec?: Platfor
   const doCheckin = () =>
     run('checkin', async () => {
       const r = await platformCheckin(storage, realm)
-      modal.info({ title: '签到完成', content: <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>{JSON.stringify(r, null, 2).slice(0, 1500)}</Typography.Paragraph>, width: 560 })
+      const o = r as Record<string, unknown>
+      // 平台没有签到接口：把原因讲清楚，而不是糊一段 JSON
+      if (o.supported === false) {
+        modal.info({
+          title: '签到',
+          content: (
+            <Typography.Text type="secondary">
+              {String(o.summary || '该平台没有签到接口')}
+            </Typography.Text>
+          ),
+          width: 520,
+        })
+        return
+      }
+      const items = (Array.isArray(o.items) ? o.items : Array.isArray(o.results) ? o.results : []) as Record<string, unknown>[]
+      const okN = Number(o.ok ?? o.granted ?? 0)
+      const failN = Number(o.failed ?? 0)
+      const line = typeof o.summary === 'string' && o.summary
+        ? o.summary
+        : `成功 ${okN}，失败 ${failN}${o.already ? `，已领过 ${Number(o.already)}` : ''}`
+      modal.info({
+        title: '签到完成',
+        width: 680,
+        content: (
+          <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+            <Typography.Text>{line}</Typography.Text>
+            {items.length > 0 && (
+              <Table
+                size="small"
+                rowKey={(_, i) => String(i)}
+                dataSource={items.slice(0, 100)}
+                pagination={{ pageSize: 8 }}
+                columns={dynCols(items[0])}
+              />
+            )}
+          </Space>
+        ),
+      })
     })
 
   const doUsage = () => {
@@ -126,7 +192,10 @@ export default function PlatformActionsBar({ spec, onChanged }: { spec?: Platfor
 
   return (
     <Space wrap size={8}>
-      {(storage === 'workbuddy' ? [...actions, 'growth'] : actions).map((a) => {
+      {(storage === 'workbuddy' ? [...actions, 'growth'] : actions)
+        // 本机客户端功能关闭：扫描/导入入口随之隐藏（服务器部署没有本机客户端）
+        .filter((a) => localFeatures || (a !== 'scan' && a !== 'import'))
+        .map((a) => {
         const meta = ACTION_LABELS[a]
         if (!meta) return null
         return (

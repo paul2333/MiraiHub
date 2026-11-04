@@ -79,6 +79,8 @@ CATALOG: list[Field] = [
     Field("LOGIN_LOCK_SECONDS", "锁定时长（秒）", G_AUTH, "int", "", 60, None, 60),
     Field("TRUSTED_PROXY_IPS", "可信代理 IP 列表", G_AUTH, "str", "逗号分隔；仅这些直连对端的 X-Real-IP/XFF 被采信"),
     Field("ENABLE_DOCS", "开放 API 文档", G_AUTH, "bool", "/docs /openapi.json；安全审计建议保持关闭"),
+    Field("LOCAL_CLIENT_FEATURES", "本机客户端功能", G_AUTH, "bool",
+          "逆向产物 / 扫描本机 / 导入本机等依赖本机客户端的入口；服务器部署关闭后控制台隐藏"),
     # ---- Anthropic ----
     Field("ANTHROPIC_DESENSITIZE", "harness 脱敏", G_ANTH, "bool", "关闭后 Claude Code 的合规声明词大概率被上游整条拒绝"),
     Field("ANTHROPIC_NO_COMPACT", "只脱敏不压缩", G_ANTH, "bool", "保留 system 原文，误拦风险略高"),

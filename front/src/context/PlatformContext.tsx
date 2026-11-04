@@ -12,6 +12,8 @@ import { useAuth } from './AuthContext'
 
 interface PlatformCtx {
   platforms: PlatformSpec[]
+  /** 本机客户端功能总开关（后台「设置」可控）：关闭时隐藏逆向产物 / 扫描本机 / 导入本机 */
+  localFeatures: boolean
   current: PlatformRoute
   /** 当前平台路由值（header 值），平台切换后变化 → 各页面依赖它重拉 */
   platformKey: string
@@ -30,6 +32,7 @@ const Ctx = createContext<PlatformCtx | null>(null)
 export function PlatformProvider({ children }: { children: ReactNode }) {
   const { authed } = useAuth()
   const [platforms, setPlatforms] = useState<PlatformSpec[]>([])
+  const [localFeatures, setLocalFeatures] = useState(true)
   const [current, setCurrent] = useState<PlatformRoute>(() => getPlatformState())
   const [loading, setLoading] = useState(false)
   const [handler, setHandler] = useState<((action: string) => void) | null>(null)
@@ -39,6 +42,7 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
     try {
       const resp = await listPlatforms()
       setPlatforms(resp?.items ?? [])
+      setLocalFeatures(resp?.local_client_features !== false)
       // 当前平台若已不存在（如切换部署），回落到第一个平台
       const cur = getPlatformState()
       if (resp?.items?.length && !resp.items.some((p) => p.id === cur.platform)) {
@@ -78,6 +82,7 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
   const value = useMemo<PlatformCtx>(
     () => ({
       platforms,
+      localFeatures,
       current,
       platformKey: getPlatformRoute(),
       loading,
@@ -87,7 +92,7 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
       requestAction,
       setActionHandler: setHandler,
     }),
-    [platforms, current, loading, reload, select, requestAction],
+    [platforms, localFeatures, current, loading, reload, select, requestAction],
   )
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }

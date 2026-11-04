@@ -136,7 +136,7 @@ export default function ConsoleLayout() {
     mq.addEventListener('change', onChange)
     return () => mq.removeEventListener('change', onChange)
   }, [])
-  const { platforms, current, select, loading } = usePlatform()
+  const { platforms, localFeatures, current, select, loading } = usePlatform()
 
   const currentSpec = platforms.find((p) => p.id === current.platform)
   const realmOptions = useMemo(() => {
@@ -176,12 +176,17 @@ export default function ConsoleLayout() {
 
   const menuItems = useMemo(
     () =>
-      [...(androidShell ? [ANDROID_NAV] : []), ...NAV_GROUPS].map((g) => ({
-        type: 'group' as const,
-        label: g.label,
-        children: g.children.map((it) => ({ key: it.key, icon: it.icon, label: it.label })),
-      })),
-    [androidShell],
+      [...(androidShell ? [ANDROID_NAV] : []), ...NAV_GROUPS]
+        .map((g) => ({
+          type: 'group' as const,
+          label: g.label,
+          // 本机客户端功能关闭时隐藏「逆向产物」等依赖本机客户端的入口
+          children: g.children
+            .filter((it) => it.key !== 'app-source' || localFeatures)
+            .map((it) => ({ key: it.key, icon: it.icon, label: it.label })),
+        }))
+        .filter((g) => g.children.length > 0),
+    [androidShell, localFeatures],
   )
 
 

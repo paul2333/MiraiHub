@@ -30,7 +30,7 @@ export interface PlatformOverviewCard {
 }
 
 export function listPlatforms() {
-  return api<{ items: PlatformSpec[] }>('/api/platforms', { skipPlatform: true })
+  return api<{ items: PlatformSpec[]; local_client_features?: boolean }>('/api/platforms', { skipPlatform: true })
 }
 
 export function platformOverview(id: string) {

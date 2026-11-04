@@ -70,3 +70,18 @@ body {
     padding: 10px !important;
   }
 }
+
+/* ===== 主题切换过渡（View Transitions，参考 antd 官网做法） ===== */
+/* 关闭默认 crossfade：新旧快照默认的淡入淡出正是「组件闪一下」的来源，改由 JS 圆形扩散接管 */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+/* 新快照盖在旧快照之上，clip-path 从点击处圆形展开 */
+::view-transition-old(root) {
+  z-index: 1;
+}
+::view-transition-new(root) {
+  z-index: 9999;
+}

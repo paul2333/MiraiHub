@@ -3,7 +3,6 @@ import {
   Avatar,
   Button,
   Card,
-  Checkbox,
   Col,
   Collapse,
   Dropdown,
@@ -72,7 +71,7 @@ export default function AccountsPage() {
 
 function WorkbuddyAccounts({ spec }: { spec: ReturnType<typeof usePlatform>['platforms'][number] | undefined }) {
   const { message, modal } = AntdApp.useApp()
-  const { platformKey, refreshCounts } = usePlatform()
+  const { platformKey, refreshCounts, localFeatures } = usePlatform()
   const { run: runJob } = useJob()
   const [items, setItems] = useState<WbAccount[]>([])
   const [summary, setSummary] = useState<WbSummary | null>(null)
@@ -361,7 +360,7 @@ function WorkbuddyAccounts({ spec }: { spec: ReturnType<typeof usePlatform>['pla
             <Button icon={<UploadOutlined />} onClick={() => setImportOpen(true)}>
               导入
             </Button>
-            {!isAndroid() && (
+            {!isAndroid() && localFeatures && (
               <Button icon={<ScanOutlined />} onClick={() => void scanLocal()}>
                 扫描本机
               </Button>
@@ -393,6 +392,8 @@ function WorkbuddyAccounts({ spec }: { spec: ReturnType<typeof usePlatform>['pla
             <Button icon={<ReloadOutlined />} onClick={() => void refreshAll()}>
               刷新全部余额
             </Button>
+            {/* 平台动作（授权/扫描/签到等）移到页头上方，不再压在表格下面 */}
+            {spec && <PlatformActionsBar spec={spec} onChanged={() => void load()} />}
           </Space>
         }
       />
@@ -571,7 +572,6 @@ function WorkbuddyAccounts({ spec }: { spec: ReturnType<typeof usePlatform>['pla
       <RequestUsageModal account={usageAcc} onClose={() => setUsageAcc(null)} />
       <HealthCheckModal result={healthResult} onClose={() => setHealthResult(null)} />
       <ModelPoolModal open={poolOpen} model={poolModel} onModelChange={setPoolModel} onClose={() => setPoolOpen(false)} />
-      {spec && <PlatformActionsBar spec={spec} onChanged={() => void load()} />}
     </Space>
   )
 }
@@ -657,15 +657,15 @@ function ModelPoolModal({
 
 function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatform>['platforms'][number] | undefined; storage: string }) {
   const { message } = AntdApp.useApp()
-  const { current, refreshCounts } = usePlatform()
+  const { current, refreshCounts, localFeatures } = usePlatform()
   const [items, setItems] = useState<GenericAccount[]>([])
   const [summary, setSummary] = useState<Record<string, number> | null>(null)
   const [loading, setLoading] = useState(false)
   const [realm, setRealm] = useState<string>(current.realm || '')
   const [authOpen, setAuthOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
-  const [pasteOpen, setPasteOpen] = useState(false)
-  const [pasteText, setPasteText] = useState('')
+  const [importLocalOpen, setImportLocalOpen] = useState(false)
+  const [exportOpen, setExportOpen] = useState(false)
   const [testResult, setTestResult] = useState<{ name: string; stages: Record<string, unknown> } | null>(null)
 
   const load = useCallback(async () => {
@@ -745,29 +745,6 @@ function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatfor
     }
   }
 
-  const submitPaste = async () => {
-    let credential: unknown
-    try {
-      credential = JSON.parse(pasteText)
-    } catch {
-      message.warning('凭证 JSON 解析失败')
-      return
-    }
-    try {
-      const r = await api<{ added?: number; updated?: number }>(`/api/${storage}/import`, {
-        method: 'POST',
-        body: { credential, realm },
-      })
-      message.success(`导入完成：新增 ${fmtInt(r.added)}，更新 ${fmtInt(r.updated)}`)
-      setPasteOpen(false)
-      setPasteText('')
-      void load()
-      void refreshCounts()
-    } catch (e) {
-      message.error((e as Error).message || '导入失败')
-    }
-  }
-
   const realmTabs = spec?.realms?.length
     ? [
         { label: '全部', value: '' },
@@ -816,19 +793,22 @@ function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatfor
                 授权接入
               </Button>
             )}
-            {(spec?.actions ?? []).includes('import') && (
-              <>
-                <Button icon={<CloudUploadOutlined />} onClick={() => setImportOpen(true)}>
-                  导入本机
-                </Button>
-                <Button icon={<UploadOutlined />} onClick={() => setPasteOpen(true)}>
-                  粘贴凭证
-                </Button>
-              </>
+            <Button icon={<UploadOutlined />} onClick={() => setImportOpen(true)}>
+              导入
+            </Button>
+            {(spec?.actions ?? []).includes('import') && localFeatures && (
+              <Button icon={<CloudUploadOutlined />} onClick={() => setImportLocalOpen(true)}>
+                导入本机
+              </Button>
             )}
+            <Button icon={<ExportOutlined />} onClick={() => setExportOpen(true)}>
+              导出
+            </Button>
             <Button icon={<ReloadOutlined />} onClick={() => void refreshAll()}>
               刷新全部额度
             </Button>
+            {/* 平台动作（授权/扫描/签到等）移到页头上方，不再压在表格下面 */}
+            {spec && <PlatformActionsBar spec={spec} onChanged={() => void load()} />}
           </Space>
         }
       />
@@ -900,8 +880,6 @@ function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatfor
         />
       </Card>
 
-      {spec && <PlatformActionsBar spec={spec} onChanged={() => void load()} />}
-
       <DeviceAuthModal
         open={authOpen}
         storage={storage}
@@ -909,22 +887,9 @@ function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatfor
         onClose={() => setAuthOpen(false)}
         onDone={() => void load()}
       />
-      <Modal
-        title="粘贴凭证导入"
-        open={pasteOpen}
-        onCancel={() => setPasteOpen(false)}
-        onOk={() => void submitPaste()}
-        okText="导入"
-        width={640}
-      >
-        <Space orientation="vertical" size={8} style={{ width: '100%' }}>
-          <Checkbox checked disabled>
-            导入到当前区域：{realm || '默认'}
-          </Checkbox>
-          <Input.TextArea rows={8} placeholder='粘贴凭证 JSON（单对象或数组）' value={pasteText} onChange={(e) => setPasteText(e.target.value)} />
-        </Space>
-      </Modal>
-      <ImportLocalModal open={importOpen} storage={storage} onClose={() => setImportOpen(false)} onDone={() => void load()} />
+      <ImportModal open={importOpen} storage={storage} realm={realm || undefined} onClose={() => setImportOpen(false)} onDone={() => { void load(); void refreshCounts() }} />
+      <ExportModal open={exportOpen} storage={storage} realm={realm || undefined} onClose={() => setExportOpen(false)} />
+      <ImportLocalModal open={importLocalOpen} storage={storage} onClose={() => setImportLocalOpen(false)} onDone={() => { void load(); void refreshCounts() }} />
       <Modal
         title={`检测结果：${testResult?.name ?? ''}`}
         open={!!testResult}

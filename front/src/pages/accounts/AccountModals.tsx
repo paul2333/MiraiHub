@@ -59,30 +59,45 @@ export function ManualAddModal({ open, onClose, onDone }: { open: boolean; onClo
   )
 }
 
-/** 批量导入：文本粘贴 + 文件上传（前端解析 JSON/JSONL） */
-export function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => void; onDone?: () => void }) {
+/** 批量导入：文本粘贴 + 文件上传（前端解析 JSON/JSONL；storage 缺省为 WorkBuddy） */
+export function ImportModal({
+  open,
+  onClose,
+  onDone,
+  storage = 'workbuddy',
+  realm,
+}: {
+  open: boolean
+  onClose: () => void
+  onDone?: () => void
+  /** 平台 storage id：workbuddy 走 /api/accounts/batch，其余走 /api/{storage}/batch */
+  storage?: string
+  realm?: string
+}) {
   const { message } = AntdApp.useApp()
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
 
   /**
-   * 解析导入内容为批量条目。后端 AccountIn.auth_json 是 **字符串**（JSON 文本），
-   * 因此所有凭证对象都要 JSON.stringify 后再提交。
+   * 解析导入内容为批量条目 `{name?, payload}`。
+   * payload 保持**原始形态**（对象或字符串），由 submit 按平台打包：
+   * WorkBuddy 的 auth_json 要求字符串；其它平台 /batch 直接收凭证对象。
    */
-  const parseItems = (raw: string): { name?: string; auth_json: string }[] => {
-    const items: { name?: string; auth_json: string }[] = []
-    const asString = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v))
+  const parseItems = (raw: string): { name?: string; payload: unknown }[] => {
+    const items: { name?: string; payload: unknown }[] = []
     const trimmed = raw.replace(/^\uFEFF/, '').trim()
+    const push = (o: Record<string, unknown>) => {
+      if (o.auth_json !== undefined) {
+        items.push({ ...(o.name !== undefined ? { name: o.name as string } : {}), payload: o.auth_json })
+      } else {
+        items.push({ payload: o })
+      }
+    }
     if (!trimmed) return items
     if (trimmed.startsWith('[')) {
       for (const it of JSON.parse(trimmed) as unknown[]) {
         if (!it || typeof it !== 'object') continue
-        const o = it as Record<string, unknown>
-        if (o.auth_json !== undefined) {
-          items.push({ ...(o.name !== undefined ? { name: o.name as string } : {}), auth_json: asString(o.auth_json) })
-        } else {
-          items.push({ auth_json: JSON.stringify(o) })
-        }
+        push(it as Record<string, unknown>)
       }
       return items
     }
@@ -90,29 +105,34 @@ export function ImportModal({ open, onClose, onDone }: { open: boolean; onClose:
       const t = line.trim()
       if (!t) continue
       const parsed = JSON.parse(t) as Record<string, unknown>
-      if (parsed && typeof parsed === 'object') {
-        if (parsed.auth_json !== undefined) {
-          items.push({ ...(parsed.name !== undefined ? { name: parsed.name as string } : {}), auth_json: asString(parsed.auth_json) })
-        } else {
-          items.push({ auth_json: JSON.stringify(parsed) })
-        }
-      }
+      if (parsed && typeof parsed === 'object') push(parsed)
     }
     return items
   }
 
-  const submit = async (items: { name?: string; auth_json: string }[]) => {
+  const submit = async (items: { name?: string; payload: unknown }[]) => {
     if (!items.length) {
       message.warning('没有可导入的账号')
       return
     }
+    const isWb = storage === 'workbuddy'
+    const body = {
+      items: items.map((it) => {
+        const named = it.name !== undefined ? { name: it.name } : {}
+        return isWb
+          ? { ...named, auth_json: typeof it.payload === 'string' ? it.payload : JSON.stringify(it.payload) }
+          : { ...named, credential: it.payload }
+      }),
+    }
     setBusy(true)
     try {
-      const r = await api<{ added?: number; updated?: number; errors?: unknown[] }>('/api/accounts/batch', {
-        method: 'POST',
-        body: { items },
-        timeout: 120000,
-      })
+      const r = await api<{ added?: number; updated?: number; errors?: unknown[] }>(
+        isWb ? '/api/accounts/batch' : `/api/${storage}/batch${realm ? `?realm=${encodeURIComponent(realm)}` : ''}`,
+        {
+          method: 'POST',
+          body,
+          timeout: 120000,
+        })
       message.success(`导入完成：新增 ${fmtInt(r.added ?? 0)}，更新 ${fmtInt(r.updated ?? 0)}${r.errors?.length ? `，失败 ${r.errors.length}` : ''}`)
       setText('')
       onDone?.()
@@ -162,15 +182,19 @@ export function ImportModal({ open, onClose, onDone }: { open: boolean; onClose:
   )
 }
 
-/** 批量导出：JSONL 下载或复制 */
+/** 批量导出：JSONL 下载或复制（storage 缺省为 WorkBuddy；其余平台走 /api/{storage}/export） */
 export function ExportModal({
   open,
   onClose,
   selectedIds,
+  storage = 'workbuddy',
+  realm,
 }: {
   open: boolean
   onClose: () => void
   selectedIds?: number[]
+  storage?: string
+  realm?: string
 }) {
   const { message } = AntdApp.useApp()
   const [format, setFormat] = useState<'client' | 'backup'>('client')
@@ -180,7 +204,9 @@ export function ExportModal({
   const doExport = async (copy: boolean) => {
     setBusy(true)
     try {
-      const r = await api<string>('/api/accounts/export', {
+      const isWb = storage === 'workbuddy'
+      const q = !isWb && realm ? `?realm=${encodeURIComponent(realm)}` : ''
+      const r = await api<{ items?: string[] }>(isWb ? '/api/accounts/export' : `/api/${storage}/export${q}`, {
         method: 'POST',
         body: {
           ids: selectedIds?.length ? selectedIds : undefined,
@@ -190,8 +216,9 @@ export function ExportModal({
         raw: false,
         timeout: 120000,
       })
-      const text = typeof r === 'string' ? r : JSON.stringify(r, null, 2)
-      const fname = exportName(`wb2api-accounts-${format}`, 'jsonl')
+      // items 是凭证 JSON 原文数组 → JSONL；兜底整体序列化
+      const text = Array.isArray(r?.items) ? (r.items as string[]).join('\n') : JSON.stringify(r, null, 2)
+      const fname = exportName(`${storage}-accounts-${format}`, 'jsonl')
       if (copy) {
         const ok = await copyText(text)
         if (ok) message.success('已复制到剪贴板')
@@ -211,14 +238,16 @@ export function ExportModal({
   return (
     <Modal title="导出账号" open={open} onCancel={onClose} footer={null} width={520}>
       <Space orientation="vertical" size={12} style={{ width: '100%' }}>
-        <Segmented
-          value={format}
-          onChange={(v) => setFormat(v as 'client' | 'backup')}
-          options={[
-            { label: '客户端格式（可再导入）', value: 'client' },
-            { label: '备份格式（含完整字段）', value: 'backup' },
-          ]}
-        />
+        {storage === 'workbuddy' && (
+          <Segmented
+            value={format}
+            onChange={(v) => setFormat(v as 'client' | 'backup')}
+            options={[
+              { label: '客户端格式（可再导入）', value: 'client' },
+              { label: '备份格式（含完整字段）', value: 'backup' },
+            ]}
+          />
+        )}
         <Checkbox checked={includeDisabled} onChange={(e) => setIncludeDisabled(e.target.checked)}>
           包含已停用账号
         </Checkbox>

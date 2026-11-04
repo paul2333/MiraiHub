@@ -63,13 +63,23 @@ def mask(value: str, keep: int = 4) -> str:
     return text[:keep] + "*" * min(8, len(text) - keep * 2) + text[-keep:]
 
 
+def _local_username() -> str:
+    """当前用户名（绝不抛异常；`os.getlogin()` 在服务/容器里没有 tty 会炸）。"""
+    import getpass
+
+    for name in ("USERNAME", "USER", "LOGNAME"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def user_hash() -> str:
     """`sha256(username)[:12]` —— 与客户端算法一致。"""
-    try:
-        username = os.environ.get("USERNAME") or os.getlogin()
-    except Exception:  # noqa: BLE001
-        username = ""
-    return hashlib.sha256(username.encode()).hexdigest()[:12]
+    return hashlib.sha256(_local_username().encode()).hexdigest()[:12]
 
 
 def config_root() -> pathlib.Path:

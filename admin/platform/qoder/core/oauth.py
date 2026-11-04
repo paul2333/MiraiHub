@@ -71,9 +71,30 @@ def machine_id_of_local() -> str:
     import os
     import platform
 
-    seed = "%s|%s" % (os.environ.get("USERNAME") or os.getlogin(),
-                      platform.node() or "")
+    seed = "%s|%s" % (_local_username(), platform.node() or "")
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
+
+
+def _local_username() -> str:
+    """当前用户名（**绝不抛异常**）。
+
+    为什么不能用 `os.getlogin()` 兜底：它读的是**控制终端**的登录名，
+    服务 / 守护进程 / 容器里没有控制终端，会直接抛
+    `OSError [Errno 25] Inappropriate ioctl for device` —— 表现为
+    「生成授权链接失败」。环境变量 + `getpass.getuser()`（内部同样
+    先查环境变量，再读 pwd 数据库）都不依赖 tty，任何部署形态都安全。
+    """
+    import getpass
+    import os
+
+    for name in ("USERNAME", "USER", "LOGNAME"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - 全环境都取不到时给稳定占位
+        return "unknown"
 
 
 class DeviceLogin:

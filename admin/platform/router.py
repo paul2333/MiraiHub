@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from admin.config import settings
 from admin.db import get_db
 from admin.models import Account, SystemSetting
 from admin.platform import registry
@@ -132,6 +133,10 @@ def list_platforms(_: bool = Depends(require_admin), db: Session = Depends(get_d
         "items": items,
         "default": registry.DEFAULT_PLATFORM,
         "loader": loader_status(),
+        # 本机客户端功能总开关（逆向产物 / 扫描本机 / 导入本机）。
+        # 服务器部署没有本机客户端，后台可一键隐藏这些入口。
+        "local_client_features": bool(
+            getattr(settings, "LOCAL_CLIENT_FEATURES", True)),
     }
 
 

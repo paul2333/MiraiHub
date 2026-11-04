@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from admin.db import get_db
 from admin.models import Account, AccountModelCooldown
+from admin.platform import transfer
 from admin.platform.registry import get as get_platform
 from admin.security import require_admin, clean_display_name
 from admin.platform.trae.core import catalog, client
@@ -941,6 +942,45 @@ def import_credential(body: ImportIn, _: bool = Depends(require_admin),
         except Exception as exc:  # noqa: BLE001
             errors.append({"error": str(exc)})
     return {"added": added, "updated": updated, "errors": errors}
+
+
+class BatchIn(BaseModel):
+    #: 每条 `{"credential": {...}}`（或直接凭证对象 / auth_json 字符串）。
+    items: list[object] = []
+
+
+@router.post("/batch")
+def batch_import(body: BatchIn, realm: str = "", _: bool = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    """批量导入凭证（与 WorkBuddy 账号池的批量导入对齐）。
+
+    接受导出备份的 JSONL 条目数组；单条失败不影响其它条目。
+    """
+    target = _realm_or_400(realm)
+
+    def _one(record: dict) -> bool:
+        payload = dict(record)
+        if target:
+            payload["realm"] = target
+        _account, created = trae_accounts.import_record(db, payload)
+        return created
+
+    return transfer.batch_import(db, body.items, _one)
+
+
+class ExportIn(BaseModel):
+    ids: list[int] = []
+    include_disabled: bool = False
+
+
+@router.post("/export")
+def export_accounts(body: ExportIn, realm: str = "",
+                    _: bool = Depends(require_admin),
+                    db: Session = Depends(get_db)):
+    """导出账号凭证（JSONL 就绪），可再原样导回 `/batch`。"""
+    return transfer.export_accounts(db, PLATFORM, _realm_or_400(realm),
+                                    ids=body.ids or None,
+                                    include_disabled=body.include_disabled)
 
 
 class PatchIn(BaseModel):
