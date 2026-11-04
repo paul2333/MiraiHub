@@ -246,7 +246,9 @@ function UsageDrawer({ storage, realm, open, onClose }: { storage: string; realm
     try {
       const r = await platformUsage(storage, realm)
       const o = r as Record<string, unknown>
-      const items = (o.items ?? o.rows ?? o.accounts ?? o.usage ?? []) as Record<string, unknown>[]
+      // loomy 形态：{ local: { items: [...] } }（上游无明细，用量为本网关账本）
+      const local = o.local as { items?: unknown[] } | undefined
+      const items = (o.items ?? o.rows ?? o.accounts ?? o.usage ?? local?.items ?? []) as Record<string, unknown>[]
       setRows(Array.isArray(items) ? items : [])
     } catch (e) {
       setErr((e as Error).message || '该平台暂不支持用量查询')

@@ -76,7 +76,8 @@ def install() -> None:
             # Loomy 凭证是明文 JSON —— 扫描即导入，用户零操作。
             # checkin 不作为手动动作暴露：每日签到由定时任务 loomy_checkin 完成，
             # 手动按钮只会让用户看到「没有签到接口」的误导提示。
-            "actions": ["scan", "import", "refresh-quota"],
+            # usage：上游无明细接口，用量明细展示本网关账本（按模型聚合）。
+            "actions": ["scan", "import", "refresh-quota", "usage"],
         },
         ))
         logger.debug("Loomy 平台已登记：%s", platform_id)
