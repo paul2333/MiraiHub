@@ -85,3 +85,43 @@ body {
 ::view-transition-new(root) {
   z-index: 9999;
 }
+
+/* ===== 登录页（左右分栏品牌区，布局参考 careercompass 登录页） ===== */
+/* 左侧品牌面板：渐变底 + 网格纹理 + 光斑（渐变色由组件按深浅模式注入） */
+.login-hero {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  width: 50%;
+  min-height: 100vh;
+  padding: 48px 56px;
+}
+.login-hero-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.07) 1px, transparent 1px);
+  background-size: 28px 28px;
+  pointer-events: none;
+}
+.login-hero-glow {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(72px);
+  pointer-events: none;
+}
+/* 移动端顶部 logo：宽屏隐藏，窄屏替代品牌区 */
+.login-mobile-logo {
+  display: none;
+}
+@media (max-width: 991px) {
+  .login-hero {
+    display: none;
+  }
+  .login-mobile-logo {
+    display: flex;
+  }
+}

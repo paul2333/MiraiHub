@@ -1,11 +1,10 @@
-import { App as AntdApp, Button, Input, Modal, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { App as AntdApp, Button, Input, Modal, Space, Table, Tooltip, Typography } from 'antd'
 import { CloudDownloadOutlined, KeyOutlined, ImportOutlined, LoginOutlined, PieChartOutlined, RocketOutlined, ScanOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useState } from 'react'
 import type { PlatformSpec } from '../api/platforms'
 import {
   platformCheckin,
   platformImportLocal,
-  platformRefreshAll,
   platformScanLocal,
   platformUsage,
   traeWebCookie,
@@ -105,29 +104,6 @@ const run = async (name: string, fn: () => Promise<unknown>) => {
       onChanged?.()
     })
 
-  const doRefresh = () =>
-    run('refresh-quota', async () => {
-      const r = await platformRefreshAll(storage, realm)
-      const o = r as { ok?: number; failed?: number; items?: { name: string; ok: boolean; error?: string }[] }
-      modal.info({
-        title: `额度刷新完成：成功 ${o.ok ?? 0}，失败 ${o.failed ?? 0}`,
-        width: 560,
-        content: (
-          <Table
-            size="small"
-            rowKey={(i) => String(i.name)}
-            dataSource={o.items ?? []}
-            pagination={{ pageSize: 8 }}
-            columns={[
-              { title: '账号', dataIndex: 'name' },
-              { title: '结果', dataIndex: 'ok', width: 80, render: (v) => (v ? <Tag color="success">成功</Tag> : <Tag color="error">失败</Tag>) },
-              { title: '原因', dataIndex: 'error', ellipsis: true },
-            ]}
-          />
-        ),
-      })
-    })
-
   const doCheckin = () =>
     run('checkin', async () => {
       const r = await platformCheckin(storage, realm)
@@ -195,6 +171,9 @@ const run = async (name: string, fn: () => Promise<unknown>) => {
       {(storage === 'workbuddy' ? [...actions, 'growth'] : actions)
         // 本机客户端功能关闭：扫描/导入入口随之隐藏（服务器部署没有本机客户端）
         .filter((a) => localFeatures || (a !== 'scan' && a !== 'import'))
+        // 「刷新额度」不在动作栏重复出按钮：各账号池页面已有自己的刷新入口
+        // （WorkBuddy 在「管理操作」菜单，通用平台在页头按钮）
+        .filter((a) => a !== 'refresh-quota')
         .map((a) => {
         const meta = ACTION_LABELS[a]
         if (!meta) return null
@@ -207,7 +186,6 @@ const run = async (name: string, fn: () => Promise<unknown>) => {
                 if (a === 'begin-auth') setAuthOpen(true)
                 else if (a === 'scan') void doScan()
                 else if (a === 'import') void doImport()
-                else if (a === 'refresh-quota') void doRefresh()
                 else if (a === 'checkin') void doCheckin()
                 else if (a === 'usage') doUsage()
                 else if (a === 'web-cookie') setCookieOpen(true)

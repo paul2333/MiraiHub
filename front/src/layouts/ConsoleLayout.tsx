@@ -14,13 +14,11 @@ import {
   MenuUnfoldOutlined,
   MinusOutlined,
   MobileOutlined,
-  MoonOutlined,
   CloseOutlined,
   RobotOutlined,
   SaveOutlined,
   SettingOutlined,
   SafetyOutlined,
-  SunOutlined,
   TagsOutlined,
   TeamOutlined,
   ToolOutlined,
@@ -31,9 +29,9 @@ import { App as AntdApp, Avatar, Button, Drawer, Dropdown, Flex, Layout, Menu, S
 import { useEffect, useMemo, useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import PlatformLogo from '../components/PlatformLogo'
+import ThemeToggle from '../components/ThemeToggle'
 import { usePlatform } from '../context/PlatformContext'
 import { useAuth } from '../context/AuthContext'
-import { useThemeMode } from '../context/ThemeContext'
 import { isAndroid, isDesktop, nativeWindowAction } from '../bridges/native'
 
 const { Sider, Header, Content } = Layout
@@ -118,7 +116,6 @@ export default function ConsoleLayout() {
   const navigate = useNavigate()
   const location = useLocation()
   const { logout } = useAuth()
-  const { mode, toggle } = useThemeMode()
   const { message } = AntdApp.useApp()
 
   const [collapsed, setCollapsed] = useState(false)
@@ -297,9 +294,8 @@ export default function ConsoleLayout() {
                   </Tooltip>
                 </>
               )}
-              <Tooltip title={mode === 'dark' ? '切换亮色' : '切换暗色'}>
-                <Button type="text" size="small" icon={mode === 'dark' ? <SunOutlined /> : <MoonOutlined />} onClick={toggle} />
-              </Tooltip>
+              {/* 主题组合按钮：浅色 / 深色 / 自适应（跟随系统） */}
+              <ThemeToggle />
               <Dropdown
                 menu={{
                   items: [{ key: 'logout', icon: <LogoutOutlined />, label: '退出登录' }],

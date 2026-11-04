@@ -17,6 +17,13 @@ export function fmtTimeFull(v?: string | null): string {
   return fmtTime(v, true)
 }
 
+/** Unix 时间戳（秒或毫秒自适应）→ 北京时间显示 */
+export function fmtEpoch(v?: number | null, withSeconds = false): string {
+  if (!v) return FMT_EMPTY
+  const ms = v < 1e12 ? v * 1000 : v
+  return dayjs(ms).utcOffset(8).format(withSeconds ? 'YYYY-MM-DD HH:mm:ss' : 'MM-DD HH:mm')
+}
+
 /** 北京时间「今日」零点（对应旧版 cnMidnight） */
 export function cnMidnight(): dayjs.Dayjs {
   return dayjs().utcOffset(8).startOf('day')

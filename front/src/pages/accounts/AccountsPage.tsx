@@ -1,4 +1,5 @@
 import {
+  Alert,
   App as AntdApp,
   Avatar,
   Button,
@@ -16,7 +17,6 @@ import {
   Spin,
   Statistic,
   Table,
-  Tabs,
   Tag,
   Tooltip,
   Typography,
@@ -26,7 +26,6 @@ import {
   ExportOutlined,
   LoginOutlined,
   MoreOutlined,
-  PlusOutlined,
   ReloadOutlined,
   ScanOutlined,
   SafetyCertificateOutlined,
@@ -47,14 +46,13 @@ import {
   ExportModal,
   HealthCheckModal,
   ImportModal,
-  ManualAddModal,
   ModelLimitsModal,
   ReauthModal,
   RequestUsageModal,
 } from './AccountModals'
 import type { GenericAccount, WbAccount, WbSummary } from './types'
 import { isAndroid } from '../../bridges/native'
-import { FMT_EMPTY, fmtCredit, fmtInt, fmtK, fmtTime, secondsAfter } from '../../utils/format'
+import { FMT_EMPTY, fmtCredit, fmtEpoch, fmtInt, fmtK, fmtTime, secondsAfter } from '../../utils/format'
 import { downloadResponse } from '../../utils/download'
 
 const PS = 20
@@ -63,8 +61,11 @@ export default function AccountsPage() {
   const { platforms, current } = usePlatform()
   const spec = platforms.find((p) => p.id === current.platform)
   const storage = (spec?.storage_platform || current.platform).toLowerCase()
-  if (storage === 'workbuddy') return <WorkbuddyAccounts spec={spec} />
-  return <GenericAccounts spec={spec} storage={storage} />
+  // key 按对外平台 id：trae-cn ↔ trae-intl、qoder ↔ qoder-intl 共用同一
+  // storage 实现，不加 key 时组件被复用，realm 等本地状态停在旧区域，
+  // 页面内容不更新（切不同产品没事，因为组件类型本来就变了）。
+  if (storage === 'workbuddy') return <WorkbuddyAccounts key={spec?.id ?? storage} spec={spec} />
+  return <GenericAccounts key={spec?.id ?? storage} spec={spec} storage={storage} />
 }
 
 /* ============================ WorkBuddy 账号池 ============================ */
@@ -84,7 +85,6 @@ function WorkbuddyAccounts({ spec }: { spec: ReturnType<typeof usePlatform>['pla
   const [reauthId, setReauthId] = useState<number | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
-  const [manualOpen, setManualOpen] = useState(false)
   const [limitsOpen, setLimitsOpen] = useState(false)
   const [concAcc, setConcAcc] = useState<WbAccount | null>(null)
   const [creditAcc, setCreditAcc] = useState<WbAccount | null>(null)
@@ -368,20 +368,19 @@ function WorkbuddyAccounts({ spec }: { spec: ReturnType<typeof usePlatform>['pla
             <Button icon={<ExportOutlined />} onClick={() => setExportOpen(true)}>
               导出
             </Button>
-            <Button icon={<PlusOutlined />} onClick={() => setManualOpen(true)}>
-              手动添加
-            </Button>
             <Dropdown
               menu={{
                 items: [
                   { key: 'health', icon: <SafetyCertificateOutlined />, label: '一键健康检查' },
                   { key: 'limits', icon: <ThunderboltOutlined />, label: '模型额度与冷却' },
+                  { key: 'refresh', icon: <ReloadOutlined />, label: '刷新全部额度' },
                   { key: 'growth', icon: <span>🌱</span>, label: '成长任务（全部）' },
                   { key: 'travel', icon: <span>🐈</span>, label: '猫猫旅行（全部）' },
                 ],
                 onClick: ({ key }) => {
                   if (key === 'health') void healthAll()
                   else if (key === 'limits') setLimitsOpen(true)
+                  else if (key === 'refresh') void refreshAll()
                   else if (key === 'growth') void growthBatch()
                   else if (key === 'travel') void catTravelBatch()
                 },
@@ -389,9 +388,6 @@ function WorkbuddyAccounts({ spec }: { spec: ReturnType<typeof usePlatform>['pla
             >
               <Button>管理操作 ▾</Button>
             </Dropdown>
-            <Button icon={<ReloadOutlined />} onClick={() => void refreshAll()}>
-              刷新全部余额
-            </Button>
             {/* 平台动作（授权/扫描/签到等）移到页头上方，不再压在表格下面 */}
             {spec && <PlatformActionsBar spec={spec} onChanged={() => void load()} />}
           </Space>
@@ -565,7 +561,6 @@ function WorkbuddyAccounts({ spec }: { spec: ReturnType<typeof usePlatform>['pla
       <ReauthModal account={items.find((a) => a.id === reauthId) ?? null} onClose={() => setReauthId(null)} onDone={() => void load()} />
       <ImportModal open={importOpen} onClose={() => setImportOpen(false)} onDone={() => void load()} />
       <ExportModal open={exportOpen} onClose={() => setExportOpen(false)} selectedIds={selectedIds} />
-      <ManualAddModal open={manualOpen} onClose={() => setManualOpen(false)} onDone={() => void load()} />
       <ModelLimitsModal open={limitsOpen} onClose={() => setLimitsOpen(false)} onDone={() => void load()} />
       <ConcurrencyModal account={concAcc} onClose={() => setConcAcc(null)} onDone={() => void load()} />
       <CreditDetailsModal account={creditAcc} onClose={() => setCreditAcc(null)} />
@@ -666,7 +661,7 @@ function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatfor
   const [importOpen, setImportOpen] = useState(false)
   const [importLocalOpen, setImportLocalOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
-  const [testResult, setTestResult] = useState<{ name: string; stages: Record<string, unknown> } | null>(null)
+  const [testResult, setTestResult] = useState<{ name: string; realm: string; stages: Record<string, Record<string, unknown>> } | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -704,7 +699,9 @@ function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatfor
     try {
       const r = await api<Record<string, unknown>>(`/api/${storage}/accounts/${a.id}/test`, { method: 'POST', body: {}, timeout: 180000 })
       message.success({ content: '检测完成', key: `t${a.id}` })
-      setTestResult({ name: a.name, stages: r })
+      // 响应形如 { realm, stages: { token/models/conversation/quota } }
+      const o = r as { realm?: string; stages?: Record<string, unknown> }
+      setTestResult({ name: a.name, realm: o.realm ?? '', stages: (o.stages ?? o) as Record<string, Record<string, unknown>> })
     } catch (e) {
       message.error({ content: (e as Error).message || '检测失败', key: `t${a.id}` })
     }
@@ -890,29 +887,7 @@ function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatfor
       <ImportModal open={importOpen} storage={storage} realm={realm || undefined} onClose={() => setImportOpen(false)} onDone={() => { void load(); void refreshCounts() }} />
       <ExportModal open={exportOpen} storage={storage} realm={realm || undefined} onClose={() => setExportOpen(false)} />
       <ImportLocalModal open={importLocalOpen} storage={storage} onClose={() => setImportLocalOpen(false)} onDone={() => { void load(); void refreshCounts() }} />
-      <Modal
-        title={`检测结果：${testResult?.name ?? ''}`}
-        open={!!testResult}
-        onCancel={() => setTestResult(null)}
-        footer={null}
-        width={640}
-      >
-        {testResult && (
-          <Tabs
-            items={Object.entries(testResult.stages)
-              .filter(([k]) => !['id', 'name', 'ok', 'error'].includes(k))
-              .map(([k, v]) => ({
-                key: k,
-                label: k,
-                children: (
-                  <Typography.Paragraph code style={{ whiteSpace: 'pre-wrap', fontSize: 12, marginBottom: 0 }}>
-                    {typeof v === 'string' ? v : JSON.stringify(v, null, 2)}
-                  </Typography.Paragraph>
-                ),
-              }))}
-          />
-        )}
-      </Modal>
+      <TestResultModal result={testResult} onClose={() => setTestResult(null)} />
     </Space>
   )
 }
@@ -949,6 +924,92 @@ function ImportLocalModal({ open, storage, onClose, onDone }: { open: boolean; s
       <Typography.Text>
         将读取本机 {storage.toUpperCase()} 客户端登录态并导入号池（先"扫描本机"可预览）。
       </Typography.Text>
+    </Modal>
+  )
+}
+
+/* ============================ 检测结果（阶段化人话展示） ============================ */
+
+const STAGE_LABELS: Record<string, string> = {
+  token: '令牌校验',
+  models: '模型目录',
+  conversation: '对话测试',
+  quota: '额度查询',
+  profile: '账号信息',
+  health: '健康检查',
+  usage: '用量接口',
+}
+
+/** 把单个阶段的返回翻译成用户能读的一句话；说不出细节时给「通过/失败」 */
+function stageDetail(key: string, v: Record<string, unknown>): string {
+  const parts: string[] = []
+  if (key === 'token' && v.expires_at) {
+    const ms = Number(v.expires_at) * 1000
+    if (Number.isFinite(ms) && ms > 0) parts.push(`令牌到期 ${fmtEpoch(Number(v.expires_at))}`)
+  }
+  if (key === 'quota' && v.ok) {
+    const num = (x: unknown) => (x === null || x === undefined || x === '' ? '—' : String(x))
+    parts.push(`剩余 ${num(v.remain)} / ${num(v.total)}${v.plan ? `（套餐 ${v.plan}）` : ''}`)
+  }
+  if (typeof v.status === 'number' && !v.ok) parts.push(`HTTP ${v.status}`)
+  if (v.code !== undefined && v.code !== null && !v.ok) parts.push(`错误码 ${String(v.code)}`)
+  const msg = (v.message || v.error || v.detail || v.summary) as string | undefined
+  if (typeof msg === 'string' && msg) parts.push(msg)
+  if (!parts.length) {
+    // 兜底：挑基本类型字段拼一句（不甩 JSON 给用户）
+    const extra = Object.entries(v)
+      .filter(([k, val]) => !['ok', 'id', 'name'].includes(k) && val !== null && val !== undefined && typeof val !== 'object')
+      .map(([k, val]) => `${k} ${String(val)}`)
+    if (extra.length) parts.push(extra.join('，'))
+  }
+  return parts.join('；') || (v.ok ? '通过' : '失败')
+}
+
+function TestResultModal({
+  result,
+  onClose,
+}: {
+  result: { name: string; realm: string; stages: Record<string, Record<string, unknown>> } | null
+  onClose: () => void
+}) {
+  const stages = Object.entries(result?.stages ?? {}).filter(
+    ([k]) => !['id', 'name', 'ok', 'error', 'realm'].includes(k),
+  )
+  const failed = stages.filter(([, v]) => !v?.ok).length
+  const summary = stages.length
+    ? failed
+      ? { type: 'error' as const, text: `共 ${stages.length} 项检查，${failed} 项未通过` }
+      : { type: 'success' as const, text: `全部通过（${stages.length} 项检查）` }
+    : null
+  return (
+    <Modal title={`检测结果：${result?.name ?? ''}`} open={!!result} onCancel={onClose} footer={null} width={640}>
+      {result?.realm && (
+        <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 12 }}>
+          区域：{result.realm}
+        </Typography.Text>
+      )}
+      <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+        {summary && <Alert type={summary.type} showIcon message={summary.text} />}
+        {stages.map(([k, v]) => {
+          const ok = !!v?.ok
+          return (
+            <Alert
+              key={k}
+              type={ok ? 'success' : 'error'}
+              showIcon
+              message={
+                <Space size={6}>
+                  <span>{STAGE_LABELS[k] ?? k}</span>
+                  <Tag color={ok ? 'success' : 'error'} style={{ marginInlineEnd: 0 }}>
+                    {ok ? '通过' : '未通过'}
+                  </Tag>
+                </Space>
+              }
+              description={stageDetail(k, v ?? {})}
+            />
+          )
+        })}
+      </Space>
     </Modal>
   )
 }
