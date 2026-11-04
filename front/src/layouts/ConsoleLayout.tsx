@@ -15,7 +15,6 @@ import {
   MinusOutlined,
   MobileOutlined,
   CloseOutlined,
-  RobotOutlined,
   SaveOutlined,
   SettingOutlined,
   SafetyOutlined,
@@ -95,10 +94,6 @@ const NAV_GROUPS: { label: string; children: NavItem[] }[] = [
       { key: 'sync', label: '同步设置', icon: <CloudUploadOutlined /> },
       { key: 'alerts', label: '预警管理', icon: <BellOutlined /> },
     ],
-  },
-  {
-    label: '智能体',
-    children: [{ key: 'agent', label: '创作台', icon: <RobotOutlined /> }],
   },
   {
     label: '系统',

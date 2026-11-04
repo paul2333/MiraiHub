@@ -1,5 +1,5 @@
 import { App as AntdApp, Alert, Button, Card, Checkbox, Col, Collapse, Form, Input, InputNumber, Modal, Popconfirm, Progress, Row, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
-import { PlusOutlined } from '@ant-design/icons'
+import { EyeOutlined, PlusOutlined } from '@ant-design/icons'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api/client'
 import { usePlatform } from '../context/PlatformContext'
@@ -300,7 +300,14 @@ export default function KeysPage() {
               render: (v: string) => (
                 <Space size={0}>
                   <Typography.Text code style={{ fontSize: 12 }}>{v}</Typography.Text>
-                  <Button type="text" size="small" onClick={() => void showFull(items.find((i) => i.masked === v)!)}>明文</Button>
+                  <Tooltip title="查看完整 Key">
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<EyeOutlined />}
+                      onClick={() => void showFull(items.find((i) => i.masked === v)!)}
+                    />
+                  </Tooltip>
                 </Space>
               ),
             },

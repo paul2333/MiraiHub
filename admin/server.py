@@ -34,7 +34,6 @@ from admin.routers import releases
 from admin.routers import audio
 from admin.routers import images
 from admin.routers import videos
-from admin.routers import agent as agent_router
 from admin.routers import mcp as mcp_router
 from admin.routers import growth_center
 from admin.routers import ip_management
@@ -237,7 +236,6 @@ app.include_router(images.router)
 app.include_router(videos.router)
 # 内置智能体（/api/agent，后台登录态）与 MCP 工具服务（/mcp，API Key 鉴权）。
 # 两者共用 admin/media_service.py 的生成与合并逻辑，只是出口协议不同。
-app.include_router(agent_router.router)
 app.include_router(mcp_router.router)
 app.include_router(sync.router)
 app.include_router(schedules.router)

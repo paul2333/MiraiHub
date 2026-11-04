@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import logging
 
 from admin.platform.gateway import AccountOps, ClientProbe, Gateway
@@ -33,28 +34,65 @@ class LoomyAccountOps:
     def __init__(self, realm: str = ""):
         self.realm = realm
 
-    def list(self, db):
-        """账号列表。
+    #: 后台刷新去重：页面连点/多标签页同时打开时只起一轮刷新
+    _refresh_lock = threading.Lock()
+    _refreshing: set = set()
 
-        **会同步 DB 列**：admin 的 `/api/accounts` 读的是列，
-        不写回会导致前端账号池显示旧数据。
+    @classmethod
+    def _spawn_refresh(cls, account_ids: list) -> None:
+        """后台线程逐个刷新过期配额（自带 DB 会话，不占用请求连接）。
+
+        之前 list() 在请求里**串行**探每个账号的上游（积分 + 模型数），
+        账号一多页面要等好几秒才出列表 —— 这就是「Loomy 账号池加载很慢」。
+        现在列表即时返回缓存快照，过期配额由后台刷新，前端 30s
+        自动刷新会把新值带出来。
         """
+
+        def _run() -> None:
+            from admin.db import SessionLocal
+            from admin.models import Account
+
+            session = SessionLocal()
+            try:
+                for aid in account_ids:
+                    account = session.get(Account, aid)
+                    if account is None:
+                        continue
+                    try:
+                        loomy_accounts.sync_quota(session, account)
+                        session.commit()
+                    except Exception:  # noqa: BLE001 - 单个账号失败不拖垮整轮
+                        session.rollback()
+            finally:
+                session.close()
+                with cls._refresh_lock:
+                    cls._refreshing.difference_update(account_ids)
+
+        threading.Thread(target=_run, daemon=True, name="loomy-quota-refresh").start()
+
+    def list(self, db):
+        """账号列表：**即时返回缓存快照**，过期配额交给后台线程刷新。
+
+        用 sync_quota（而不是 fetch_quota）作为后台刷新的实现 ——
+        前者**同时**拉积分余额与模型数（fetch_quota 只探模型，
+        用它会导致余额永远显示 0）。
+        """
+        accounts = loomy_accounts.accounts_for(db, self.realm)
+        stale = [a.id for a in accounts if not loomy_accounts.quota_is_fresh(a)]
+        if stale:
+            with self._refresh_lock:
+                todo = [i for i in stale if i not in self._refreshing]
+                self._refreshing.update(todo)
+            if todo:
+                self._spawn_refresh(todo)
         views = []
-        for account in loomy_accounts.accounts_for(db, self.realm):
-            quota = None
-            if not loomy_accounts.quota_is_fresh(account):
-                # 用 sync_quota 而不是 fetch_quota ——
-                # 前者**同时**拉积分余额与模型数（fetch_quota 只探模型，
-                # 用它会导致余额永远显示 0）
-                result = loomy_accounts.sync_quota(db, account)
-                if result.get("ok"):
-                    quota = result.get("quota")
-            else:
-                try:
-                    snap = json.loads(account.credits_snapshot or "{}")
-                except ValueError:
-                    snap = {}
-                quota = snap if isinstance(snap, dict) else None
+        for account in accounts:
+            # 缓存快照里同时有余额与模型数，直接展示（quota 标记不吹成 live）
+            try:
+                snap = json.loads(account.credits_snapshot or "{}")
+            except ValueError:
+                snap = {}
+            quota = snap if isinstance(snap, dict) and snap else None
             views.append(loomy_accounts.public_view(account, quota=quota))
         db.commit()
         return {"items": views, "summary": loomy_accounts.summarize(views)}

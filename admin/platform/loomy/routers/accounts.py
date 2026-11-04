@@ -163,6 +163,11 @@ def usage(realm: str = "", days: int = 30, _: bool = Depends(require_admin),
 @router.post("/checkin")
 def checkin(realm: str = "", _: bool = Depends(require_admin),
             db: Session = Depends(get_db)):
-    """Loomy 没有签到 —— 返回 `supported: False`（不是错误）。"""
-    return {"supported": False,
-            "summary": "Loomy 没有签到接口；额度按对话计量"}
+    """每日签到（POST /points/first-login，幂等；领当日 5000 积分）。
+
+    控制台不再放手动按钮（动作清单里已去掉 checkin），这个端点保留
+    给调度器/脚本用，与 platform_gateway 的 checkin() 同口径。
+    """
+    from admin.platform.loomy.services import checkin as loomy_checkin
+
+    return loomy_checkin.run_daily_checkin(db, None, _realm_or_400(realm))

@@ -74,8 +74,9 @@ def install() -> None:
             extra={
             "task_runners": list(_task_runners().keys()),
             # Loomy 凭证是明文 JSON —— 扫描即导入，用户零操作。
-            # checkin：每日签到领 5000 积分（POST /points/first-login，幂等）。
-            "actions": ["scan", "import", "refresh-quota", "checkin"],
+            # checkin 不作为手动动作暴露：每日签到由定时任务 loomy_checkin 完成，
+            # 手动按钮只会让用户看到「没有签到接口」的误导提示。
+            "actions": ["scan", "import", "refresh-quota"],
         },
         ))
         logger.debug("Loomy 平台已登记：%s", platform_id)

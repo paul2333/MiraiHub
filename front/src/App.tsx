@@ -28,7 +28,6 @@ const GroupsPage = lazy(() => import('./pages/GroupsPage'))
 const SchedulesPage = lazy(() => import('./pages/SchedulesPage'))
 const SyncPage = lazy(() => import('./pages/SyncPage'))
 const AlertsPage = lazy(() => import('./pages/AlertsPage'))
-const AgentPage = lazy(() => import('./pages/AgentPage'))
 const SettingsPage = lazy(() => import('./pages/SettingsPage'))
 const MaintenancePage = lazy(() => import('./pages/MaintenancePage'))
 const AppSourcePage = lazy(() => import('./pages/AppSourcePage'))
@@ -109,7 +108,6 @@ function AppRoutes() {
         <Route path="schedules" element={<SchedulesPage />} />
         <Route path="sync" element={<SyncPage />} />
         <Route path="alerts" element={<AlertsPage />} />
-        <Route path="agent" element={<AgentPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="maintenance" element={<MaintenancePage />} />
         <Route path="app-source" element={<AppSourcePage />} />

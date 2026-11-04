@@ -1504,6 +1504,10 @@ async def _speed_test_run(body, request, db):
     if not acc or not POOL.acquire(acc.uid or ""):
         raise HTTPException(503, "当前没有可检测账号（冷却或正在使用），稍后重试", headers={"Retry-After": "3"})
     from admin import upstream_http
+    # 上游发车队列（upstream_dispatch.before_send）要求每次上游发送都带
+    # 账号键，否则 503「上游账号尚未确定」。测速是「后台自己发起」的
+    # 上游调用，没有网关选号流程替它写这个键 —— 与 videos 轮询同款修复。
+    upstream_http.select_account(request.scope, acc)
     sess = None
     try:
         sess = await _blocking_call(backend.AccountSession, acc.auth_json, on_cancel=lambda session: session.close())

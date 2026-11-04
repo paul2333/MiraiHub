@@ -684,6 +684,14 @@ function GenericAccounts({ spec, storage }: { spec: ReturnType<typeof usePlatfor
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load])
 
+  // 30s 自动刷新（页面可见时）：Loomy 等平台的配额由后端后台线程刷新，靠它带出新值
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load()
+    }, 30000)
+    return () => window.clearInterval(timer)
+  }, [load])
+
   const refreshOne = async (a: GenericAccount, force = false) => {
     try {
       await api(`/api/${storage}/accounts/${a.id}/refresh${force ? '?force=true' : ''}`, { method: 'POST', body: {} })
