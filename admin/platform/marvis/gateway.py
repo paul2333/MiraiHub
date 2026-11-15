@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 
 from fastapi import Request
@@ -183,8 +184,13 @@ def _prepare_body(body: dict, slot: str) -> dict:
 #: `upstream_business` 整体也不在白名单 —— 唯一的例外是
 #: `RETRY_SAME_ACCOUNT_BIZ_CODES` 里的业务码，见下。
 RETRY_SAME_ACCOUNT_KINDS = frozenset({"network", "timeout"})
-#: 上游偶发 403 4100406「非法请求」：实测同号同分钟 200/403 交替（约 10%），
-#: 且事件循环阻塞修复后单次仅 ~5s ⇒ 同号重试一次可把失败率压到 ~1%。
+#: 上游偶发 403 4100406「非法请求」：实测同号同分钟 200/403 交替（约 5–10%），
+#: 且事件循环阻塞修复后单次仅 ~5s ⇒ 同号重试**两次**（最多 3 次尝试）把失败率
+#: 压到 ~0.1%（按每次 ~5–10% 独立概率估算：0.1³ = 0.1%、0.05³ ≈ 0.0125%）。
+#:
+#: 2026-11-16 线上反例：16:06:44.928 那条 403 elapsed 8869ms ≈ 两次尝试，
+#: 即「首发 + 1 次重试」都撞上随机拒绝。单次概率没变（同一时段 60 次连打 0 个
+#: 403），只是重试次数不够 —— 所以提到 2 次重试（3 次尝试）。
 #:
 #: 证据（2026-11-15 14:40–15:05，`request_audits` 21 行）：2 条 403
 #: （14:49:51 用时 5.3s、14:52:46 用时 5.5s）+ 19 条 200，同一 key
@@ -195,10 +201,14 @@ RETRY_SAME_ACCOUNT_KINDS = frozenset({"network", "timeout"})
 #: ⚠ 只放这一个码：4100403（登录态过期）是 `auth`、4100404（风控）是
 #: `risk_control`，都不在这里，也不会因为这条规则被重试。
 RETRY_SAME_ACCOUNT_BIZ_CODES = frozenset({"4100406"})
-#: 同号重试次数（不含首次）。
-SAME_ACCOUNT_RETRIES = 1
-#: 同号重试前的抖动退避（秒）。瞬时网络失败立刻重发常常还是失败。
+#: 同号重试次数（不含首次）。2 ⇒ 最多 3 次尝试。
+SAME_ACCOUNT_RETRIES = 2
+#: 同号重试的**基数**退避（秒）：实际等待 = 基数 × (index + 1) + 抖动，
+#: 即第 1 次重试 ~0.3s、第 2 次 ~0.6s（各再加 0–0.3s 随机抖动）。
+#: 递增是为了避开上游的短时抖动窗口；抖动是为了避免同频重发。
 SAME_ACCOUNT_RETRY_DELAY = 0.3
+#: 退避抖动上限（秒），与 `SAME_ACCOUNT_RETRY_DELAY` 一起构成递增 + 抖动退避。
+SAME_ACCOUNT_RETRY_JITTER = 0.3
 
 
 def _warn_upstream_failure(account, exc: client.UpstreamError, *,
@@ -223,7 +233,7 @@ def _warn_upstream_failure(account, exc: client.UpstreamError, *,
 
 async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                          stream: bool):
-    """调上游 —— **整个调用跑在工作线程里**，只对「瞬时」失败同号重试一次。
+    """调上游 —— **整个调用跑在工作线程里**，只对「瞬时」失败同号重试（最多 2 次）。
 
     ## 什么算「瞬时」
 
@@ -264,14 +274,22 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                 exc.kind == "upstream_business"
                 and any(code in str(exc.detail or "")
                         for code in RETRY_SAME_ACCOUNT_BIZ_CODES))
-            # 仍然**只重试一次**：`index + 1 > SAME_ACCOUNT_RETRIES` 是唯一
-            # 的一次性标记，没有第二个计数器。
+            # 上限仍然**只由这一个标记**决定（`index + 1 > SAME_ACCOUNT_RETRIES`），
+            # 没有第二个计数器：最多 1 + SAME_ACCOUNT_RETRIES = 3 次尝试。
             if index + 1 > SAME_ACCOUNT_RETRIES or not transient:
                 raise
+            # 递增 + 抖动退避：第 index 次尝试失败后等
+            # 基数 × (index + 1) + U(0, 抖动上限) 秒。
+            # 按每次 ~5–10% 独立概率估算，3 次尝试把失败率压到 ~0.1%
+            # （0.1³ = 0.1%，0.05³ ≈ 0.0125%）。
+            delay = (SAME_ACCOUNT_RETRY_DELAY * (index + 1)
+                     + random.uniform(0, SAME_ACCOUNT_RETRY_JITTER))
             logger.warning(
-                "Marvis 瞬时失败（kind=%s status=%s code=%s），同号重试一次 acc=%s",
-                exc.kind, exc.status or "-", exc.code or "-", account_id)
-            await asyncio.sleep(SAME_ACCOUNT_RETRY_DELAY)
+                "Marvis 瞬时失败（kind=%s status=%s code=%s），同号重试 "
+                "acc=%s 第 %s/%s 次重试，退避 %.2fs",
+                exc.kind, exc.status or "-", exc.code or "-", account_id,
+                index + 1, SAME_ACCOUNT_RETRIES, delay)
+            await asyncio.sleep(delay)
 
 
 async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
@@ -345,7 +363,7 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             exclude.add(account.id)
             # 参数类错误换号也没用，直接停。
             # 同号重试已经在 `_call_upstream` 里做过（白名单 kind + 4100406
-            # 业务码，且只一次），这里只负责「换号」—— 不做 `exclude.discard()`
+            # 业务码，最多 2 次），这里只负责「换号」—— 不做 `exclude.discard()`
             # 的伪重试。
             if exc.status in (400, 422) and exc.kind not in (
                     "auth", "rate_limit", "risk_control"):

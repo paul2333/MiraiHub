@@ -382,8 +382,11 @@ class EventLoopSafetyTests(unittest.TestCase):
         self.assertIn("4100406", gateway.RETRY_SAME_ACCOUNT_BIZ_CODES)
         for code in ("4100403", "4100404"):
             self.assertNotIn(code, gateway.RETRY_SAME_ACCOUNT_BIZ_CODES)
-        self.assertEqual(gateway.SAME_ACCOUNT_RETRIES, 1,
-                         "仍然只重试一次（复用原有的一次性标记）")
+        # 2026-11-16 由 1 提到 2：线上 16:06:44.928 那条 403 elapsed 8869ms
+        # ≈ 两次尝试都撞上随机拒绝（单次约 5–10%），1 次重试把失败率压到 ~1%
+        # 不够，3 次尝试可压到 ~0.1%。上限仍只由这一个常量控制。
+        self.assertEqual(gateway.SAME_ACCOUNT_RETRIES, 2,
+                         "最多 3 次尝试（1 次首发 + 2 次同号重试）")
 
 
 class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -397,11 +400,14 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
         self.mclient = mclient
         self._orig_open = mclient.open_chat_stream
         self._orig_delay = gateway.SAME_ACCOUNT_RETRY_DELAY
+        self._orig_jitter = gateway.SAME_ACCOUNT_RETRY_JITTER
         gateway.SAME_ACCOUNT_RETRY_DELAY = 0
+        gateway.SAME_ACCOUNT_RETRY_JITTER = 0
 
     def tearDown(self):
         self.mclient.open_chat_stream = self._orig_open
         self.gateway.SAME_ACCOUNT_RETRY_DELAY = self._orig_delay
+        self.gateway.SAME_ACCOUNT_RETRY_JITTER = self._orig_jitter
 
     async def test_transient_network_error_retries_same_account(self):
         calls = []
@@ -418,7 +424,7 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [7, 7], "必须是同一个账号重试")
 
     async def test_illegal_request_4100406_retries_same_account_once(self):
-        """4100406 是上游**偶发**拒绝（同号同分钟 200/403 交替）⇒ 同号重试一次。"""
+        """4100406 是上游**偶发**拒绝（同号同分钟 200/403 交替）⇒ 同号重试。"""
         calls = []
 
         def fake_open(data, realm, body, *, account_id=0):
@@ -434,10 +440,10 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
         self.mclient.open_chat_stream = fake_open
         got = await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
         self.assertEqual(got, "STREAM")
-        self.assertEqual(calls, [7, 7], "4100406 必须同号重试，且只重试一次")
+        self.assertEqual(calls, [7, 7], "4100406 必须同号重试（首发失败后重试成功）")
 
-    async def test_illegal_request_4100406_gives_up_after_one_retry(self):
-        """连撞两次 4100406 仍然要抛 —— 不许变成无限重试。"""
+    async def test_illegal_request_4100406_gives_up_after_two_retries(self):
+        """连撞三次 4100406 仍然要抛 —— 不许变成无限重试。"""
         calls = []
 
         def fake_open(data, realm, body, *, account_id=0):
@@ -450,7 +456,44 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
         self.mclient.open_chat_stream = fake_open
         with self.assertRaises(self.mclient.UpstreamError):
             await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
-        self.assertEqual(len(calls), 2, "只许重试一次（1 次首发 + 1 次重试）")
+        self.assertEqual(len(calls), 3, "只许重试两次（1 次首发 + 2 次重试）")
+
+    async def test_backoff_increases_and_jitters(self):
+        """退避 = 基数 × (index + 1) + U(0, 抖动)：递增且带抖动。
+
+        递增是为了避开上游短时抖动窗口；抖动是为了避免同频重发。
+        这里把 `asyncio.sleep` / `random.uniform` 换成记录器，只断言「喂给
+        sleep 的秒数」—— 不真的睡。
+        """
+        from unittest import mock
+
+        sleeps = []
+        calls = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            raise self.mclient.UpstreamError(
+                "模型网关失败（HTTP 403）", status=403, code="403",
+                kind="upstream_business",
+                detail='{"code":4100406,"msg":"非法请求"}')
+
+        self.mclient.open_chat_stream = fake_open
+        self.gateway.SAME_ACCOUNT_RETRY_DELAY = 0.3
+        self.gateway.SAME_ACCOUNT_RETRY_JITTER = 0.3
+        with mock.patch.object(self.gateway.asyncio, "sleep", fake_sleep), \
+                mock.patch.object(self.gateway.random, "uniform",
+                                  return_value=0.25):
+            with self.assertRaises(self.mclient.UpstreamError):
+                await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(sleeps), 2, "两次重试各退避一次")
+        self.assertAlmostEqual(sleeps[0], 0.3 * 1 + 0.25, places=6)
+        self.assertAlmostEqual(sleeps[1], 0.3 * 2 + 0.25, places=6)
+        self.assertLess(sleeps[0], sleeps[1], "退避必须递增")
 
     async def test_other_business_error_is_not_retried(self):
         """4100406 之外的业务拒绝仍然不重试（本次只放开这一个码）。"""
