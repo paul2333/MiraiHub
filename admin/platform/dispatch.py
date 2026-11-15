@@ -713,6 +713,16 @@ def _model_for_platform(db, storage: str, model: str) -> tuple[str, dict | None]
     if any(str(row.get("readable") or "").lower() == str(model or "").strip().lower()
            for row in (by_storage.get(storage) or [])):
         return model, None
+    # **槽位名 / 上游真名也要认**（2026-11-15）：别名还原会把 body 的 model
+    # 改写成上游槽位名（Marvis 的 `main-auto`），而 model_configs 存的是可读名
+    # （`deepseek-v4.1-flash`）。不做这次映射，4/5 个 marvis 模型会被自己的
+    # 改写结果判成「不存在于平台」而 404。
+    from admin.platform import models_router as _mr2
+    _readable_of = _mr2.readable_model_id(storage, model)
+    if _readable_of and any(
+            str(row.get('readable') or '').lower() == str(_readable_of).lower()
+            for row in (by_storage.get(storage) or [])):
+        return model, None
     owners: list[str] = []
     for row in by_key.get(alias) or []:
         if row["platform"] not in owners:

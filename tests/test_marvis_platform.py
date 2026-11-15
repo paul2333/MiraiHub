@@ -295,5 +295,70 @@ class GatewayGuardTests(unittest.TestCase):
         self.assertNotIn("stream_options", prepared)
 
 
+class DispatchModelForPlatformTests(unittest.TestCase):
+    """dispatch 的「这个模型属于该平台吗」校验（2026-11-15 线上 404 回归）。
+
+    别名还原会把 body 里的 model 改写成**上游槽位名**
+    （`deepseek-v4.1-flash-marvis` -> `main-auto`），而 `model_configs`
+    存的是**可读名**（`deepseek-v4.1-flash`）。校验时若只拿槽位名去比对
+    可读名清单，永远不中 —— 实测 4/5 个 marvis 模型被判成
+    `model_not_found` 而 404，只有本来就发可读名的那个能用。
+    """
+
+    MODELS = ("deepseek-v4.1-flash", "deepseek-v4-pro",
+              "deepseek-v4-flash", "hy3", "hunyuan-vision-2.0")
+
+    def setUp(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from admin.db import Base
+        from admin.models import ModelConfig
+        from admin.platform import dispatch
+
+        # 内存库 + 建全表：与 ImportTests 的写法一致（不依赖线上库）。
+        engine = create_engine("sqlite://")
+        Base.metadata.create_all(engine)
+        self._db = Session(engine)
+        self._dispatch = dispatch
+        self._db.add_all([
+            ModelConfig(platform="marvis", model_id=name, enabled=1,
+                        credit_multiplier=1.0, upstream_metadata="{}")
+            for name in self.MODELS
+        ])
+        self._db.commit()
+        # 目录缓存是模块级的，必须先清掉，否则会读到别的用例留下的快照。
+        dispatch.invalidate_model_cache()
+
+    def tearDown(self):
+        dispatch = getattr(self, "_dispatch", None)
+        if dispatch is not None:
+            dispatch.invalidate_model_cache()
+        db = getattr(self, "_db", None)
+        if db is not None:
+            db.close()
+
+    def test_slot_name_maps_back_to_readable_name(self):
+        """槽位名（别名还原的产物）要映射回可读名后放行，不能再 404。"""
+        model, error = self._dispatch._model_for_platform(
+            self._db, "marvis", "main-auto")
+        self.assertEqual(model, "main-auto")
+        self.assertIsNone(error, "槽位名 main-auto 应被放行，实际：%r" % (error,))
+        # 线上实测挂掉的另外三个槽位同样必须放行（不是只修 main-auto）
+        for slot in ("deepseek-v4-pro-external", "hy3-preview-agent",
+                     "hy3-preview-agent-real"):
+            mapped, err = self._dispatch._model_for_platform(
+                self._db, "marvis", slot)
+            self.assertEqual(mapped, slot)
+            self.assertIsNone(err, "槽位名 %s 应被放行，实际：%r" % (slot, err))
+
+    def test_unknown_model_is_still_rejected(self):
+        """真不存在的模型必须继续 404 —— 别把校验顺手改成「全放行」。"""
+        _, error = self._dispatch._model_for_platform(
+            self._db, "marvis", "no-such-model-xyz")
+        self.assertIsNotNone(error, "不存在的模型必须被拒")
+        self.assertEqual(error["code"], "model_not_found")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
