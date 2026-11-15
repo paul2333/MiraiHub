@@ -164,6 +164,7 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     model = str(body.get("model") or "")
     exclude: set[int] = set()
     last_error: client.UpstreamError | None = None
+    retried_same = False
     for _ in range(MAX_ATTEMPTS):
         # `min_balance=0` = 只要余额 > 0 的号。
         #
@@ -214,6 +215,13 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                 cool_seconds=(600 if exc.kind in ("auth", "risk_control") else 0))
             last_error = exc
             exclude.add(account.id)
+            # marvis 的 `/v1/chat/completions` 不签名（core/endpoints.py:15-19），
+            # 无业务码的 403 是上游瞬时拒绝（实测同号同分钟 5×200 + 2×403，4 秒后恢复）。
+            # 池里常常只有 1 个号，换号与冷却都救不了 ⇒ 同号再打一次（最多一次）。
+            if exc.kind == "signature_invalid" and not retried_same:
+                retried_same = True
+                exclude.discard(account.id)
+                continue
             # 参数类错误换号也没用，直接停
             if exc.status in (400, 422) and exc.kind not in (
                     "auth", "rate_limit", "risk_control"):
