@@ -47,6 +47,14 @@ logger = logging.getLogger("admin.platform.marvis.gateway")
 
 PUBLIC = endpoints.PLATFORM
 STORAGE = marvis_accounts.PLATFORM
+#: 一次请求最多尝试**几个账号**（不是上游调用次数）。
+#:
+#: 与「同号重试」是两层独立的上限（2026-11-16 解耦）：
+#:   · 同一个号内部：`_call_upstream` 最多 1 + SAME_ACCOUNT_RETRIES = 3 次；
+#:   · 账号之间：本常量 = 3 个号，每号最多 3 次 ⇒ 最坏 9 次上游调用。
+#: 以前这两层没有任何日志能区分：一个号把 3 次尝试全吃掉后请求就回 403，
+#: 看不出是「池里没别的号」还是「换号没发生」。现在换号显式化并留日志
+#: （`Marvis 换号重试` / `Marvis 换号终止`）。
 MAX_ATTEMPTS = 3
 
 PATHS = frozenset({
@@ -231,8 +239,41 @@ def _warn_upstream_failure(account, exc: client.UpstreamError, *,
         "1" if stream else "0", detail[:200])
 
 
+def _profile_of(body: dict) -> dict:
+    """请求形状画像 —— **只算数字，绝不复制内容**。
+
+    2026-11-16 线上：4100406 只在大请求（主代理那条 `You are a helpful AI
+    assistant…`）上偶发，同一时刻同一个号的小请求 200。要把「请求多大 /
+    几条消息 / 几个工具 / 系统提示多长」和成功失败对上，才可能定位触发条件。
+
+    这里算的字节数与 `client` 真正发出去的 JSON 完全一致
+    （`json.dumps(body, ensure_ascii=False).encode()`）。
+    """
+    messages = body.get("messages")
+    messages = messages if isinstance(messages, list) else []
+    tools = body.get("tools")
+    tools = tools if isinstance(tools, list) else []
+    sys_chars = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") not in ("system", "developer"):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            sys_chars += len(content)
+        else:
+            sys_chars += len(str(content or ""))
+    try:
+        size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    except Exception:  # noqa: BLE001 - 画像失败绝不能影响转发
+        size = 0
+    return {"bytes": size, "msgs": len(messages), "tools": len(tools),
+            "sys_chars": sys_chars, "max_tokens": body.get("max_tokens")}
+
+
 async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
-                         stream: bool):
+                         stream: bool, profile: dict | None = None):
     """调上游 —— **整个调用跑在工作线程里**，只对「瞬时」失败同号重试（最多 2 次）。
 
     ## 什么算「瞬时」
@@ -256,7 +297,27 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
     `select_account` 是「换号」语义。瞬时网络失败时换号毫无意义，还会白占
     一个租约；这里重试**复用同一个已租账号**（不 `exclude.discard`、不重新
     `select`），与「换号」严格分开。
+
+    换号由调用方 `_attempt` 负责：本函数把**同号重试耗尽**后照样抛，
+    `_attempt` 捕获后把该号加入 `exclude` 再选下一个号，并打一条
+    `Marvis 换号重试` 日志。2026-11-16 之前换号是**静默**的：线上只能看到
+    一个号连打 3 次后回 403，看不出到底有没有第二个号可换。
+
+    ## 请求画像（2026-11-16 加）
+
+    每次上游调用打一条 INFO：`bytes / msgs / tools / sys_chars / max_tokens`；
+    失败分支再打一条 `失败画像`，`_attempt` 成功时打 `成功画像`。
+    4100406 只在大请求上偶发、同一时刻小请求 200 ⇒ 必须把「请求形状」和
+    「成功 / 失败」放在一起比。**只记数字，绝不落 body 内容**（含用户对话）。
     """
+    if profile is None:
+        profile = _profile_of(body)
+    logger.info(
+        "Marvis 请求画像 acc=%s model=%s stream=%s bytes=%d msgs=%d tools=%d "
+        "sys_chars=%d max_tokens=%s",
+        account_id, body.get("model") or "-", int(bool(stream)),
+        profile["bytes"], profile["msgs"], profile["tools"],
+        profile["sys_chars"], profile["max_tokens"])
     for index in range(1 + SAME_ACCOUNT_RETRIES):
         try:
             if stream:
@@ -267,6 +328,13 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                 client.chat_completions, data, realm, body,
                 account_id=account_id)
         except client.UpstreamError as exc:
+            # 失败画像：与「成功画像」同列，按 bytes/msgs/tools 直接对比。
+            logger.info(
+                "Marvis 失败画像 kind=%s status=%s code=%s acc=%s bytes=%d "
+                "msgs=%d tools=%d sys_chars=%d attempt=%d/%d",
+                exc.kind, exc.status or "-", exc.code or "-", account_id,
+                profile["bytes"], profile["msgs"], profile["tools"],
+                profile["sys_chars"], index + 1, 1 + SAME_ACCOUNT_RETRIES)
             # 白名单 kind（网络抖动 / 瞬断）**或** 上游偶发业务码（4100406）。
             # 后者只在 kind 已经是 `upstream_business` 时才看 —— `auth` /
             # `risk_control` 即便 detail 里带了同一个码也不重试。
@@ -305,10 +373,31 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
 
     留在事件循环线程上，任何一次慢调用都是**全站**慢（见 `_call_upstream`
     的 63.5 秒事故）。所以这里一步都不留在循环上。
+
+    ## 两层重试（2026-11-16 解耦）
+
+    同一个号内部的重试在 `_call_upstream`（最多 1 + SAME_ACCOUNT_RETRIES = 3 次）；
+    本函数只负责**换号**：同号重试耗尽 ⇒ 该号进 `exclude` ⇒ 选下一个号，
+    最多 `MAX_ATTEMPTS` 个号。`auth`（4100403）不重试，直接冷却该号并换号；
+    400/422 换号也没用，直接抛。
+
+    换号成功打 `Marvis 换号重试 acc=A -> B（原因 kind=... code=...）`；
+    一个号都没换成（池里只有它 / 全被 exclude）时打 `Marvis 换号终止`。
+    2026-11-16 之前这两条日志都不存在，线上 403 无法区分「没号可换」和
+    「没换号」—— 这次把换号做成**可数的事实**。
     """
     model = str(body.get("model") or "")
     exclude: set[int] = set()
     last_error: client.UpstreamError | None = None
+    # 请求画像只算一次，本次请求的所有上游尝试共用（只记数字，不落内容）。
+    profile = _profile_of(body)
+    # 两层重试，各管各的上限：
+    #   · 同一个号：`_call_upstream` 内最多 1 + SAME_ACCOUNT_RETRIES = 3 次；
+    #   · 账号之间：本循环最多 MAX_ATTEMPTS = 3 个号（每号 3 次 ⇒ 最多 9 次）。
+    # 换号 = 把失败号加入 `exclude` 后继续循环 —— `select_account` 会跳过它。
+    switch_from = 0
+    switch_reason: tuple[str, str] = ("", "")
+    tried = 0
     for _ in range(MAX_ATTEMPTS):
         # `min_balance=0` = 只要余额 > 0 的号。
         #
@@ -322,6 +411,13 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             model=model, exclude_ids=exclude, min_balance=0)
         if account is None:
             break
+        if switch_from:
+            # 真换到号了才打这条 —— 日志里能直接数出「换号重试」触发了几次。
+            logger.info(
+                "Marvis 换号重试 acc=%s -> %s（原因 kind=%s code=%s）",
+                switch_from, int(account.id or 0),
+                switch_reason[0] or "-", switch_reason[1] or "-")
+            switch_from = 0
         if not await asyncio.to_thread(shared.lease, account):
             exclude.add(account.id)
             continue
@@ -329,17 +425,28 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
         try:
             data = await asyncio.to_thread(
                 marvis_accounts.ensure_token, db, account)
+            tried += 1
             result = await _call_upstream(
-                data, realm, body, int(account.id or 0), stream=stream)
+                data, realm, body, int(account.id or 0), stream=stream,
+                profile=profile)
             if not stream:
                 shared.note_success(account)
                 shared.release(account)
+            logger.info(
+                "Marvis 成功画像 acc=%s model=%s bytes=%d msgs=%d tools=%d "
+                "sys_chars=%d elapsed_ms=%d",
+                int(account.id or 0), model or "-", profile["bytes"],
+                profile["msgs"], profile["tools"], profile["sys_chars"],
+                int((time.perf_counter() - started) * 1000))
             return result, account, started
         except client.UpstreamError as exc:
             shared.release(account)
             # 可观测性：失败必须留痕（kind / status / 业务码 / detail / 号）。
             # ⚠ 放在「改写成用户文案」之前 —— 这里要的是**上游原话**。
             _warn_upstream_failure(account, exc, model=model, stream=stream)
+            # 换号日志要写**上游原话**：auth 下面会被改写成 credential_expired，
+            # 而排障时想知道的是上游那个 4100403。
+            fail_kind, fail_code = exc.kind, exc.code or ""
             # 401 是「登录态过期」而不是「配置错了」—— 文案要能直接指导操作。
             # Marvis 的 token 实测只活约 2 小时（见 `TOKEN_TTL_SECONDS`），
             # 说「请检查凭证」只会让用户去翻配置，而答案是重新扫码。
@@ -361,13 +468,17 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                 cool_seconds=(600 if exc.kind in ("auth", "risk_control") else 0))
             last_error = exc
             exclude.add(account.id)
-            # 参数类错误换号也没用，直接停。
-            # 同号重试已经在 `_call_upstream` 里做过（白名单 kind + 4100406
-            # 业务码，最多 2 次），这里只负责「换号」—— 不做 `exclude.discard()`
-            # 的伪重试。
+            # 参数类错误换号也没用，直接抛（不再浪费一次上游往返）。
             if exc.status in (400, 422) and exc.kind not in (
                     "auth", "rate_limit", "risk_control"):
-                break
+                raise exc
+            # 走到这里 = 同号重试已经在 `_call_upstream` 里**耗尽**
+            # （白名单 kind + 4100406 业务码，最多 2 次）⇒ 该换号了：
+            # 失败号已进 `exclude`，下一轮选号自然换到下一个号。
+            # `auth`（4100403）在 `_call_upstream` 里不重试，这里是**直接**
+            # 冷却该号（note_failure 600s）并换号。
+            switch_from = int(account.id or 0)
+            switch_reason = (fail_kind, fail_code)
         except Exception as exc:  # noqa: BLE001
             shared.release(account)
             logger.warning("Marvis 调用失败 acc=%s: %s: %s",
@@ -376,7 +487,16 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             last_error = client.UpstreamError(
                 "Marvis 调用异常（%s）" % type(exc).__name__, kind="upstream")
             exclude.add(account.id)
+            switch_from = int(account.id or 0)
+            switch_reason = ("exception", type(exc).__name__)
     if last_error is not None:
+        if switch_from:
+            # 换号没得换了（池子只有一个号 / 全被 exclude）—— 这条是排障关键：
+            # 它证明「不是没试换号，是没人可换」。
+            logger.warning(
+                "Marvis 换号终止：已无更多可用账号（已试 %d 个号，最后 kind=%s "
+                "code=%s）", tried, switch_reason[0] or "-",
+                switch_reason[1] or "-")
         raise last_error
     # 走到这里说明**一个号都没选到**（选号返回 None 或全被租约挤掉）。
     # 「导入凭证」这句话只在池子真的空的时候成立；有 active 号却选不到，

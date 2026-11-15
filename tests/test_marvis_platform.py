@@ -14,6 +14,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 # 必须早于 `admin.*` 导入：`admin/db.py` 在模块级按 settings 建引擎，
 # 默认值是 MySQL；固定成 SQLite 文件库才能脱库跑（内存库不接受连接池参数）。
@@ -443,7 +444,12 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [7, 7], "4100406 必须同号重试（首发失败后重试成功）")
 
     async def test_illegal_request_4100406_gives_up_after_two_retries(self):
-        """连撞三次 4100406 仍然要抛 —— 不许变成无限重试。"""
+        """连撞三次 4100406 仍然要抛 —— 不许变成无限重试。
+
+        这里的「3 次」是**单个号**的上限（1 次首发 + 2 次同号重试），
+        语义没有变化。整条请求的上限是「3 个号 × 每号 3 次 = 9 次上游调用」，
+        由下面的 `AccountSwitchTests` 覆盖（2026-11-16 换号解耦）。
+        """
         calls = []
 
         def fake_open(data, realm, body, *, account_id=0):
@@ -542,6 +548,215 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(self.mclient.UpstreamError):
                 await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
             self.assertEqual(len(calls), 1, "kind=%s 不许重试" % kind)
+
+
+class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
+    """换号重试：同号重试**耗尽后必须换下一个号**（2026-11-16 加日志 + 钉死路径）。
+
+    2026-11-16 01:13 的线上 403：一个号连打 3 次（7–8s）后请求直接失败。
+    查库确认当时池里**只有一个 marvis 号**（187；189 是 17:14:27 才导入的），
+    所以「没换号」不是分支缺失，而是**没号可换** —— 但旧代码一条日志都没有，
+    线上根本看不出这一点。这里用假号池把路径钉死：「A 号 3 次全 403、
+    B 号首次 200」⇒ 最终成功，顺带钉住 auth 不重试直接换号、400/422 直接抛、
+    整条请求最多 9 次上游调用。
+    """
+
+    def setUp(self):
+        from admin.platform.marvis import gateway
+        from admin.platform.marvis.core import client as mclient
+
+        self.gateway = gateway
+        self.mclient = mclient
+        self._orig = {
+            "open": mclient.open_chat_stream,
+            "select": gateway.shared.select_account,
+            "lease": gateway.shared.lease,
+            "release": gateway.shared.release,
+            "success": gateway.shared.note_success,
+            "failure": gateway.shared.note_failure,
+            "ensure": gateway.marvis_accounts.ensure_token,
+            "credentials": gateway.marvis_accounts.credentials_of,
+            "hint": gateway.marvis_accounts.token_expiry_hint,
+            "delay": gateway.SAME_ACCOUNT_RETRY_DELAY,
+            "jitter": gateway.SAME_ACCOUNT_RETRY_JITTER,
+        }
+        gateway.SAME_ACCOUNT_RETRY_DELAY = 0
+        gateway.SAME_ACCOUNT_RETRY_JITTER = 0
+        self.accounts = [SimpleNamespace(id=1, auth_json="{}"),
+                         SimpleNamespace(id=2, auth_json="{}")]
+        self.failures = []
+
+        def fake_select(db, *, storage, realm, key, model, exclude_ids=None,
+                        min_balance=None):
+            excluded = set(exclude_ids or ())
+            for account in self.accounts:
+                if account.id not in excluded:
+                    return account
+            return None
+
+        def fake_note_failure(db, account, **kwargs):
+            self.failures.append((account.id, kwargs.get("kind"),
+                                  kwargs.get("cool_seconds")))
+
+        gateway.shared.select_account = fake_select
+        gateway.shared.lease = lambda account: True
+        gateway.shared.release = lambda account: None
+        gateway.shared.note_success = lambda account: None
+        gateway.shared.note_failure = fake_note_failure
+        gateway.marvis_accounts.ensure_token = lambda db, account: {"t": "x"}
+        gateway.marvis_accounts.credentials_of = lambda account: {}
+        gateway.marvis_accounts.token_expiry_hint = lambda credentials: {}
+
+    def tearDown(self):
+        self.mclient.open_chat_stream = self._orig["open"]
+        self.gateway.shared.select_account = self._orig["select"]
+        self.gateway.shared.lease = self._orig["lease"]
+        self.gateway.shared.release = self._orig["release"]
+        self.gateway.shared.note_success = self._orig["success"]
+        self.gateway.shared.note_failure = self._orig["failure"]
+        self.gateway.marvis_accounts.ensure_token = self._orig["ensure"]
+        self.gateway.marvis_accounts.credentials_of = self._orig["credentials"]
+        self.gateway.marvis_accounts.token_expiry_hint = self._orig["hint"]
+        self.gateway.SAME_ACCOUNT_RETRY_DELAY = self._orig["delay"]
+        self.gateway.SAME_ACCOUNT_RETRY_JITTER = self._orig["jitter"]
+
+    def _illegal_request(self):
+        return self.mclient.UpstreamError(
+            "模型网关失败（HTTP 403）", status=403, code="403",
+            kind="upstream_business",
+            detail='{"code":4100406,"msg":"非法请求"}')
+
+    async def _run(self, body=None):
+        return await self.gateway._attempt(
+            None, None, None, body or {"model": "main-auto"}, "cn",
+            stream=True)
+
+    async def test_switches_account_after_same_account_retries(self):
+        """探针 ①：A 号 3 次全 403、B 号首次 200 ⇒ 最终成功，调用 [A,A,A,B]。"""
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            if account_id == 1:
+                raise self._illegal_request()
+            return "RESULT"
+
+        self.mclient.open_chat_stream = fake_open
+        result, account, _ = await self._run()
+        self.assertEqual(result, "RESULT")
+        self.assertEqual(account.id, 2)
+        self.assertEqual(calls, [1, 1, 1, 2],
+                         "A 号同号重试耗尽后必须换到 B 号再试")
+
+    async def test_switch_is_logged(self):
+        """要求 4：换号成功要留一条可 grep 的日志。"""
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            if account_id == 1:
+                raise self._illegal_request()
+            return "RESULT"
+
+        self.mclient.open_chat_stream = fake_open
+        with self.assertLogs("admin.platform.marvis.gateway", level="INFO") as logs:
+            await self._run()
+        joined = "\n".join(logs.output)
+        self.assertIn("Marvis 换号重试 acc=1 -> 2", joined)
+        self.assertIn("原因 kind=upstream_business code=403", joined)
+
+    async def test_both_accounts_fail_raises_after_six_calls(self):
+        """探针 ②：两个号都 403 ⇒ 抛，且每号各 3 次（共 6 次上游调用）。"""
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            raise self._illegal_request()
+
+        self.mclient.open_chat_stream = fake_open
+        with self.assertRaises(self.mclient.UpstreamError):
+            await self._run()
+        self.assertEqual(calls, [1, 1, 1, 2, 2, 2],
+                         "每个号各 1 次首发 + 2 次同号重试，然后换号")
+
+    async def test_auth_switches_without_retry_and_cools(self):
+        """探针 ③：A 号 401(auth) ⇒ 不重试、直接换 B；A 冷却 600s。"""
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            if account_id == 1:
+                raise self.mclient.UpstreamError(
+                    "登录态过期", status=401, code="4100403", kind="auth",
+                    detail='{"code":4100403,"msg":"登录态过期/未登录"}')
+            return "RESULT"
+
+        self.mclient.open_chat_stream = fake_open
+        result, account, _ = await self._run()
+        self.assertEqual(result, "RESULT")
+        self.assertEqual(account.id, 2)
+        self.assertEqual(calls, [1, 2], "auth 不许同号重试，直接换号")
+        self.assertEqual(self.failures, [(1, "auth", 600)],
+                         "auth 必须冷却该号 600s 再换")
+
+    async def test_three_accounts_cap_nine_upstream_calls(self):
+        """总上限：MAX_ATTEMPTS=3 个号 × 每号 3 次 = 最多 9 次上游调用。"""
+        self.accounts.append(SimpleNamespace(id=3, auth_json="{}"))
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            raise self._illegal_request()
+
+        self.mclient.open_chat_stream = fake_open
+        with self.assertRaises(self.mclient.UpstreamError):
+            await self._run()
+        self.assertEqual(len(calls), 9, "3 个号 × 3 次，不许无限换号")
+        self.assertEqual(calls, [1, 1, 1, 2, 2, 2, 3, 3, 3])
+
+    async def test_param_error_400_is_raised_without_switch(self):
+        """400/422 换号也没用：一次就抛，不换号。"""
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            raise self.mclient.UpstreamError(
+                "模型网关失败（HTTP 400）", status=400, code="400",
+                kind="upstream_business",
+                detail='{"code":3000101,"msg":"invalid parameter"}')
+
+        self.mclient.open_chat_stream = fake_open
+        with self.assertRaises(self.mclient.UpstreamError):
+            await self._run()
+        self.assertEqual(calls, [1], "400 直接抛，不重试也不换号")
+
+    async def test_request_profile_logged_without_body_content(self):
+        """B：请求画像只记数字；用户对话内容绝不进日志。"""
+        secret = "用户私有对话内容-不应出现在日志里"
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            return "RESULT"
+
+        self.mclient.open_chat_stream = fake_open
+        body = {
+            "model": "main-auto",
+            "max_tokens": 2048,
+            "messages": [
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {"role": "user", "content": secret},
+            ],
+            "tools": [{"type": "function", "function": {"name": "t"}}],
+        }
+        with self.assertLogs("admin.platform.marvis.gateway", level="INFO") as logs:
+            await self._run(body)
+        joined = "\n".join(logs.output)
+        self.assertIn("Marvis 请求画像", joined)
+        self.assertIn("msgs=2", joined)
+        self.assertIn("tools=1", joined)
+        self.assertIn("max_tokens=2048", joined)
+        self.assertNotIn(secret, joined, "请求画像绝不能打印 body 内容")
 
 
 class DispatchModelForPlatformTests(unittest.TestCase):
