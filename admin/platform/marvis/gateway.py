@@ -194,6 +194,20 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             return result, account, started
         except client.UpstreamError as exc:
             shared.release(account)
+            # 401 是「登录态过期」而不是「配置错了」—— 文案要能直接指导操作。
+            # Marvis 的 token 实测只活约 2 小时（见 `TOKEN_TTL_SECONDS`），
+            # 说「请检查凭证」只会让用户去翻配置，而答案是重新扫码。
+            detail = exc.detail or exc.message
+            if exc.kind == "auth":
+                hint = marvis_accounts.token_expiry_hint(
+                    marvis_accounts.credentials_of(account))
+                age = hint.get("age_seconds")
+                extra = ("（该凭证已签发 %d 分钟，超过约 2 小时的有效期）"
+                         % (age // 60) if age is not None else "")
+                exc = client.UpstreamError(
+                    "Marvis 登录态已过期%s：请在控制台「授权登录」重新扫码（QQ / 微信）"
+                    % extra, status=401, code="credential_expired", kind="auth",
+                    detail=detail)
             shared.note_failure(
                 db, account, kind=exc.kind, detail=exc.detail or exc.message,
                 status=exc.status, model=model, public_platform=PUBLIC,
@@ -213,8 +227,30 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             exclude.add(account.id)
     if last_error is not None:
         raise last_error
+    # 走到这里说明**一个号都没选到**（选号返回 None 或全被租约挤掉）。
+    # 「导入凭证」这句话只在池子真的空的时候成立；有 active 号却选不到，
+    # 原因只有两种，得分开讲清楚（2026-11-15 用户实测被这句话误导：账号明明
+    # 是 active、凭证也在，只是 access_token 过了约 2 小时有效期）。
+    try:
+        rows = marvis_accounts.accounts_for(db, realm)
+        alive = [r for r in rows if (getattr(r, "status", "") or "") == "active"]
+        expired = [r for r in alive
+                   if "过期" in str(getattr(r, "last_err_msg", "") or "")]
+    except Exception:  # noqa: BLE001
+        alive, expired = [], []
+    if alive and len(expired) == len(alive):
+        raise shared.PlatformRejected(
+            503, "Marvis 账号登录态已全部过期，请在控制台「授权登录」重新扫码"
+                 "（access_token 由上游按天轮换，过期后只能重登）",
+            kind="server_error", code="credential_expired",
+            headers={"Retry-After": "5"})
+    if alive:
+        raise shared.PlatformRejected(
+            503, "Marvis 账号都在冷却或排队中，请稍后重试",
+            kind="server_error", code="accounts_cooling",
+            headers={"Retry-After": "3"})
     raise shared.PlatformRejected(
-        503, "Marvis 没有可用账号（请先在控制台导入凭证并确认状态为启用）",
+        503, "Marvis 还没有账号，请在控制台「授权登录」扫码（QQ 或微信）",
         kind="server_error", code="no_available_account",
         headers={"Retry-After": "3"})
 
@@ -321,23 +357,6 @@ async def chat_completions(request: Request):
                                       "X-Accel-Buffering": "no"})
 
 
-async def messages(request: Request):
-    """Anthropic 入口 → 转成 OpenAI 请求再复用主路径。
-
-    Marvis 上游是 OpenAI 协议，所以这里做的是协议翻译，不是透传。
-    """
-    body = await _body_of(request)
-    normalized = _anthropic_to_openai(body)
-    return await _run_normalized(request, normalized)
-
-
-async def responses(request: Request):
-    """Responses 入口 → 折叠成 chat/completions 请求。"""
-    body = await _body_of(request)
-    normalized = _responses_to_openai(body)
-    return await _run_normalized(request, normalized)
-
-
 def _anthropic_to_openai(body: dict) -> dict:
     messages: list[dict] = []
     system = body.get("system")
@@ -389,34 +408,51 @@ def _anthropic_to_openai(body: dict) -> dict:
 
 
 def _responses_to_openai(body: dict) -> dict:
-    raw_input = body.get("input")
-    messages: list[dict] = []
-    instructions = body.get("instructions")
-    if isinstance(instructions, str) and instructions.strip():
-        messages.append({"role": "system", "content": instructions})
-    if isinstance(raw_input, str):
-        messages.append({"role": "user", "content": raw_input})
-    elif isinstance(raw_input, list):
-        for item in raw_input:
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role") or "user")
-            content = item.get("content")
-            if isinstance(content, list):
-                content = "".join(str(part.get("text") or "") for part in content
-                                  if isinstance(part, dict))
-            messages.append({"role": role, "content": content or ""})
-    out = {"model": body.get("model") or endpoints.DEFAULT_MODEL,
-           "messages": messages,
-           "stream": bool(body.get("stream"))}
-    if body.get("max_output_tokens"):
-        out["max_tokens"] = body["max_output_tokens"]
+    """Responses 请求 → OpenAI chat 请求（**复用 protocol_bridge**）。
+
+    2026-11-15 修：这里原来是自己手写的一个精简版，只搬 messages /
+    max_output_tokens，**把 `tools` 整个丢了** —— 于是通过 `/v1/responses`
+    发工具定义时，上游根本收不到，模型只能回「我没有 get_time 工具」
+    （真机实测 function_call=0，而同一个请求走 `/v1/messages` 正常返回
+    tool_use）。`protocol_bridge.responses_to_openai` 是各平台共用的成熟实现
+    （工具、tool_choice、function_call 回传都处理过），直接用它。
+    """
+    from admin.platform import protocol_bridge as bridge
+
+    out = dict(bridge.responses_to_openai(body) or {})
+    # 模型 id 必须是槽位名（上游只认槽位），bridge 会原样保留上游名。
+    out["model"] = endpoints.DEFAULT_MODEL
+    if not out.get("messages"):
+        # bridge 对纯字符串 input 已经处理；这里兜底空消息体
+        out["messages"] = [{"role": "user",
+                            "content": str(body.get("input") or "")}]
     return out
 
 
-async def _run_normalized(request: Request, normalized: dict):
-    """把已翻译好的 OpenAI 请求走一遍主路径（复用选号/记账/流式）。"""
+class _Inner:
+    """给 bridge 中继用的内层：`body_iterator` 产出 OpenAI SSE 字节。"""
+
+    def __init__(self, response):
+        self.body_iterator = response.body_iterator
+
+
+async def _run_normalized(request: Request, normalized: dict, *, protocol: str):
+    """把已翻译好的 OpenAI 请求走一遍主路径，**再把响应翻回请求方协议**。
+
+    ## 2026-11-15 修：这里原来少了「翻回去」这一步
+
+    改造前是 `return await chat_completions(inner)` —— 直接把 OpenAI 的
+    JSON / SSE 原样返回。Anthropic 客户端读 `content[]`、Responses 客户端读
+    `output[]`，拿到的却是 `choices[]`，于是**流式零事件、非流式空文本**
+    （真机实测：`/v1/messages` 与 `/v1/responses` 全空，只有
+    `/v1/chat/completions` 正常）。协议翻译只做了一半。
+
+    现在：上游返回后按 `protocol` 走 `protocol_bridge` 对应的中继/整形，
+    与豆包、Loomy 等平台同一条路径。
+    """
     from starlette.requests import Request as _Request
+
+    from admin.platform import protocol_bridge as bridge
 
     payload = json.dumps(normalized, ensure_ascii=False).encode()
 
@@ -424,10 +460,44 @@ async def _run_normalized(request: Request, normalized: dict):
         return {"type": "http.request", "body": payload, "more_body": False}
 
     inner = _Request(request.scope, receive)
-    return await chat_completions(inner)
+    response = await chat_completions(inner)
+
+    if protocol == "anthropic":
+        model = str(normalized.get("model") or "")
+        if getattr(response, "status_code", 200) >= 400:
+            return response                     # 错误原样返回（已是 JSON）
+        if isinstance(response, StreamingResponse):
+            return bridge.anthropic_stream_relay(_Inner(response), model,
+                                                 prefix="marvis")
+        # 非流式：JSONResponse.body 是已序列化的 bytes
+        result = json.loads(response.body.decode("utf-8"))
+        return JSONResponse(bridge.openai_to_anthropic(result, model))
+
+    if protocol == "responses":
+        model = str(normalized.get("model") or "")
+        if getattr(response, "status_code", 200) >= 400:
+            return response
+        if isinstance(response, StreamingResponse):
+            return bridge.responses_stream_relay(_Inner(response), model,
+                                                 prefix="marvis")
+        result = json.loads(response.body.decode("utf-8"))
+        return JSONResponse(bridge.openai_to_responses(result, model))
+
+    return response
 
 
-async def count_tokens(request: Request):
+async def messages(request: Request):
+    """Anthropic 入口 → 转成 OpenAI 请求跑主路径 → 响应翻回 Anthropic。"""
+    body = await _body_of(request)
+    normalized = _anthropic_to_openai(body)
+    return await _run_normalized(request, normalized, protocol="anthropic")
+
+
+async def responses(request: Request):
+    """Responses 入口 → 折叠成 chat/completions → 响应翻回 Responses。"""
+    body = await _body_of(request)
+    normalized = _responses_to_openai(body)
+    return await _run_normalized(request, normalized, protocol="responses")
     """本地估算。口径：CJK 1 token/字，其它 4 字符 1 token（保守近似）。"""
     body = await _body_of(request)
     parts: list[str] = []
@@ -448,11 +518,15 @@ async def list_models(_request: Request):
     Marvis 的模型网关**没有** `/v1/models`（实测无此端点），目录是客户端内置的
     槽位表，所以这里返回静态目录 —— 不猜上游。
 
-    `id` 给**槽位名**（上游接受的 id），真实模型名放 `name`。
+    `id` 给**可读模型名**（`deepseek-v4.1-flash`）而不是槽位名
+    （`main-auto`）—— 后者对外无法理解（用户实测反馈「怎么模型能叫这个
+    名称呢」）。槽位名留在 `api_id` 里，调用时由 `canonical_model_id()`
+    换回去，客户端不需要知道它是槽位。
     """
-    data = [{"id": item["api_id"], "object": "model", "created": 0,
+    data = [{"id": item["id"], "object": "model", "created": 0,
              "owned_by": PUBLIC, "name": item["name"],
-             "api_id": item["api_id"], "context": item["context"]}
+             "api_id": item["api_id"], "context": item["context"],
+             "display_name": item["name"]}
             for item in endpoints.models_catalog()]
     return JSONResponse({"object": "list", "data": data})
 
@@ -463,7 +537,7 @@ async def balance(request: Request):
 
     realm = _realm(request)
     with SessionLocal() as db:
-        summary = marvis_accounts.summarize(db, realm)
+        summary = marvis_accounts.summarize_db(db, realm)
     return JSONResponse({"object": "balance", "platform": PUBLIC,
                          "realm": realm,
                          "total_tokens": summary["balance_total"],

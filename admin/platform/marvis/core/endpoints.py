@@ -157,6 +157,34 @@ DEFAULT_MODEL = "main-auto"
 DISPLAY_BY_SLOT = {slot: name for slot, name, _ctx, _cap in MODEL_TABLE}
 #: 显示名 → 槽位名
 SLOT_BY_DISPLAY = {name: slot for slot, name, _ctx, _cap in MODEL_TABLE}
+
+#: 槽位名 → **对外可读名**（客户端 / 控制台看到的模型名）。
+#:
+#: 为什么需要这一层：`main-auto` 是上游的**槽位名**（它只认这个），但把它
+#: 当成模型名展示给用户是荒谬的 —— 用户在客户端里看到 `main-auto-marvis`
+#: 完全不知道背后是 DeepSeek V4.1 Flash（2026-11-15 用户当场质疑）。
+#: 而 `deepseek-v4-pro-external` 看着像模型名，所以只有 `main-auto` /
+#: `hy3-preview-agent` 这几个槽位名「露馅」，表现为「Pro 没问题、Flash 有问题」。
+#:
+#: 映射到**真实模型名**后：
+#:   * `/v1/models` 的 `id` 是 `deepseek-v4.1-flash`（+ 平台后缀）；
+#:   * 客户端发这个名字时，`models_router.MODEL_NAME_MAP['marvis']` 的反查
+#:     会把它换回槽位名再打上游（与 Qoder 的 `dfmodel` 同一套机制）。
+READABLE_BY_SLOT = {
+    "main-auto": "deepseek-v4.1-flash",        # deepseek-v4-1-flash-261017
+    "deepseek-v4-pro-external": "deepseek-v4-pro",   # deepseek-v4-pro-202606
+    "hy3-preview-agent": "deepseek-v4-flash",  # deepseek-v4-flash-ga-260731
+    "hy3-preview-agent-real": "hy3",
+    "hunyuan-turbos-vision": "hunyuan-vision-2.0",   # HY-Vision-2.0-instruct
+}
+#: 可读名 → 槽位名（反查；大小写不敏感）
+SLOT_BY_READABLE = {name.lower(): slot for slot, name in READABLE_BY_SLOT.items()}
+#: 小写槽位名 → 槽位名（客户端把模型名大写化时也要能认）
+SLOT_BY_LOWER = {slot.lower(): slot for slot in DISPLAY_BY_SLOT}
+#: 上游真实模型名 → 槽位名（`deepseek-v4-1-flash-261017` → `main-auto`）。
+#: 客户端从文档/别处抄来上游真名时也要能打，否则只能靠人肉换算槽位。
+SLOT_BY_UPSTREAM = {name.lower(): slot for slot, name, _c, _cap in MODEL_TABLE}
+
 #: 旧版把目录存成数组下标（"0"…"7"），保留映射让老路由继续可用
 ALIAS_BY_INDEX = {str(index): slot for index, (slot, *_rest) in enumerate(MODEL_TABLE)}
 
@@ -165,9 +193,27 @@ UNAVAILABLE_MODELS = frozenset({"kimi-k2.5"})
 
 
 def canonical_model_id(model) -> str:
-    """把用户传的 model 归一成上游槽位名。支持显示名 / 旧数字下标 / 已是槽位。"""
+    """把用户传的 model 归一成上游槽位名。
+
+    认四种写法：可读名（`deepseek-v4.1-flash`）/ 上游真实名
+    （`deepseek-v4-1-flash-261017`）/ 旧数字下标（`"0"`）/ 已是槽位（`main-auto`）。
+    前两种是**对外**的写法，后两种是历史与内部的写法，四条路都得通。
+    """
     raw = str(model or "")
-    return ALIAS_BY_INDEX.get(raw) or SLOT_BY_DISPLAY.get(raw) or raw
+    if not raw:
+        return raw
+    return (ALIAS_BY_INDEX.get(raw)
+            or SLOT_BY_DISPLAY.get(raw)
+            or SLOT_BY_READABLE.get(raw.strip().lower())
+            or SLOT_BY_LOWER.get(raw.strip().lower())
+            or SLOT_BY_UPSTREAM.get(raw.strip().lower())
+            or raw)
+
+
+def readable_model_id(model) -> str:
+    """槽位名 → 对外可读名（查不到就原样返回）。"""
+    slot = canonical_model_id(model)
+    return READABLE_BY_SLOT.get(slot, UNAVAILABLE_SLOTS.get(slot, slot))
 
 
 def display_model_id(model) -> str:
@@ -193,11 +239,22 @@ def models_catalog(realm: str = "") -> list[dict]:
         dispatch 也按它校验「模型属不属于这个平台」。
 
     真实模型名放 `name`（卡片上显示的就是实际在跑什么），不放进 `id`。
+
+    ## ⚠️ `id` 也不能是**槽位名**（2026-11-15 修）
+
+    改造前 `id` 直接给槽位名，于是客户端里出现 `main-auto-marvis`——
+    用户完全看不出这是 DeepSeek V4.1 Flash（真人反馈原话：
+    「怎么模型能叫这个名称呢？它不是 deep sea V4.1 Flash 吗」）。
+    `deepseek-v4-pro-external` 恰好长得像模型名，所以只有 Flash 那几个
+    「露馅」，表现为「Pro 没问题、Flash 有问题」。
+
+    现在 `id` 给**可读名**（`deepseek-v4.1-flash`），槽位名只留在 `api_id`
+    里给上游用；客户端发可读名进来，`canonical_model_id()` 会换回槽位。
     """
     out = []
     for slot, name, context, cap in MODEL_TABLE:
         out.append({
-            "id": slot,
+            "id": readable_model_id(slot),
             "api_id": slot,
             "name": name,
             "context": context,
@@ -308,13 +365,20 @@ def business_headers(acct: dict, *, query: str, method: str = "GET") -> dict:
     }
 
 
-def authorize_url(login_type: str = "QC", guid: str = "") -> str:
+def authorize_url(login_type: str = "QC", guid: str = "", state: str = "") -> str:
     """生成授权页地址（用户在浏览器里登 QQ / 微信，拿到 code）。
 
-    ⚠ 两个细节都是实测踩出来的：
+    ⚠ 三个细节都是实测踩出来的：
+
       · `redirect_uri` 必须带 `?login_type=XX`，否则服务端取不到登录方式；
       · QQ 的 `state` 必须与渲染层一致是**小数**（`Math.random()*100`），
-        写成整数会被判参数无效；微信则用设备 guid 当 state。
+        写成整数会被判参数无效。
+      · **`state` 必须由调用方传进来并原样保存** —— 这个函数以前自己
+        `repr(random.random()*100)` 生成一个，而 `auth_start` 又另外算了
+        一个存进会话，换码时带的是后者。两者不一致 → QQ 侧判
+        `-109 RC_PARAMS_INVALID`（2026-11-15 真机复现），现象就是
+        「扫码授权成功了，一提交就报参数无效」。参数一旦传进来，这里
+        绝不再改它的值。
     """
     from urllib.parse import urlencode, quote
 
@@ -325,7 +389,8 @@ def authorize_url(login_type: str = "QC", guid: str = "") -> str:
             "redirect_uri": redirect,
             "response_type": "code",
             "scope": "snsapi_login",
-            "state": guid or "",
+            # 微信拿设备 guid 当 state（与 magpie 渲染层一致）
+            "state": state or guid or "",
         }
         return WX_AUTHORIZE + "?" + urlencode(params, quote_via=quote)
     params = {
@@ -334,6 +399,21 @@ def authorize_url(login_type: str = "QC", guid: str = "") -> str:
         "response_type": "code",
         "client_id": QQ_APP_ID,
         "redirect_uri": redirect,
-        "state": repr(random.random() * 100),
+        # 兜底也保持「小数」形态：没传 state 时自己算一个，但调用方
+        # 应该传 —— 只有它能同时把同一个值存进会话。
+        "state": state or ("%.7f" % (random.random() * 100)),
     }
     return QQ_AUTHORIZE + "?" + urlencode(params, quote_via=quote)
+
+
+def new_oauth_state(login_type: str, guid: str) -> str:
+    """本次授权要用的 `state`（`auth_start` / 授权地址 / 换码三处必须一致）。
+
+    QQ：小数（渲染层 `Math.random()*100` 同口径）。
+    微信：设备 guid —— 微信会把 state 原样回传给 redirect_uri，用 guid
+    既能归因，也保证「授权地址里的 state」＝「回调里的 state」＝「换码时发的
+    state」三者完全一致。
+    """
+    if str(login_type).upper() == "WX":
+        return guid or ""
+    return "%.7f" % (random.random() * 100)

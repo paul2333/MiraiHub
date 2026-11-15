@@ -166,9 +166,22 @@ def fetch_wallet(credential: dict, realm: str = "cn", *, account_id: int = 0) ->
         realm=realm, account_id=account_id)
     inner = data.get("data") if isinstance(data, dict) else None
     if not isinstance(inner, dict):
-        raise UpstreamError("钱包接口没有返回 data 字段",
-                            kind="upstream_business",
-                            detail=json.dumps(data, ensure_ascii=False)[:200])
+        # ⚠ **`data: null` 是登录态失效的信号，不是「业务失败」**
+        # （2026-11-15 真机实测）：access_token 过期后，钱包接口仍然回
+        # `{"code": 0, "msg": "success", "data": null}` —— HTTP 200、业务码 0，
+        # 唯一异常是 data 为空。同一份凭证打模型网关会明确回
+        # `4100403 登录态过期/未登录`，两条路径指同一件事。
+        #
+        # 以前这里按 `upstream_business` 归类，后果有二：
+        #   · 账号不会被标成「凭证失效」，控制台只显示「钱包接口没有返回 data
+        #     字段」——用户完全不知道要去重新扫码；
+        #   · 网关到最后仍然报「没有可用账号，请先在控制台导入凭证」，
+        #     而账号明明是 active、凭证也在，只是过期了。
+        # 现在归成 `auth`：上层据此冷却 + 控制台显示「登录态已过期」。
+        raise UpstreamError(
+            "Marvis 登录态已过期（钱包接口无数据），请在控制台重新扫码登录",
+            status=401, kind="auth",
+            detail=json.dumps(data, ensure_ascii=False)[:200])
     return inner
 
 
@@ -338,6 +351,40 @@ def exchange_code(code: str, login_type: str, realm: str = "cn", *,
 
     if not isinstance(info, dict):
         info = {}
+
+    # ---- 上游错误码 → 人话（2026-11-15 真机逐条对照出来的）----
+    #
+    #   -109 RC_PARAMS_INVALID : **缺 `Ual-Access-Guid` 请求头**（或缺
+    #       login_type / code）。浏览器直接打开 `marvis_oauth?code=…` 时
+    #       就是这个 —— 浏览器没有 guid。**这一步不会消耗 code**（参数校验在
+    #       兑换之前），所以「浏览器显示 -109」是正常噪音，不影响我们兑换。
+    #   -107 RC_NO_AUTH_ERR   : 参数齐全但 code 无效 —— 已过期或已被用过。
+    #       QQ/微信的 code 只有几分钟寿命，必须马上提交。
+    #
+    # 这两条以前都被压成一句「没有下发 accesstoken」，用户完全不知道该干嘛。
+    biz_code = 0
+    if isinstance(info, dict) and info.get("code") is not None:
+        try:
+            biz_code = int(info.get("code"))
+        except (TypeError, ValueError):
+            biz_code = 0
+    if biz_code == -109:
+        raise UpstreamError(
+            "上游判参数无效（-109）：这是浏览器直接打开回调页时的正常提示，"
+            "不影响提交；请确认你贴的是完整回调地址（含 code=…），并在授权后 1 分钟内提交。",
+            status=400, code="-109", kind="auth",
+            detail=body_text[:200])
+    if biz_code == -107:
+        raise UpstreamError(
+            "授权码已过期或已被使用（-107）：QQ / 微信的 code 只有几分钟有效期。"
+            "请重新扫码，拿到回调地址后立刻贴进来提交（别再刷新那个页面）。",
+            status=400, code="-107", kind="auth",
+            detail=body_text[:200])
+    if biz_code not in (0, 200):
+        raise UpstreamError(
+            "上游返回错误（%s）：%s" % (biz_code,
+                                   str(info.get("msg") or info.get("message") or "")[:120]),
+            status=400, code=str(biz_code), kind="auth", detail=body_text[:200])
 
     # ⚠ 字段名是**小写无下划线**：上游实测返回
     #   `{"openid": "...", "accesstoken": "mv_...", "refreshtoken": "...",

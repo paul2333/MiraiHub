@@ -239,11 +239,31 @@ class MarvisGateway:
                      if (getattr(r, "status", "") or "") == "active")
         remain = sum(int(getattr(r, "balance_remain", 0) or 0) for r in rows)
         limit = sum(int(getattr(r, "balance_total", 0) or 0) for r in rows)
+
+        def _tok(n: int) -> str:
+            """token 量级缩写（与前端 fmtToken 同口径）。
+
+            为什么要缩写：Marvis 每号每日 1000 万计费 token，一个号池上亿，
+            千分位全展开是 `123,456,789`，把概览卡片撑得大小不一。
+            `raw` 里给精确值，前端放进 tooltip 悬停可见。
+            """
+            v = int(n or 0)
+            if v >= 10 ** 9:
+                text = ("%.2f" % (v / 1e9)).rstrip("0").rstrip(".") + "B"
+            elif v >= 10 ** 6:
+                text = ("%.2f" % (v / 1e6)).rstrip("0").rstrip(".") + "M"
+            elif v >= 10 ** 4:
+                text = ("%.1f" % (v / 1e3)).rstrip("0").rstrip(".") + "K"
+            else:
+                text = "{:,}".format(v)
+            return text
+
         return [
             {"key": "accounts", "label": "账号总数", "value": total,
              "sub": "启用 %d" % active, "icon": "fa-users", "tone": ""},
-            {"key": "credits", "label": "可用额度", "value": remain,
-             "sub": "总额度 %d" % limit, "icon": "fa-wallet", "tone": "brand"},
+            {"key": "credits", "label": "可用 Token", "value": _tok(remain),
+             "raw": remain, "unit": "token", "unit_label": "Token",
+             "sub": "总额度 %s" % _tok(limit), "icon": "fa-wallet", "tone": "brand"},
             {"key": "mode", "label": "接入方式", "value": "反向代理",
              "sub": "腾讯 Marvis", "icon": "fa-network-wired", "tone": ""},
         ]

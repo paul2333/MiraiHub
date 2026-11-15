@@ -75,6 +75,11 @@ def install() -> None:
             extra={
                 "task_runners": list(_task_runners().keys()),
                 "actions": ["import", "export", "begin-auth", "refresh-quota"],
+                # 额度口径：**token 而不是积分**。控制台据此把「积分」列改成
+                # 「Token」并启用 K/M 缩写（每号每日 1000 万，数字动辄七八位，
+                # 千分位铺开会把等宽列撑爆）。
+                "quota_unit": "token",
+                "quota_unit_label": "Token",
             },
         ))
         logger.debug("腾讯 Marvis 平台已登记：%s", platform_id)

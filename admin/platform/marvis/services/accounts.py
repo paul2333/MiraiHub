@@ -90,6 +90,56 @@ def realm_of(account: Account) -> str:
     return (account.domain or "cn").strip() or "cn"
 
 
+#: 凭证有效期（秒）——**实测推断值，不是上游下发的**。
+#:
+#: 2026-11-15 实测：13:34 授权 → 15:44 上游回 `4100403 登录态过期/未登录`，
+#: 存活 2 小时 10 分；按 4 小时假设会晚 1 小时 50 分，不成立。所以取 2 小时，
+#: 并留 10 分钟余量提前提示（`TOKEN_TTL_SECONDS - TOKEN_WARN_SECONDS`）。
+#:
+#: 为什么是推断而不是读字段：QQ / 微信登录回调**不下发 `expires_in`**，
+#: `expires_at` 恒为 0。看不到真实值，只能按实测收敛一个保守值。
+TOKEN_TTL_SECONDS = 2 * 3600
+#: 提前多久开始提示「该重登了」。
+TOKEN_WARN_SECONDS = 10 * 60
+
+
+def token_age_seconds(data: dict) -> int | None:
+    """这份凭证签发到现在多少秒（拿不到 `issued_at` 返回 None）。"""
+    raw = data.get("issued_at")
+    try:
+        issued = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if issued <= 0:
+        return None
+    return max(0, int(time.time()) - issued)
+
+
+def token_expiry_hint(data: dict) -> dict:
+    """凭证时效提示（给控制台账号卡与错误信息共用）。
+
+    `state`：
+      * `unknown`  —— 老凭证没有 `issued_at`（无法判断，不吓用户）；
+      * `fresh`    —— 还早；
+      * `soon`     —— 剩余不足 `TOKEN_WARN_SECONDS`，该准备重登了；
+      * `expired`  —— 已超过推断 TTL，大概率上游已判失效。
+    """
+    age = token_age_seconds(data)
+    if age is None:
+        return {"state": "unknown", "age_seconds": None,
+                "remaining_seconds": None, "ttl_seconds": TOKEN_TTL_SECONDS}
+    remaining = TOKEN_TTL_SECONDS - age
+    if remaining <= 0:
+        state = "expired"
+    elif remaining <= TOKEN_WARN_SECONDS:
+        state = "soon"
+    else:
+        state = "fresh"
+    return {"state": state, "age_seconds": age,
+            "remaining_seconds": max(0, remaining),
+            "ttl_seconds": TOKEN_TTL_SECONDS}
+
+
 def public_view(account: Account, *, quota: dict | None = None,
                 include_credential: bool = False) -> dict:
     """给控制台的账号视图。**默认不含 token**。
@@ -116,6 +166,9 @@ def public_view(account: Account, *, quota: dict | None = None,
         "last_sync_at": account.last_sync_at.isoformat()
         if getattr(account, "last_sync_at", None) else None,
         "last_err_msg": account.last_err_msg or "",
+        # 凭证时效：QQ/微信 token 实测只活约 2 小时（上游不下发 expires_in），
+        # 控制台据此提前亮「该重新授权了」，不必等一次 401 才发现。
+        "token_expiry": token_expiry_hint(data),
     }
     if include_credential:
         view["credential"] = data
@@ -172,6 +225,14 @@ def _upsert(db: Session, payload: dict) -> tuple[Account, bool]:
     if not guid_of(data):
         data["guid"] = str(uuid.uuid4())
     data.setdefault("login_type", "1")
+    # **记下这份凭证是什么时候签发的**（2026-11-15）。
+    #
+    # 为什么必须记：QQ / 微信登录回调**不下发 `expires_in`**，所以
+    # `expires_at` 一直是 0，系统对「这票还能活多久」一无所知 —— 只能等上游
+    # 回 401 才发现过期。实测（第一份凭证 13:34 授权、15:44 失效）存活约
+    # **2 小时**，比常见的 24 小时短一个数量级，所以「授权完能用、过一阵
+    # 突然退登」是可以预判的。有了 `issued_at` 才能提前提示用户重登。
+    data.setdefault("issued_at", int(time.time()))
 
     realm = str(data.get("realm") or "cn")
     uid = openid
@@ -341,6 +402,13 @@ def ensure_token(db: Session, account: Account) -> dict:
         raise client.UpstreamError(
             "账号凭证不完整（缺 openid / access_token），请重新扫码登录",
             status=401, kind="auth")
+    # 凭证按推断 TTL 已过期：**提前**给出可操作的提示，而不是发一个注定 401
+    # 的请求再报「登录态过期」。仍然放行（只是提示）—— 推断值可能偏保守，
+    # 真让上游判死才有说服力；这里只把话说清楚。
+    hint = token_expiry_hint(data)
+    if hint["state"] == "expired":
+        logger.info("Marvis 凭证已超推断 TTL（%ss）acc=%s，本次仍尝试调用",
+                    hint["age_seconds"], account.id)
     if not guid_of(data):
         # 历史数据可能没 guid：补一个并写回，否则这份凭证永远换不出登录态。
         data["guid"] = str(uuid.uuid4())

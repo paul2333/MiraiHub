@@ -285,10 +285,12 @@ def auth_start(body: AuthStartIn | None = None,
     if login_type not in ("QC", "WX"):
         raise HTTPException(400, detail="login_type 只能是 QC 或 WX")
     guid = str(uuid.uuid4())
-    # QQ 的 state 必须与渲染层一致是**小数**，写整数会被判参数无效（实测）。
-    state = "" if login_type == "WX" else ("%.7f" % (time.time() % 100))
+    # `state` 必须是**同一个值**：授权地址里带的、会话里存的、换码时发的。
+    # 以前授权地址内部自己又生成一个，结果换码时 state 对不上，上游回
+    # `-109 RC_PARAMS_INVALID`（2026-11-15 真机复现）。
+    state = endpoints.new_oauth_state(login_type, guid)
     auth_id = uuid.uuid4().hex
-    url = endpoints.authorize_url(login_type, guid)
+    url = endpoints.authorize_url(login_type, guid, state=state)
     _AUTH_SESSIONS[auth_id] = {
         "login_type": login_type, "guid": guid, "state": state,
         "at": time.time(), "status": "pending", "account": None, "error": "",
@@ -321,8 +323,9 @@ def auth_url(login_type: str = "QC", _: bool = Depends(require_admin)):
 def auth_qr(text: str = "", _: bool = Depends(require_admin)):
     """把任意文本（这里就是授权页地址）渲染成 SVG 二维码。
 
-    用仓库内联的 `qrcode`（`_vendor/qrcode`）—— 路由器上没有这个包，
-    所以不能依赖系统安装。
+    依赖 `requirements.txt` 里的 `qrcode>=7.4`（与小浣熊的扫码授权同一个包，
+    SVG 工厂用 lxml）。PR 原文写的「仓库内联 _vendor/qrcode」实际没有落地 ——
+    线上装漏了这个包时这里会 500，所以错误信息直接说明缺的是什么。
     """
     if not text.strip():
         raise HTTPException(400, detail="text 不能为空")
@@ -330,7 +333,9 @@ def auth_qr(text: str = "", _: bool = Depends(require_admin)):
         import qrcode
         import qrcode.image.svg as svg_factory
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, detail="二维码库不可用：%s" % exc) from exc
+        raise HTTPException(
+            500,
+            detail="二维码库不可用（需要 qrcode>=7.4 与 lxml）：%s" % exc) from exc
 
     image = qrcode.make(text, image_factory=svg_factory.SvgPathImage, box_size=10,
                         border=2)
