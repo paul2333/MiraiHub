@@ -611,6 +611,24 @@ def _model_id_for(db, storage: str, model: str) -> str:
         if normalized and normalized != model:
             exact = normalized
 
+    # 5) **槽位名 → 可读名**（2026-11-15 向后兼容）。
+    #
+    # Marvis 早期对外发的是槽位名（`main-auto`），不少客户端配置里留的就是它；
+    # 后来目录改成可读名后 `model_configs` 只存 `deepseek-v4.1-flash`，
+    # 槽位名就查不到了 —— 老配置会突然全 404。
+    #
+    # 这里按平台的「槽位 → 可读名」映射反查一次：映射结果确实是该平台的原生
+    # id 才改（`readable_model_id` 对别的平台是恒等，不会误伤）。
+    if not exact:
+        try:
+            from admin.platform import models_router as _mr
+
+            readable = _mr.readable_model_id(storage, model)
+            if readable and readable != model and _mr.is_native_model_id(storage, readable):
+                exact = readable
+        except Exception:  # noqa: BLE001 - 兜底失败就按原样
+            pass
+
     if not exact:
         return model
     return exact.split(":", 1)[0] if storage == "trae" else exact
@@ -712,16 +730,6 @@ def _model_for_platform(db, storage: str, model: str) -> tuple[str, dict | None]
     # 客户端拿着可读名回来时必须按同平台命中，否则会被判成「属于别的平台」。
     if any(str(row.get("readable") or "").lower() == str(model or "").strip().lower()
            for row in (by_storage.get(storage) or [])):
-        return model, None
-    # **槽位名 / 上游真名也要认**（2026-11-15）：别名还原会把 body 的 model
-    # 改写成上游槽位名（Marvis 的 `main-auto`），而 model_configs 存的是可读名
-    # （`deepseek-v4.1-flash`）。不做这次映射，4/5 个 marvis 模型会被自己的
-    # 改写结果判成「不存在于平台」而 404。
-    from admin.platform import models_router as _mr2
-    _readable_of = _mr2.readable_model_id(storage, model)
-    if _readable_of and any(
-            str(row.get('readable') or '').lower() == str(_readable_of).lower()
-            for row in (by_storage.get(storage) or [])):
         return model, None
     owners: list[str] = []
     for row in by_key.get(alias) or []:

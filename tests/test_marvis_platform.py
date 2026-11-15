@@ -298,59 +298,82 @@ class GatewayGuardTests(unittest.TestCase):
 class DispatchModelForPlatformTests(unittest.TestCase):
     """dispatch 的「这个模型属于该平台吗」校验（2026-11-15 线上 404 回归）。
 
-    别名还原会把 body 里的 model 改写成**上游槽位名**
-    （`deepseek-v4.1-flash-marvis` -> `main-auto`），而 `model_configs`
-    存的是**可读名**（`deepseek-v4.1-flash`）。校验时若只拿槽位名去比对
-    可读名清单，永远不中 —— 实测 4/5 个 marvis 模型被判成
-    `model_not_found` 而 404，只有本来就发可读名的那个能用。
+    线上 4/5 个 marvis 模型恒 404：客户端发 `deepseek-v4.1-flash-marvis`，
+    改写链把名字换成上游槽位名 `main-auto`，而 `model_configs` 存的是
+    **可读名**（`deepseek-v4.1-flash`）—— 校验只比对清单里的原始写法，
+    槽位名永远不中，于是判成 `model_not_found`。
+
+    ⚠️ 必须用**全局库**（`SessionLocal`）：改写链里的 `is_native_model_id()`
+    与 `_model_id_for()` 内部自己开 session，喂一个私有内存库它们看不见，
+    会退回旧行为 —— 那样测试就测不到真实的线上链路。
     """
 
     MODELS = ("deepseek-v4.1-flash", "deepseek-v4-pro",
               "deepseek-v4-flash", "hy3", "hunyuan-vision-2.0")
+    #: 客户端实际发的名字（带平台后缀）
+    CLIENT_NAMES = ("deepseek-v4.1-flash-marvis", "deepseek-v4-pro-marvis",
+                    "deepseek-v4-flash-marvis", "hy3-marvis")
+    #: 改写链会产出的上游槽位名
+    SLOTS = ("main-auto", "deepseek-v4-pro-external",
+             "hy3-preview-agent", "hy3-preview-agent-real")
 
     def setUp(self):
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import Session
-
-        from admin.db import Base
+        from admin.db import Base, SessionLocal, engine
         from admin.models import ModelConfig
-        from admin.platform import dispatch
+        from admin.platform import dispatch, models_router
 
-        # 内存库 + 建全表：与 ImportTests 的写法一致（不依赖线上库）。
-        engine = create_engine("sqlite://")
         Base.metadata.create_all(engine)
-        self._db = Session(engine)
+        self._db = SessionLocal()
         self._dispatch = dispatch
+        self._models_router = models_router
+        # 清掉上一次运行残留的 marvis 行，保证清单可预期
+        self._db.query(ModelConfig).filter(
+            ModelConfig.platform == "marvis").delete()
         self._db.add_all([
             ModelConfig(platform="marvis", model_id=name, enabled=1,
                         credit_multiplier=1.0, upstream_metadata="{}")
             for name in self.MODELS
         ])
         self._db.commit()
-        # 目录缓存是模块级的，必须先清掉，否则会读到别的用例留下的快照。
+        # 两处缓存都是模块级的，必须清掉，否则读到别的用例留下的快照。
+        models_router._native_cache.update({"at": 0.0, "ids": {}})
         dispatch.invalidate_model_cache()
 
     def tearDown(self):
         dispatch = getattr(self, "_dispatch", None)
-        if dispatch is not None:
-            dispatch.invalidate_model_cache()
+        router = getattr(self, "_models_router", None)
         db = getattr(self, "_db", None)
         if db is not None:
-            db.close()
+            from admin.models import ModelConfig
 
-    def test_slot_name_maps_back_to_readable_name(self):
-        """槽位名（别名还原的产物）要映射回可读名后放行，不能再 404。"""
-        model, error = self._dispatch._model_for_platform(
-            self._db, "marvis", "main-auto")
-        self.assertEqual(model, "main-auto")
-        self.assertIsNone(error, "槽位名 main-auto 应被放行，实际：%r" % (error,))
-        # 线上实测挂掉的另外三个槽位同样必须放行（不是只修 main-auto）
-        for slot in ("deepseek-v4-pro-external", "hy3-preview-agent",
-                     "hy3-preview-agent-real"):
-            mapped, err = self._dispatch._model_for_platform(
+            db.query(ModelConfig).filter(
+                ModelConfig.platform == "marvis").delete()
+            db.commit()
+            db.close()
+        if router is not None:
+            router._native_cache.update({"at": 0.0, "ids": {}})
+        if dispatch is not None:
+            dispatch.invalidate_model_cache()
+
+    def test_client_names_pass_the_rewrite_chain(self):
+        """4 个线上挂掉的 marvis 名字，走完整改写链后必须不再 404。"""
+        from admin.platform import model_suffix
+
+        for name in self.CLIENT_NAMES:
+            _, bare, _ = model_suffix.resolve(name)
+            _, upstream = model_suffix.alias_to_upstream(name)
+            _, error = self._dispatch._model_for_platform(
+                self._db, "marvis", upstream or bare or name)
+            self.assertIsNone(error, "%s 被判成 %r" % (name, error))
+
+    def test_slot_names_are_mapped_not_rejected(self):
+        """裸槽位名（老客户端配置里的写法）也要认，并映射回可读名。"""
+        for slot in self.SLOTS:
+            mapped, error = self._dispatch._model_for_platform(
                 self._db, "marvis", slot)
-            self.assertEqual(mapped, slot)
-            self.assertIsNone(err, "槽位名 %s 应被放行，实际：%r" % (slot, err))
+            self.assertIsNone(error, "槽位名 %s 被判成 %r" % (slot, error))
+            self.assertIn(mapped, self.MODELS,
+                          "槽位名 %s 应映射到可读名，实际 %r" % (slot, mapped))
 
     def test_unknown_model_is_still_rejected(self):
         """真不存在的模型必须继续 404 —— 别把校验顺手改成「全放行」。"""
