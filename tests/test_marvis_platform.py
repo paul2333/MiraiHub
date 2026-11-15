@@ -375,6 +375,16 @@ class EventLoopSafetyTests(unittest.TestCase):
                      "risk_control"):
             self.assertNotIn(kind, gateway.RETRY_SAME_ACCOUNT_KINDS)
 
+    def test_retry_biz_codes_only_contain_illegal_request(self):
+        """业务码白名单**只**放 4100406：4100403 是 auth、4100404 是风控。"""
+        from admin.platform.marvis import gateway
+
+        self.assertIn("4100406", gateway.RETRY_SAME_ACCOUNT_BIZ_CODES)
+        for code in ("4100403", "4100404"):
+            self.assertNotIn(code, gateway.RETRY_SAME_ACCOUNT_BIZ_CODES)
+        self.assertEqual(gateway.SAME_ACCOUNT_RETRIES, 1,
+                         "仍然只重试一次（复用原有的一次性标记）")
+
 
 class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
     """同号重试：只对白名单 kind，且**复用同一个账号**（不重新选号）。"""
@@ -407,7 +417,27 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got, "STREAM")
         self.assertEqual(calls, [7, 7], "必须是同一个账号重试")
 
-    async def test_business_error_is_not_retried(self):
+    async def test_illegal_request_4100406_retries_same_account_once(self):
+        """4100406 是上游**偶发**拒绝（同号同分钟 200/403 交替）⇒ 同号重试一次。"""
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            if len(calls) == 1:
+                raise self.mclient.UpstreamError(
+                    "模型网关失败（HTTP 403）", status=403, code="403",
+                    kind=self.mclient._classify(
+                        403, '{"code":4100406,"msg":"非法请求"}'),
+                    detail='{"code":4100406,"msg":"非法请求"}')
+            return "STREAM"
+
+        self.mclient.open_chat_stream = fake_open
+        got = await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+        self.assertEqual(got, "STREAM")
+        self.assertEqual(calls, [7, 7], "4100406 必须同号重试，且只重试一次")
+
+    async def test_illegal_request_4100406_gives_up_after_one_retry(self):
+        """连撞两次 4100406 仍然要抛 —— 不许变成无限重试。"""
         calls = []
 
         def fake_open(data, realm, body, *, account_id=0):
@@ -420,7 +450,55 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
         self.mclient.open_chat_stream = fake_open
         with self.assertRaises(self.mclient.UpstreamError):
             await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
-        self.assertEqual(len(calls), 1, "upstream_business 不许重试")
+        self.assertEqual(len(calls), 2, "只许重试一次（1 次首发 + 1 次重试）")
+
+    async def test_other_business_error_is_not_retried(self):
+        """4100406 之外的业务拒绝仍然不重试（本次只放开这一个码）。"""
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            raise self.mclient.UpstreamError(
+                "模型网关失败（HTTP 403）", status=403, code="403",
+                kind="upstream_business",
+                detail='{"code":4100410,"msg":"请求不合法"}')
+
+        self.mclient.open_chat_stream = fake_open
+        with self.assertRaises(self.mclient.UpstreamError):
+            await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+        self.assertEqual(len(calls), 1, "非 4100406 的 upstream_business 不许重试")
+
+    async def test_param_error_400_is_not_retried(self):
+        """400 参数错：换号没用、重打也没用 ⇒ 一次就抛（不浪费一次 5s 往返）。"""
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            raise self.mclient.UpstreamError(
+                "模型网关失败（HTTP 400）", status=400, code="400",
+                kind="upstream_business",
+                detail='{"code":400,"msg":"参数错误"}')
+
+        self.mclient.open_chat_stream = fake_open
+        with self.assertRaises(self.mclient.UpstreamError):
+            await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+        self.assertEqual(len(calls), 1, "400 参数错不许重试")
+
+    async def test_auth_kind_with_same_code_is_not_retried(self):
+        """kind 是 auth / risk_control 时，即便 detail 里带 4100406 也不重试。"""
+        for kind in ("auth", "risk_control"):
+            calls = []
+
+            def fake_open(data, realm, body, *, account_id=0):
+                calls.append(account_id)
+                raise self.mclient.UpstreamError(
+                    "模型网关失败（HTTP 403）", status=403, code="403",
+                    kind=kind, detail='{"code":4100406,"msg":"非法请求"}')
+
+            self.mclient.open_chat_stream = fake_open
+            with self.assertRaises(self.mclient.UpstreamError):
+                await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+            self.assertEqual(len(calls), 1, "kind=%s 不许重试" % kind)
 
 
 class DispatchModelForPlatformTests(unittest.TestCase):

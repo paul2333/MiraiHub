@@ -175,11 +175,26 @@ def _prepare_body(body: dict, slot: str) -> dict:
 #: 只有这两类是「网络抖动 / 上游瞬断」：换号没用（新号一样走同一条坏链路），
 #: 同一个号隔几百毫秒再来一次往往就过去了。
 #:
-#: `upstream_business`（4100406 非法请求这类请求级拒绝）、`auth`、
-#: `risk_control`、`signature_invalid` **一律不在白名单** —— 它们不会因为
-#: 「再打一次」而变好；上一版把瞬时 403 当成可重试信号（`exclude.discard()`
-#: 后重新选号）实际是「换号重试」，既救不了请求也白占一个租约。
+#: `auth`、`risk_control`、`signature_invalid` **一律不在白名单** ——
+#: 它们不会因为「再打一次」而变好；上一版把瞬时 403 当成可重试信号
+#: （`exclude.discard()` 后重新选号）实际是「换号重试」，既救不了请求也
+#: 白占一个租约。
+#:
+#: `upstream_business` 整体也不在白名单 —— 唯一的例外是
+#: `RETRY_SAME_ACCOUNT_BIZ_CODES` 里的业务码，见下。
 RETRY_SAME_ACCOUNT_KINDS = frozenset({"network", "timeout"})
+#: 上游偶发 403 4100406「非法请求」：实测同号同分钟 200/403 交替（约 10%），
+#: 且事件循环阻塞修复后单次仅 ~5s ⇒ 同号重试一次可把失败率压到 ~1%。
+#:
+#: 证据（2026-11-15 14:40–15:05，`request_audits` 21 行）：2 条 403
+#: （14:49:51 用时 5.3s、14:52:46 用时 5.5s）+ 19 条 200，同一 key
+#: （api_key_id=3）、同一模型（deepseek-v4.1-flash-marvis）。同号、同分钟
+#: 内 200 与 403 交替 ⇒ 这是**上游偶发**拒绝，不是请求体本身错，也不是
+#: 账号/凭证问题（换号救不了，所以仍然复用同一个账号）。
+#:
+#: ⚠ 只放这一个码：4100403（登录态过期）是 `auth`、4100404（风控）是
+#: `risk_control`，都不在这里，也不会因为这条规则被重试。
+RETRY_SAME_ACCOUNT_BIZ_CODES = frozenset({"4100406"})
 #: 同号重试次数（不含首次）。
 SAME_ACCOUNT_RETRIES = 1
 #: 同号重试前的抖动退避（秒）。瞬时网络失败立刻重发常常还是失败。
@@ -208,7 +223,14 @@ def _warn_upstream_failure(account, exc: client.UpstreamError, *,
 
 async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                          stream: bool):
-    """调上游 —— **整个调用跑在工作线程里**，只对白名单瞬时 kind 同号重试。
+    """调上游 —— **整个调用跑在工作线程里**，只对「瞬时」失败同号重试一次。
+
+    ## 什么算「瞬时」
+
+    ① 白名单 kind（`network` / `timeout`）；
+    ② `upstream_business` 里 **业务码命中 `RETRY_SAME_ACCOUNT_BIZ_CODES`**
+       （当前只有 `4100406 非法请求`）—— 实测同号同分钟 200/403 交替，属上游
+       偶发，重打一次就过；参数类错误（400/422）不在此列，换号/重打都无用。
 
     ## 为什么必须 `to_thread`
 
@@ -235,12 +257,20 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                 client.chat_completions, data, realm, body,
                 account_id=account_id)
         except client.UpstreamError as exc:
-            if (index + 1 > SAME_ACCOUNT_RETRIES
-                    or exc.kind not in RETRY_SAME_ACCOUNT_KINDS):
+            # 白名单 kind（网络抖动 / 瞬断）**或** 上游偶发业务码（4100406）。
+            # 后者只在 kind 已经是 `upstream_business` 时才看 —— `auth` /
+            # `risk_control` 即便 detail 里带了同一个码也不重试。
+            transient = exc.kind in RETRY_SAME_ACCOUNT_KINDS or (
+                exc.kind == "upstream_business"
+                and any(code in str(exc.detail or "")
+                        for code in RETRY_SAME_ACCOUNT_BIZ_CODES))
+            # 仍然**只重试一次**：`index + 1 > SAME_ACCOUNT_RETRIES` 是唯一
+            # 的一次性标记，没有第二个计数器。
+            if index + 1 > SAME_ACCOUNT_RETRIES or not transient:
                 raise
             logger.warning(
-                "Marvis 瞬时失败（kind=%s status=%s），同号重试一次 acc=%s",
-                exc.kind, exc.status or "-", account_id)
+                "Marvis 瞬时失败（kind=%s status=%s code=%s），同号重试一次 acc=%s",
+                exc.kind, exc.status or "-", exc.code or "-", account_id)
             await asyncio.sleep(SAME_ACCOUNT_RETRY_DELAY)
 
 
@@ -314,8 +344,9 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             last_error = exc
             exclude.add(account.id)
             # 参数类错误换号也没用，直接停。
-            # 同号重试已经在 `_call_upstream` 里做过（且只对白名单 kind），
-            # 这里只负责「换号」—— 不做 `exclude.discard()` 的伪重试。
+            # 同号重试已经在 `_call_upstream` 里做过（白名单 kind + 4100406
+            # 业务码，且只一次），这里只负责「换号」—— 不做 `exclude.discard()`
+            # 的伪重试。
             if exc.status in (400, 422) and exc.kind not in (
                     "auth", "rate_limit", "risk_control"):
                 break
