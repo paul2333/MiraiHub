@@ -72,6 +72,10 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 #: 额度用尽 —— 因为循环上限是 3：只要前 3 个被选中的号都回了 402，
 #: 就直接把错误甩给客户端。提到 8 之后，撞上几个当日额度用尽的号也能
 #: 继续往后试；上限仍有意义（每次尝试占一个号的租约）。
+#: 402 且余额为正（多半是该号没有请求的模型）时的短冷却秒数。
+#: 取值只为「本轮换号 + 短暂避开」，不应长到把号池摘空。
+MODEL_MISS_COOL_SECONDS = 60
+
 MAX_ATTEMPTS = _env_int("LOOMY_MAX_ATTEMPTS", 8)
 LEASE_WAIT_SECONDS = 2.0
 
@@ -543,10 +547,15 @@ def _attempt(db, request, key, body: dict, realm: str):
                     available = int(((probe or {}).get("quota") or {}).get("available") or 0)
                     if available > 0:
                         zero_balance = False
-                        cool_seconds = 300
+                        # 402 且余额为正：多半是该号**没有请求的模型**（部分号只开了
+                        # spark 系列，有余额也用不了）。按「额度耗尽」冷却 300s 会把号池
+                        # 越用越少，最终真的变成「全都没额度」。本轮已由 exclude_identity
+                        # 排掉，这里只做短冷却，直接换下一个号即可。
+                        cool_seconds = MODEL_MISS_COOL_SECONDS
                         logger.info(
-                            "Loomy 402 但余额仍为 %s，判为当日/瞬时限额，冷却 300s（acc=%s）",
-                            available, account.id)
+                            "Loomy 402 但余额仍为 %s（疑似无 %s 模型），"
+                            "短冷却 %ss 换号（acc=%s）",
+                            available, model, cool_seconds, account.id)
                 except Exception:  # noqa: BLE001 - 复核失败按原逻辑保守处理
                     logger.debug("Loomy 402 余额复核失败 acc=%s", account.id,
                                  exc_info=True)
@@ -892,10 +901,15 @@ def _open_stream(db, request, key, body: dict, realm: str, stats: dict,
                     available = int(((probe or {}).get("quota") or {}).get("available") or 0)
                     if available > 0:
                         zero_balance = False
-                        cool_seconds = 300
+                        # 402 且余额为正：多半是该号**没有请求的模型**（部分号只开了
+                        # spark 系列，有余额也用不了）。按「额度耗尽」冷却 300s 会把号池
+                        # 越用越少，最终真的变成「全都没额度」。本轮已由 exclude_identity
+                        # 排掉，这里只做短冷却，直接换下一个号即可。
+                        cool_seconds = MODEL_MISS_COOL_SECONDS
                         logger.info(
-                            "Loomy 流式 402 但余额仍为 %s，短暂冷却 300s（acc=%s）",
-                            available, account.id)
+                            "Loomy 流式 402 但余额仍为 %s（疑似无 %s 模型），"
+                            "短冷却 %ss 换号（acc=%s）",
+                            available, model, cool_seconds, account.id)
                 except Exception:  # noqa: BLE001
                     logger.debug("流式 402 余额复核失败 acc=%s", account.id,
                                  exc_info=True)
