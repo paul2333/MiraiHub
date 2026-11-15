@@ -31,8 +31,11 @@ DSH 侧就显示成「API key is invalid」）。
 from __future__ import annotations
 
 import asyncio
+import gzip
+import hashlib
 import json
 import logging
+import os
 import random
 import time
 
@@ -56,6 +59,34 @@ STORAGE = marvis_accounts.PLATFORM
 #: 看不出是「池里没别的号」还是「换号没发生」。现在换号显式化并留日志
 #: （`Marvis 换号重试` / `Marvis 换号终止`）。
 MAX_ATTEMPTS = 3
+
+#: 403 请求体转储 —— **临时排障开关，默认关闭**（2026-11-16 加）。
+#:
+#: 线上 4100406 只在大请求上出现（bytes=3590147 / msgs=270 / sys_chars=142860，
+#: 3 次尝试全 403），同一时刻同一个号的小请求 200；而**同形状的合成请求**
+#: （270 条 / 3.65MB / sys 143K）全部 200 ⇒ 触发条件是**具体内容**，不是体积、
+#: 不是消息数、不是 tools 数。要二分内容，先得拿到真实失败的那一份 body。
+#:
+#: 开关（每次调用都读环境变量，改 env 后无需改代码）：
+#:   · `MIRAIHUB_MARVIS_DUMP_403=1`      打开转储；默认 0 / 未设置 = 完全不碰磁盘；
+#:   · `MIRAIHUB_MARVIS_DUMP_403_DIR`   目录，默认 `/tmp`（容器内）；
+#:   · `MIRAIHUB_MARVIS_DUMP_403_KEEP`  最多保留几份，默认 3。
+#:
+#: ⚠ **内容绝不进日志**：日志里只有路径与字节数。dump 文件里是用户对话原文，
+#: 排障结束必须删除（`_prune_dump_403` 只管份数，不管生命周期）。
+DUMP_403_ENV = "MIRAIHUB_MARVIS_DUMP_403"
+DUMP_403_DIR_ENV = "MIRAIHUB_MARVIS_DUMP_403_DIR"
+DUMP_403_KEEP_ENV = "MIRAIHUB_MARVIS_DUMP_403_KEEP"
+DUMP_403_DEFAULT_DIR = "/tmp"
+DUMP_403_DEFAULT_KEEP = 3
+DUMP_403_PREFIX = "mh403-"
+#: 已落盘内容的指纹 → 路径。
+#:
+#: 一次请求会打多次上游（同号最多 3 次 + 换号最多 3 个号），**body 完全相同**；
+#: 不去重的话一次请求就能把 3 个名额占满，而且三份内容一模一样、毫无增量。
+#: 按内容 sha256 去重 ⇒ 一次请求最多落一份，名额留给**不同**的失败请求。
+_DUMP_403_SEEN: dict[str, str] = {}
+_DUMP_403_SEEN_MAX = 16
 
 PATHS = frozenset({
     "/v1/chat/completions",
@@ -272,6 +303,89 @@ def _profile_of(body: dict) -> dict:
             "sys_chars": sys_chars, "max_tokens": body.get("max_tokens")}
 
 
+def _dump_403_enabled() -> bool:
+    """临时转储开关是否打开（每次调用都读环境变量，默认关闭）。"""
+    return str(os.environ.get(DUMP_403_ENV) or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _dump_403_keep() -> int:
+    """最多保留几份；非法值退回默认 3。"""
+    try:
+        keep = int(str(os.environ.get(DUMP_403_KEEP_ENV) or "").strip() or
+                   DUMP_403_DEFAULT_KEEP)
+    except (TypeError, ValueError):
+        return DUMP_403_DEFAULT_KEEP
+    return keep if keep > 0 else DUMP_403_DEFAULT_KEEP
+
+
+def _prune_dump_403(directory: str) -> None:
+    """只留最新 N 份，删最旧的。
+
+    文件名里带纳秒时间戳（`mh403-<ns>-<sha16>.json.gz`），定宽 ⇒ 字典序就是
+    时间序，不用 stat 每个文件。
+    """
+    keep = _dump_403_keep()
+    try:
+        names = sorted(name for name in os.listdir(directory)
+                       if name.startswith(DUMP_403_PREFIX)
+                       and name.endswith(".json.gz"))
+    except OSError:
+        return
+    for name in names[:max(0, len(names) - keep)]:
+        try:
+            os.unlink(os.path.join(directory, name))
+        except OSError:  # noqa: PERF203 - 删不掉不影响本次转储
+            pass
+
+
+def _dump_403_body(body: dict, *, status: int | None,
+                   account_id: int = 0) -> str:
+    """把**本次实际发出的 body 原始字节**写成 gzip，返回路径（未落盘返回空串）。
+
+    字节与 `client.open_chat_stream` 发出去的完全一致：
+    `json.dumps(body, ensure_ascii=False).encode()`（client.py 同一行），
+    所以**原样重放这份 dump 就等于重放上游当时收到的那份请求**。
+
+    只对 `status == 403` 落盘，且同内容只落一次（见 `_DUMP_403_SEEN`）。
+    ⚠ 绝不把内容写进日志 —— 日志里只有路径与字节数。
+    """
+    if not _dump_403_enabled() or status != 403:
+        return ""
+    try:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    except Exception:  # noqa: BLE001 - 转储失败绝不能影响转发
+        logger.warning("Marvis 403 转储：body 序列化失败，已跳过")
+        return ""
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    seen = _DUMP_403_SEEN.get(digest)
+    if seen:
+        return seen
+    directory = str(os.environ.get(DUMP_403_DIR_ENV) or DUMP_403_DEFAULT_DIR)
+    path = os.path.join(directory, "%s%d-%s.json.gz" % (
+        DUMP_403_PREFIX, time.time_ns(), digest))
+    try:
+        os.makedirs(directory, exist_ok=True)
+        # 先写 .part 再 rename：读到半截文件的重放脚本会拿到坏 JSON。
+        partial = path + ".part"
+        with gzip.open(partial, "wb") as handle:
+            handle.write(data)
+        os.replace(partial, path)
+    except Exception as exc:  # noqa: BLE001 - 同上，绝不能影响转发
+        logger.warning("Marvis 403 转储失败 path=%s: %s",
+                       path, type(exc).__name__)
+        return ""
+    _prune_dump_403(directory)
+    if len(_DUMP_403_SEEN) >= _DUMP_403_SEEN_MAX:
+        _DUMP_403_SEEN.clear()
+    _DUMP_403_SEEN[digest] = path
+    # 只有路径与字节数 —— 内容一个字符都不进日志。
+    logger.warning(
+        "Marvis 403 请求体已转储 path=%s bytes=%d acc=%s（内容不进日志；"
+        "排障结束必须删除）", path, len(data), account_id)
+    return path
+
+
 async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                          stream: bool, profile: dict | None = None):
     """调上游 —— **整个调用跑在工作线程里**，只对「瞬时」失败同号重试（最多 2 次）。
@@ -335,6 +449,13 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                 exc.kind, exc.status or "-", exc.code or "-", account_id,
                 profile["bytes"], profile["msgs"], profile["tools"],
                 profile["sys_chars"], index + 1, 1 + SAME_ACCOUNT_RETRIES)
+            # 403 时把「本次实际发出的 body」转储一份（仅当
+            # MIRAIHUB_MARVIS_DUMP_403=1；默认关闭，连目录都不建）。
+            # 放 to_thread：3.5MB 的 gzip 要十几毫秒，不能钉在事件循环上。
+            if exc.status == 403:
+                await asyncio.to_thread(
+                    _dump_403_body, body, status=exc.status,
+                    account_id=account_id)
             # 白名单 kind（网络抖动 / 瞬断）**或** 上游偶发业务码（4100406）。
             # 后者只在 kind 已经是 `upstream_business` 时才看 —— `auth` /
             # `risk_control` 即便 detail 里带了同一个码也不重试。

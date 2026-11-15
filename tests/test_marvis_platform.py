@@ -759,6 +759,170 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, joined, "请求画像绝不能打印 body 内容")
 
 
+class Dump403Tests(unittest.IsolatedAsyncioTestCase):
+    """403 请求体转储（临时排障开关）：默认关闭、只对 403、内容绝不进日志。
+
+    线上 4100406 只在大请求上偶发（bytes=3590147 / msgs=270），同形状的合成
+    请求全 200 ⇒ 触发条件是**内容**。要二分内容，必须拿到真实失败的那份 body；
+    这里钉死转储的四个不变量，免得开关本身成为新的线上风险：
+
+      ① 默认关闭 —— 不设 env 时**一个字节都不写盘**；
+      ② 只对 403 —— 500 / 200 不落盘（否则名额被无关失败占满）；
+      ③ 落盘字节 == 上游实际收到的字节（`json.dumps(..., ensure_ascii=False)`），
+         否则重放的不是同一份请求，二分结论无意义；
+      ④ 内容不进日志 —— 日志只有路径与字节数（dump 里是用户对话原文）。
+    """
+
+    def setUp(self):
+        import tempfile
+
+        from admin.platform.marvis import gateway
+
+        self.gateway = gateway
+        self._tmp = tempfile.mkdtemp(prefix="mh403-test-")
+        self._env_keys = (gateway.DUMP_403_ENV, gateway.DUMP_403_DIR_ENV,
+                          gateway.DUMP_403_KEEP_ENV)
+        self._saved_env = {k: os.environ.get(k) for k in self._env_keys}
+        self._saved_seen = dict(gateway._DUMP_403_SEEN)
+        gateway._DUMP_403_SEEN.clear()
+        for key in self._env_keys:
+            os.environ.pop(key, None)
+        # 端到端用例会真的走到同号重试分支：退避置 0，别让测试真睡。
+        self._saved_delay = gateway.SAME_ACCOUNT_RETRY_DELAY
+        self._saved_jitter = gateway.SAME_ACCOUNT_RETRY_JITTER
+        gateway.SAME_ACCOUNT_RETRY_DELAY = 0
+        gateway.SAME_ACCOUNT_RETRY_JITTER = 0
+
+    def tearDown(self):
+        import shutil
+
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.gateway._DUMP_403_SEEN.clear()
+        self.gateway._DUMP_403_SEEN.update(self._saved_seen)
+        self.gateway.SAME_ACCOUNT_RETRY_DELAY = self._saved_delay
+        self.gateway.SAME_ACCOUNT_RETRY_JITTER = self._saved_jitter
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _enable(self, keep=None):
+        os.environ[self.gateway.DUMP_403_ENV] = "1"
+        os.environ[self.gateway.DUMP_403_DIR_ENV] = self._tmp
+        if keep is not None:
+            os.environ[self.gateway.DUMP_403_KEEP_ENV] = str(keep)
+
+    def _files(self):
+        return sorted(os.listdir(self._tmp))
+
+    def test_disabled_by_default_writes_nothing(self):
+        path = self.gateway._dump_403_body({"messages": []}, status=403)
+        self.assertEqual(path, "")
+        self.assertEqual(self._files(), [], "默认关闭时不许碰磁盘")
+
+    def test_only_403_is_dumped(self):
+        self._enable()
+        for status in (200, 400, 500, 502, None):
+            self.assertEqual(
+                self.gateway._dump_403_body({"messages": []}, status=status), "")
+        self.assertEqual(self._files(), [], "只有 403 才落盘")
+
+    def test_dump_bytes_equal_sent_bytes(self):
+        """落盘内容必须与 client 真正发出的字节逐字节相同。"""
+        import gzip
+        import json
+
+        self._enable()
+        body = {
+            "model": "main-auto",
+            "max_tokens": 128000,
+            "messages": [
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {"role": "user", "content": "中文 + emoji 😀 + \n 换行"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "t"}}],
+        }
+        path = self.gateway._dump_403_body(body, status=403, account_id=189)
+        self.assertTrue(path.endswith(".json.gz"))
+        with gzip.open(path, "rb") as handle:
+            raw = handle.read()
+        self.assertEqual(raw, json.dumps(body, ensure_ascii=False).encode("utf-8"))
+
+    def test_content_never_reaches_logs(self):
+        secret = "用户私有对话内容-绝不应出现在日志里"
+        self._enable()
+        body = {"messages": [{"role": "user", "content": secret}]}
+        with self.assertLogs("admin.platform.marvis.gateway", level="WARNING") as logs:
+            path = self.gateway._dump_403_body(body, status=403, account_id=189)
+        joined = "\n".join(logs.output)
+        self.assertIn("Marvis 403 请求体已转储", joined)
+        self.assertIn(os.path.basename(path), joined, "日志要给路径，否则没法取文件")
+        self.assertIn("bytes=", joined)
+        self.assertNotIn(secret, joined, "转储日志绝不能打印 body 内容")
+
+    def test_same_body_dumped_once(self):
+        """同一次请求的重试/换号共享同一份 body ⇒ 只落一份。"""
+        self._enable()
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        first = self.gateway._dump_403_body(body, status=403)
+        second = self.gateway._dump_403_body(body, status=403)
+        self.assertEqual(first, second)
+        self.assertEqual(len(self._files()), 1, "同一份内容不许重复占名额")
+
+    def test_keeps_only_newest_three(self):
+        self._enable()
+        paths = []
+        for index in range(5):
+            body = {"messages": [{"role": "user", "content": "n%d" % index}]}
+            paths.append(self.gateway._dump_403_body(body, status=403))
+        files = self._files()
+        self.assertEqual(len(files), 3, "最多保留 3 份")
+        kept = {os.path.basename(path) for path in paths[-3:]}
+        self.assertEqual(set(files), kept, "留下的是最新的 3 份")
+
+    async def test_upstream_403_triggers_dump_but_500_does_not(self):
+        """端到端：`_call_upstream` 的 403 分支要真的把 body 落盘。"""
+        from admin.platform.marvis.core import client as mclient
+
+        self._enable()
+        orig_open = mclient.open_chat_stream
+        self.addCleanup(setattr, mclient, "open_chat_stream", orig_open)
+
+        def open_403(data, realm, body, *, account_id=0):
+            raise mclient.UpstreamError(
+                "模型网关失败（HTTP 403）", status=403, code="403",
+                kind="upstream_business",
+                detail='{"code":4100406,"msg":"非法请求"}')
+
+        mclient.open_chat_stream = open_403
+        body = {"model": "main-auto",
+                "messages": [{"role": "user", "content": "big"}]}
+        with self.assertLogs("admin.platform.marvis.gateway", level="WARNING"):
+            with self.assertRaises(mclient.UpstreamError):
+                await self.gateway._call_upstream({}, "cn", body, 189,
+                                                  stream=True)
+        self.assertEqual(len(self._files()), 1, "403 必须落一份，且只落一份")
+
+        os.environ.pop(self.gateway.DUMP_403_ENV, None)
+        self.gateway._DUMP_403_SEEN.clear()
+        before = set(self._files())
+
+        def open_500(data, realm, body, *, account_id=0):
+            raise mclient.UpstreamError(
+                "模型网关失败（HTTP 500）", status=500, code="500",
+                kind="upstream_error")
+
+        mclient.open_chat_stream = open_500
+        os.environ[self.gateway.DUMP_403_ENV] = "1"
+        # 500 走 kind=upstream_error ⇒ 不重试、也不落盘；这里只要求「不落盘」。
+        with self.assertLogs("admin.platform.marvis.gateway", level="INFO"):
+            with self.assertRaises(mclient.UpstreamError):
+                await self.gateway._call_upstream({}, "cn", body, 189,
+                                                  stream=True)
+        self.assertEqual(set(self._files()), before, "500 不许落盘")
+
+
 class DispatchModelForPlatformTests(unittest.TestCase):
     """dispatch 的「这个模型属于该平台吗」校验（2026-11-15 线上 404 回归）。
 
