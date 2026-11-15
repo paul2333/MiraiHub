@@ -11,11 +11,22 @@ Marvis 的模型网关 `POST /v1/chat/completions` 本身就是 OpenAI 兼容的
   3. **流式原样转发** —— 不在这里读干流。
   4. **记账** —— 落 usage_logs，控制台的用量与积分统计靠它。
 
-## 为什么流式要用线程池读
+## 为什么**每一个**上游调用都要在工作线程里
 
-`core/client.py` 走的是 `urllib`（同步）。在 async handler 里直接 `stream.read()`
-会把整个事件循环按秒级卡住 —— 一个慢速长回答就能让全网关停摆。这里用
-`run_in_executor` 把每块读放到工作线程，事件循环照常服务其它请求。
+`core/client.py` 走的是 `urllib`（同步）。在 async handler 里直接
+`urlopen` / `stream.read()` 会把整个事件循环按秒级卡住 ——
+`admin.server` 是单进程单 worker 的 uvicorn，事件循环一停，全站（控制台、
+账号同步、健康检查、所有平台的转发）一起停摆。
+
+2026-11-15 线上事故就是这一条：`open_chat_stream` 里的 `urlopen` 在事件
+循环线程上等上游状态行，`admin.loop_watch` 实测卡死
+3.3s / 7s / 17s / 27s / **63.5s**，43 个在飞请求被串行化后超期，上游回
+`4100406 非法请求`（再被旧版 `_classify` 误判成 `signature_invalid`，
+DSH 侧就显示成「API key is invalid」）。
+
+所以现在：**建连**（`open_chat_stream` / `chat_completions`）、**逐块读**
+（`resp.read`）、以及**同步 DB**（选号 / 租约 / 记账）全部走
+`asyncio.to_thread`；事件循环线程上只剩 await。
 """
 from __future__ import annotations
 
@@ -159,12 +170,97 @@ def _prepare_body(body: dict, slot: str) -> dict:
     return out
 
 
-def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
-    """选号 + 租约 + 调上游。换号语义与其它平台一致。"""
+#: 允许「**同号**立刻重试一次」的瞬时失败 kind。
+#:
+#: 只有这两类是「网络抖动 / 上游瞬断」：换号没用（新号一样走同一条坏链路），
+#: 同一个号隔几百毫秒再来一次往往就过去了。
+#:
+#: `upstream_business`（4100406 非法请求这类请求级拒绝）、`auth`、
+#: `risk_control`、`signature_invalid` **一律不在白名单** —— 它们不会因为
+#: 「再打一次」而变好；上一版把瞬时 403 当成可重试信号（`exclude.discard()`
+#: 后重新选号）实际是「换号重试」，既救不了请求也白占一个租约。
+RETRY_SAME_ACCOUNT_KINDS = frozenset({"network", "timeout"})
+#: 同号重试次数（不含首次）。
+SAME_ACCOUNT_RETRIES = 1
+#: 同号重试前的抖动退避（秒）。瞬时网络失败立刻重发常常还是失败。
+SAME_ACCOUNT_RETRY_DELAY = 0.3
+
+
+def _warn_upstream_failure(account, exc: client.UpstreamError, *,
+                           model: str, stream: bool) -> None:
+    """上游失败打一条 warn —— 可观测性的最低要求。
+
+    2026-11-15 之前 marvis 失败**一条日志都没有**：线上只能靠 `usage_logs`
+    的毫秒时间戳反推「哪一秒开始串行化」，完全看不出失败原因（kind / 业务码 /
+    到底是哪个号 / 上游原话）。这里把 kind、HTTP 状态、业务码、detail 前
+    200 字符和 account id 一次打全。
+
+    ⚠ **不含任何凭证**：detail 是上游返回体，access_token 只在请求头里。
+    """
+    detail = str(exc.detail or exc.message or "").replace("\n", " ").replace("\r", " ")
+    logger.warning(
+        "Marvis 上游失败 kind=%s status=%s code=%s acc=%s model=%s stream=%s "
+        "detail=%s",
+        exc.kind, exc.status or "-", exc.code or "-",
+        int(getattr(account, "id", 0) or 0), model or "-",
+        "1" if stream else "0", detail[:200])
+
+
+async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
+                         stream: bool):
+    """调上游 —— **整个调用跑在工作线程里**，只对白名单瞬时 kind 同号重试。
+
+    ## 为什么必须 `to_thread`
+
+    `client.open_chat_stream` 内部是 `urllib.request.urlopen`：它会一直阻塞
+    到上游把**响应状态行 + 响应头**吐回来。`admin.server` 是单进程单 worker
+    的 uvicorn，在事件循环线程里调它等于把整个网关钉死 —— 2026-11-15 实测
+    单次阻塞 3.3s/7s/17s/27s/**63.5s**，43 个在飞请求被串行化后超期，
+    上游回 `4100406 非法请求`。非流式的 `chat_completions` 会 `read()`
+    整个响应体，同样是阻塞调用，同样要挪出去。
+
+    ## 为什么重试**不重新选号**
+
+    `select_account` 是「换号」语义。瞬时网络失败时换号毫无意义，还会白占
+    一个租约；这里重试**复用同一个已租账号**（不 `exclude.discard`、不重新
+    `select`），与「换号」严格分开。
+    """
+    for index in range(1 + SAME_ACCOUNT_RETRIES):
+        try:
+            if stream:
+                return await asyncio.to_thread(
+                    client.open_chat_stream, data, realm, body,
+                    account_id=account_id)
+            return await asyncio.to_thread(
+                client.chat_completions, data, realm, body,
+                account_id=account_id)
+        except client.UpstreamError as exc:
+            if (index + 1 > SAME_ACCOUNT_RETRIES
+                    or exc.kind not in RETRY_SAME_ACCOUNT_KINDS):
+                raise
+            logger.warning(
+                "Marvis 瞬时失败（kind=%s status=%s），同号重试一次 acc=%s",
+                exc.kind, exc.status or "-", account_id)
+            await asyncio.sleep(SAME_ACCOUNT_RETRY_DELAY)
+
+
+async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
+    """选号 + 租约 + 调上游。换号语义与其它平台一致。
+
+    ## 为什么是 async，且每一步都要 `to_thread`
+
+    这里的三类调用全是**同步阻塞**的：
+
+      · `shared.select_account` / `lease` / `note_failure`：SQLAlchemy 同步会话；
+      · `marvis_accounts.ensure_token`：可能 `db.commit()`；
+      · `client.open_chat_stream` / `chat_completions`：`urllib` 同步 HTTP。
+
+    留在事件循环线程上，任何一次慢调用都是**全站**慢（见 `_call_upstream`
+    的 63.5 秒事故）。所以这里一步都不留在循环上。
+    """
     model = str(body.get("model") or "")
     exclude: set[int] = set()
     last_error: client.UpstreamError | None = None
-    retried_same = False
     for _ in range(MAX_ATTEMPTS):
         # `min_balance=0` = 只要余额 > 0 的号。
         #
@@ -173,28 +269,29 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
         # 它又排回队首（这些号从没成功过，`last_used_at` 恒为 NULL，选号按它升序）
         # —— 用户感受到的就是「一直失败，用不了」。NULL 余额（从没同步过）仍放行，
         # 否则新导入的号会被全部误杀。
-        account = shared.select_account(
-            db, storage=STORAGE, realm=realm, key=key,
+        account = await asyncio.to_thread(
+            shared.select_account, db, storage=STORAGE, realm=realm, key=key,
             model=model, exclude_ids=exclude, min_balance=0)
         if account is None:
             break
-        if not shared.lease(account):
+        if not await asyncio.to_thread(shared.lease, account):
             exclude.add(account.id)
             continue
         started = time.perf_counter()
         try:
-            data = marvis_accounts.ensure_token(db, account)
-            if stream:
-                resp = client.open_chat_stream(
-                    data, realm, body, account_id=int(account.id or 0))
-                return resp, account, started
-            result = client.chat_completions(
-                data, realm, body, account_id=int(account.id or 0))
-            shared.note_success(account)
-            shared.release(account)
+            data = await asyncio.to_thread(
+                marvis_accounts.ensure_token, db, account)
+            result = await _call_upstream(
+                data, realm, body, int(account.id or 0), stream=stream)
+            if not stream:
+                shared.note_success(account)
+                shared.release(account)
             return result, account, started
         except client.UpstreamError as exc:
             shared.release(account)
+            # 可观测性：失败必须留痕（kind / status / 业务码 / detail / 号）。
+            # ⚠ 放在「改写成用户文案」之前 —— 这里要的是**上游原话**。
+            _warn_upstream_failure(account, exc, model=model, stream=stream)
             # 401 是「登录态过期」而不是「配置错了」—— 文案要能直接指导操作。
             # Marvis 的 token 实测只活约 2 小时（见 `TOKEN_TTL_SECONDS`），
             # 说「请检查凭证」只会让用户去翻配置，而答案是重新扫码。
@@ -209,27 +306,24 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                     "Marvis 登录态已过期%s：请在控制台「授权登录」重新扫码（QQ / 微信）"
                     % extra, status=401, code="credential_expired", kind="auth",
                     detail=detail)
-            shared.note_failure(
-                db, account, kind=exc.kind, detail=exc.detail or exc.message,
-                status=exc.status, model=model, public_platform=PUBLIC,
+            await asyncio.to_thread(
+                shared.note_failure, db, account, kind=exc.kind,
+                detail=exc.detail or exc.message, status=exc.status,
+                model=model, public_platform=PUBLIC,
                 cool_seconds=(600 if exc.kind in ("auth", "risk_control") else 0))
             last_error = exc
             exclude.add(account.id)
-            # marvis 的 `/v1/chat/completions` 不签名（core/endpoints.py:15-19），
-            # 无业务码的 403 是上游瞬时拒绝（实测同号同分钟 5×200 + 2×403，4 秒后恢复）。
-            # 池里常常只有 1 个号，换号与冷却都救不了 ⇒ 同号再打一次（最多一次）。
-            if exc.kind == "signature_invalid" and not retried_same:
-                retried_same = True
-                exclude.discard(account.id)
-                continue
-            # 参数类错误换号也没用，直接停
+            # 参数类错误换号也没用，直接停。
+            # 同号重试已经在 `_call_upstream` 里做过（且只对白名单 kind），
+            # 这里只负责「换号」—— 不做 `exclude.discard()` 的伪重试。
             if exc.status in (400, 422) and exc.kind not in (
                     "auth", "rate_limit", "risk_control"):
                 break
         except Exception as exc:  # noqa: BLE001
             shared.release(account)
-            logger.warning("Marvis 调用失败 acc=%s: %s",
-                           account.id, type(exc).__name__)
+            logger.warning("Marvis 调用失败 acc=%s: %s: %s",
+                           int(getattr(account, "id", 0) or 0),
+                           type(exc).__name__, str(exc)[:200])
             last_error = client.UpstreamError(
                 "Marvis 调用异常（%s）" % type(exc).__name__, kind="upstream")
             exclude.add(account.id)
@@ -240,12 +334,16 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     # 原因只有两种，得分开讲清楚（2026-11-15 用户实测被这句话误导：账号明明
     # 是 active、凭证也在，只是 access_token 过了约 2 小时有效期）。
     try:
-        rows = marvis_accounts.accounts_for(db, realm)
+        rows = await asyncio.to_thread(marvis_accounts.accounts_for, db, realm)
         alive = [r for r in rows if (getattr(r, "status", "") or "") == "active"]
         expired = [r for r in alive
                    if "过期" in str(getattr(r, "last_err_msg", "") or "")]
     except Exception:  # noqa: BLE001
         alive, expired = [], []
+    # 「一个号都没选到」同样是网关失败，而且是最难从响应里看出原因的一种：
+    # 响应里只有 503 + 一句人话，没有 kind / 没有上游。这里补一条 warn。
+    logger.warning("Marvis 无可用账号 realm=%s model=%s active=%d expired=%d",
+                   realm, model or "-", len(alive), len(expired))
     if alive and len(expired) == len(alive):
         raise shared.PlatformRejected(
             503, "Marvis 账号登录态已全部过期，请在控制台「授权登录」重新扫码"
@@ -264,10 +362,16 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
 
 
 async def _iter_upstream(resp):
-    """把同步 `HTTPResponse` 的 read 挪到工作线程，避免卡住事件循环。"""
-    loop = asyncio.get_running_loop()
+    """逐块读上游 SSE —— **每一块都在工作线程里读**，事件循环上不留阻塞调用。
+
+    每取一块才发起下一次 `read`，消费者慢下来就自然形成背压；线程里的
+    异常会在 `await` 处原样抛回，不需要自己搬运。
+
+    ⚠ 建连（`open_chat_stream`）也是阻塞的，已经在上游的 `to_thread` 里；
+    这里只负责「已建好的连接」的读取。
+    """
     while True:
-        chunk = await loop.run_in_executor(None, resp.read, 8192)
+        chunk = await asyncio.to_thread(resp.read, 8192)
         if not chunk:
             break
         yield chunk
@@ -296,9 +400,11 @@ async def chat_completions(request: Request):
 
     db = SessionLocal()
     try:
-        key = shared.authenticate(db, request, platform=PUBLIC)
-        resp, account, started = _attempt(db, request, key, upstream_body, realm,
-                                          stream=wants_stream)
+        # 鉴权、选号、上游调用全是同步实现 —— 一律在工作线程里跑（见 _attempt）。
+        key = await asyncio.to_thread(
+            shared.authenticate, db, request, platform=PUBLIC)
+        resp, account, started = await _attempt(
+            db, request, key, upstream_body, realm, stream=wants_stream)
     except shared.PlatformRejected as exc:
         db.close()
         # `openai()` 本身返回的就是 **JSONResponse**，不要再包一层 ——
@@ -313,12 +419,12 @@ async def chat_completions(request: Request):
     db.close()
 
     if not wants_stream:
-        try:
-            usage = _usage_of(resp)
-            _bill(key, account, slot, usage, request=request, started=started)
-            return JSONResponse(resp)
-        except Exception:  # noqa: BLE001
-            raise
+        # 非流式：整段响应体已经在 _call_upstream 的线程里读完（不再阻塞循环）；
+        # 记账是同步 DB，也放到线程里。
+        usage = _usage_of(resp)
+        await asyncio.to_thread(
+            _bill, key, account, slot, usage, request=request, started=started)
+        return JSONResponse(resp)
 
     async def generator():
         stats = {"ttfb_ms": 0, "total_ms": 0}

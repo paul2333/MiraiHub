@@ -295,6 +295,134 @@ class GatewayGuardTests(unittest.TestCase):
         self.assertNotIn("stream_options", prepared)
 
 
+class ErrorClassifyTests(unittest.TestCase):
+    """403 的业务码分类（2026-11-15 线上 4100406 被误判成 signature_invalid）。"""
+
+    def test_illegal_request_business_code_is_not_signature_invalid(self):
+        kind = client._classify(403, '{"code":4100406,"msg":"非法请求"}')
+        self.assertEqual(kind, "upstream_business")
+
+    def test_business_code_as_string_is_parsed(self):
+        self.assertEqual(client._classify(403, '{"code":"4100406"}'),
+                         "upstream_business")
+
+    def test_403_without_code_is_upstream_business(self):
+        """模型网关**不签名**（endpoints.py:15-19）⇒ 403 不可能是签名问题。"""
+        self.assertEqual(client._classify(403, ""), "upstream_business")
+        self.assertEqual(client._classify(403, "forbidden"), "upstream_business")
+
+    def test_risk_control_code_is_kept(self):
+        """4100404 是设备/IP 风控，必须留在 risk_control（不能并进 auth）。"""
+        self.assertEqual(client._classify(403, '{"code":4100404,"msg":"风控"}'),
+                         "risk_control")
+
+    def test_credential_expired_code_is_auth(self):
+        self.assertEqual(
+            client._classify(403, '{"code":4100403,"msg":"登录态过期/未登录"}'),
+            "auth")
+
+    def test_other_statuses_unchanged(self):
+        self.assertEqual(client._classify(401, ""), "auth")
+        self.assertEqual(client._classify(429, ""), "rate_limit")
+        self.assertEqual(client._classify(502, ""), "upstream_error")
+        self.assertEqual(client._classify(400, ""), "http_error")
+
+    def test_biz_code_of_handles_nested_envelope(self):
+        self.assertEqual(client._biz_code_of('{"error":{"code":4100406}}'),
+                         "4100406")
+        self.assertEqual(client._biz_code_of('HTTP 403: {"code":4100406}'),
+                         "4100406")
+        self.assertEqual(client._biz_code_of(""), "")
+        self.assertEqual(client._biz_code_of("not json at all"), "")
+
+
+class EventLoopSafetyTests(unittest.TestCase):
+    """阻塞调用必须在工作线程里（2026-11-15 事件循环被钉死 63.5 秒）。"""
+
+    def test_attempt_is_a_coroutine_function(self):
+        import inspect
+
+        from admin.platform.marvis import gateway
+
+        self.assertTrue(
+            inspect.iscoroutinefunction(gateway._attempt),
+            "_attempt 必须是 async：同步实现会把 urlopen 留在事件循环上")
+
+    def test_upstream_call_goes_through_to_thread(self):
+        import inspect
+
+        from admin.platform.marvis import gateway
+
+        src = inspect.getsource(gateway._call_upstream)
+        self.assertIn("asyncio.to_thread", src)
+        # 裸的同步调用（`client.open_chat_stream(`）一行都不许留
+        self.assertNotIn("client.open_chat_stream(", src)
+        self.assertNotIn("client.chat_completions(", src)
+
+    def test_stream_reader_goes_through_to_thread(self):
+        import inspect
+
+        from admin.platform.marvis import gateway
+
+        src = inspect.getsource(gateway._iter_upstream)
+        self.assertIn("asyncio.to_thread", src)
+
+    def test_retry_whitelist_has_no_business_or_auth_kinds(self):
+        from admin.platform.marvis import gateway
+
+        self.assertIn("network", gateway.RETRY_SAME_ACCOUNT_KINDS)
+        for kind in ("upstream_business", "signature_invalid", "auth",
+                     "risk_control"):
+            self.assertNotIn(kind, gateway.RETRY_SAME_ACCOUNT_KINDS)
+
+
+class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
+    """同号重试：只对白名单 kind，且**复用同一个账号**（不重新选号）。"""
+
+    def setUp(self):
+        from admin.platform.marvis import gateway
+        from admin.platform.marvis.core import client as mclient
+
+        self.gateway = gateway
+        self.mclient = mclient
+        self._orig_open = mclient.open_chat_stream
+        self._orig_delay = gateway.SAME_ACCOUNT_RETRY_DELAY
+        gateway.SAME_ACCOUNT_RETRY_DELAY = 0
+
+    def tearDown(self):
+        self.mclient.open_chat_stream = self._orig_open
+        self.gateway.SAME_ACCOUNT_RETRY_DELAY = self._orig_delay
+
+    async def test_transient_network_error_retries_same_account(self):
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            if len(calls) == 1:
+                raise self.mclient.UpstreamError("boom", status=0, kind="network")
+            return "STREAM"
+
+        self.mclient.open_chat_stream = fake_open
+        got = await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+        self.assertEqual(got, "STREAM")
+        self.assertEqual(calls, [7, 7], "必须是同一个账号重试")
+
+    async def test_business_error_is_not_retried(self):
+        calls = []
+
+        def fake_open(data, realm, body, *, account_id=0):
+            calls.append(account_id)
+            raise self.mclient.UpstreamError(
+                "模型网关失败（HTTP 403）", status=403, code="403",
+                kind="upstream_business",
+                detail='{"code":4100406,"msg":"非法请求"}')
+
+        self.mclient.open_chat_stream = fake_open
+        with self.assertRaises(self.mclient.UpstreamError):
+            await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+        self.assertEqual(len(calls), 1, "upstream_business 不许重试")
+
+
 class DispatchModelForPlatformTests(unittest.TestCase):
     """dispatch 的「这个模型属于该平台吗」校验（2026-11-15 线上 404 回归）。
 

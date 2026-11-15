@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 
@@ -227,20 +228,93 @@ def close_stream(resp) -> None:
         pass
 
 
+#: 上游业务码里属于「登录态 / 鉴权」的那几个 —— **只有命中这里才归 `auth`**。
+#:
+#: `4100403 登录态过期/未登录`（真机实测：同一份过期凭证打钱包接口回
+#: `data: null`，打模型网关就回这个码，两条路径指同一件事）。
+#:
+#: ⚠ `4100404` **不在**这张表里：它是设备/IP 风控（见 endpoints.py 的 UA
+#: 约束），必须继续归 `risk_control` —— 归成 `auth` 会让真风控静默，还会把
+#: 一个好号冷却 600 秒，而真正的处置是换出口 / 换设备指纹。
+BIZ_AUTH_CODES = frozenset({"4100403"})
+
+#: 从错误体里抠业务码：`{"code":4100406,...}` / `{"code":"4100403",...}`。
+_BIZ_CODE_RE = re.compile(r'"code"\s*:\s*"?(-?[A-Za-z0-9_.]+)"?')
+
+
+def _biz_code_of(text: str) -> str:
+    """解析上游错误体里的业务码（返回**字符串**；解析不出返回 ""）。
+
+    上游的错误信封实测有两种写法：
+
+        {"code":4100406,"msg":"非法请求"}     ← 数字
+        {"code":"4100403", ...}               ← 字符串
+
+    还可能被包一层（`{"error": {"code": ...}}`）。先按 JSON 解，
+    解不动退回正则抠第一处 `"code":` —— 错误体里混了别的文本时也要能认。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    start = raw.find("{")
+    if start > 0:
+        raw = raw[start:]
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            code = data.get("code")
+            if code is None:
+                err = data.get("error")
+                if isinstance(err, dict):
+                    code = err.get("code")
+            if isinstance(code, bool):
+                code = None
+            if code is not None:
+                return str(code).strip()
+    match = _BIZ_CODE_RE.search(raw)
+    return match.group(1).strip() if match else ""
+
+
 def _classify(status: int, text: str) -> str:
     """把上游错误归成一类 —— 上层据此决定冷却 / 禁用 / 换号。
 
-    ⚠ 风控（403 + 4100404）与登录失效（401）必须分开：前者是**设备/IP**
-    的问题，换号没用还会把好号一起打挂；后者才是账号问题。
+    ## 业务码不能吞（2026-11-15 线上误判的直接根因）
+
+    上游 403 的真实报文是 `{"code":4100406,"msg":"非法请求"}` —— **有业务码**。
+    旧实现只看 HTTP 状态，403 一律 `signature_invalid`，于是：
+
+      · 上层按「签名错」处理（同号重试 / 换号），但
+        `/v1/chat/completions` **根本不签名**（core/endpoints.py:15-19），
+        换号不可能修好；
+      · `signature_invalid` 在 sentinel 里是 RISK 级（sentinel.py:174），
+        一次瞬时 403 就能把一个好平台推进熔断；
+      · 下游（DSH）把 403 渲染成「API key is invalid」，用户去翻 key，
+        而真实原因是请求被上游业务层拒绝。
+
+    现在：解析业务码 —— 命中已知鉴权码才归 `auth`，其余一律
+    `upstream_business`（已在 SENTINEL_KINDS 里，按 throttle 记录，不熔断、
+    不冷却、不重试）。
+
+    ⚠ 风控（4100404）与登录失效（401）仍必须分开：前者是**设备/IP** 的问题，
+    换号没用还会把好号一起打挂；后者才是账号问题。
     """
-    blob = (text or "").lower()
-    if "4100404" in blob or "risk" in blob or "风控" in blob:
+    blob = str(text or "")
+    low = blob.lower()
+    code = _biz_code_of(blob)
+    if code == "4100404" or "4100404" in low or "risk" in low or "风控" in blob:
         return "risk_control"
     if status == 401:
         return "auth"
+    if code:
+        # 业务码是**最可信**的信号：信封里有 code，就说明这是业务层拒绝，
+        # 不是传输/协议错误。鉴权码之外一律 upstream_business。
+        return "auth" if code in BIZ_AUTH_CODES else "upstream_business"
     if status == 403:
-        # 403 但没有风控码 —— 签名或参数问题
-        return "signature_invalid"
+        # 没有业务码的 403：不是签名问题（这个端点不签名），按业务拒绝处理。
+        return "upstream_business"
     if status == 429:
         return "rate_limit"
     if status >= 500:
