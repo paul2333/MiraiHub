@@ -73,10 +73,6 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 #: 额度用尽 —— 因为循环上限是 3：只要前 3 个被选中的号都回了 402，
 #: 就直接把错误甩给客户端。提到 8 之后，撞上几个当日额度用尽的号也能
 #: 继续往后试；上限仍有意义（每次尝试占一个号的租约）。
-#: 402 且余额为正（多半是该号没有请求的模型）时的短冷却秒数。
-#: 取值只为「本轮换号 + 短暂避开」，不应长到把号池摘空。
-MODEL_MISS_COOL_SECONDS = 60
-
 MAX_ATTEMPTS = _env_int("LOOMY_MAX_ATTEMPTS", 8)
 LEASE_WAIT_SECONDS = 2.0
 
@@ -118,6 +114,19 @@ def _cool_seconds(kind: str) -> int:
     if kind == "upstream_error":
         return UPSTREAM_COOL_SECONDS
     return 0
+
+
+#: 402 且余额为正（多半是该号没有请求的模型）时的**账号级短冷却**秒数。
+#:
+#: 取值只为「本轮换号 + 短暂避开」：按「额度耗尽」冷却 300s 会把号池
+#: 越用越少，最终真的变成「全都没额度」。本轮已由 `exclude_identity`
+#: 排掉，这里只需让这个号短暂避开，下一轮换号即可。
+#:
+#: ⚠ 与 `MODEL_MISS_COOL_SECONDS` **不是一回事**，别合并：那个是上游
+#: 静默换模型时的 (账号×模型) 级冷却（默认 3600s，见
+#: `_note_model_not_served`）—— 号本身健康、只是这个模型不可用，
+#: 粒度是「号×模型」，不该整号摘掉；本常量是账号级、分钟级短冷却。
+QUOTA_POSITIVE_COOL_SECONDS = 60
 
 
 #: 上游「账号已被停用」的业务码（2026-11-13 实测）。
@@ -676,7 +685,7 @@ def _attempt(db, request, key, body: dict, realm: str):
                         # spark 系列，有余额也用不了）。按「额度耗尽」冷却 300s 会把号池
                         # 越用越少，最终真的变成「全都没额度」。本轮已由 exclude_identity
                         # 排掉，这里只做短冷却，直接换下一个号即可。
-                        cool_seconds = MODEL_MISS_COOL_SECONDS
+                        cool_seconds = QUOTA_POSITIVE_COOL_SECONDS
                         logger.info(
                             "Loomy 402 但余额仍为 %s（疑似无 %s 模型），"
                             "短冷却 %ss 换号（acc=%s）",
@@ -1070,7 +1079,7 @@ def _open_stream(db, request, key, body: dict, realm: str, stats: dict,
                         # spark 系列，有余额也用不了）。按「额度耗尽」冷却 300s 会把号池
                         # 越用越少，最终真的变成「全都没额度」。本轮已由 exclude_identity
                         # 排掉，这里只做短冷却，直接换下一个号即可。
-                        cool_seconds = MODEL_MISS_COOL_SECONDS
+                        cool_seconds = QUOTA_POSITIVE_COOL_SECONDS
                         logger.info(
                             "Loomy 流式 402 但余额仍为 %s（疑似无 %s 模型），"
                             "短冷却 %ss 换号（acc=%s）",
