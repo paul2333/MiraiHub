@@ -295,9 +295,10 @@ async def _bill_async(*args, **kwargs) -> None:
 #
 # ## 表的来源与匹配语义
 #
-# 7 条规则逐条移植自客户端插件的 `CONTENT_FINGERPRINTS`：`find` 是**字面量**
+# 前 7 条规则逐条移植自客户端插件的 `CONTENT_FINGERPRINTS`：`find` 是**字面量**
 # （`re.escape` + `re.IGNORECASE`，上游匹配大小写不敏感）；第 4 条用插件登记的
-# `findRegex`（容忍空白归一与可选词漂移）。
+# `findRegex`（容忍空白归一与可选词漂移）。第 8 条是**本地补的**（插件表里没有，
+# 2026-11-16 真机二分得出，见该条注释）。
 #
 # ⚠️ 各条的**锚点语义不同**，不要统一加 `^`：
 #
@@ -308,13 +309,17 @@ async def _bill_async(*args, **kwargs) -> None:
 #   5. DSH Web 面开头两句 —— 位置无关
 #   6. DSH `@` 引用说明句 —— 位置无关
 #   7. SDK 计费头字样 —— 位置无关
+#   8. DSH「follow-up suggestion」提示词首句 —— **行首锚定**（唯一带 `^\s*`
+#      的一条，见规则 8 的注释）
 #
-# 本实现**不**给任何一条加行首锚定：改写范围宁可略宽 —— 漏改一处就是整轮
-# 403，多改一处只是语义等价的措辞变化（与客户端插件同一取舍）。
+# 前 7 条**不**加行首锚定：改写范围宁可略宽 —— 漏改一处就是整轮 403，多改一处
+# 只是语义等价的措辞变化（与客户端插件同一取舍）。第 8 条是这条取舍的**唯一
+# 例外**：上游对那一串本身就是**前缀锚定**（前接任意字符即放行，实测 200），
+# 加锚点是让改写范围与上游判定**同形**，既不漏改，也不去动句中正常叙述。
 
-#: 腾讯内容级风控**指纹表**（7 条全量移植自 DSH 插件
+#: 腾讯内容级风控**指纹表**（8 条：前 7 条全量移植自 DSH 插件
 #: `dsh-providers-hub/lib/openai-gateway/tencent-fingerprint.js` 的
-#: `CONTENT_FINGERPRINTS`）。
+#: `CONTENT_FINGERPRINTS`；第 8 条本地补，见该条注释）。
 #:
 #: ## 为什么要这张表
 #:
@@ -423,6 +428,20 @@ _TENCENT_FINGERPRINT_RULES = (
     #    原串尾巴（`eader`）留在后面，改出一串垃圾。
     (re.compile(re.escape("x-anthropic-billing-header"), re.I),
      "x-client-billing-header"),
+    # 8. DSH 的「follow-up suggestion」系统提示词首句（插件表里没有，本地补）。
+    #    ⚠️ 上游这一条的判定与前 7 条**不同**，2026-11-16 真机二分 26 次确证：
+    #      · 命中长度恰好 **32** 字符：`...suggestio`(31) → 200，
+    #        `...suggestion`(32) → 403/4100406（不要求词边界）；
+    #      · **前缀锚定**，不是 contains：前面加一句（`System note. ...`）→ 200；
+    #      · 只查 **system** 角色（同一串放 user → 200）；
+    #      · 前导空白先 strip（前导空格 / 换行照样 403），大小写不敏感。
+    #    所以这里是**唯一**带 `^\s*` 的一条：锚点与上游判定同形 —— 句中出现的
+    #    同一串本来就不会被拦，改了只是无谓地篡改正文。
+    #    改法是把 `the` 换成 `a`：**破坏前缀、不删句子**，语义仍是「后续建议
+    #    引擎」。⚠️ 不能靠加空格 / 换行绕过（上游 strip 前导空白），必须是真实
+    #    文本改动；也不能把首句删掉（那会丢掉「只输出建议、不要别的内容」的约束）。
+    (re.compile(r"^\s*You\s+are\s+the\s+follow-up\s+suggestion", re.I),
+     "You are a follow-up suggestion"),
 )
 
 

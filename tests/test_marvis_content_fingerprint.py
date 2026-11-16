@@ -44,15 +44,16 @@ def _specimen(pattern):
     src = re.sub(r"([A-Za-z])\?", r"\1", src)     # 单字符可选取该字符
     src = re.sub(r",\?", "", src)                  # 可选逗号取缺席
     src = re.sub(r"\\(.)", r"\1", src)           # 其余转义还原成字面量
+    src = re.sub(r"^\^", "", src)               # 行首锚点 ^ 不贡献字符
     return src
 
 
 class RuleTableTests(unittest.TestCase):
     """规则表本身：条数、每条都能命中自己的样例。"""
 
-    def test_rule_table_has_all_seven_fingerprints(self):
+    def test_rule_table_has_all_eight_fingerprints(self):
         """少一条就是留一个随时会踩的 403。"""
-        self.assertEqual(len(marvis_gateway._TENCENT_FINGERPRINT_RULES), 7)
+        self.assertEqual(len(marvis_gateway._TENCENT_FINGERPRINT_RULES), 8)
 
     def test_every_rule_rewrites_its_own_specimen(self):
         """每条规则：样例命中 → 改写后文本变了、且不再命中。"""
@@ -316,7 +317,7 @@ class FindLiteralDriftTests(unittest.TestCase):
             "To give feedback, users should report the issue at "))
 
     def test_no_rule_lost_characters_against_plugin(self):
-        """7 条规则的长度必须与插件逐条一致 —— 任何一条被短写，这里就红。
+        """前 7 条规则的长度必须与插件逐条一致 —— 任何一条被短写，这里就红。
 
         注意第 4 条比的是「findRegex 的正则源码」长度（它本来就不是字面量），
         其余六条比「re.escape 之前的字面量」长度。混为一谈会让断言虚高
@@ -324,12 +325,129 @@ class FindLiteralDriftTests(unittest.TestCase):
         """
         lengths = []
         for index, (pattern, _replacement) in enumerate(
-                marvis_gateway._TENCENT_FINGERPRINT_RULES):
+                marvis_gateway._TENCENT_FINGERPRINT_RULES[:len(self.PLUGIN_LENGTHS)]):
             if index == 3:
                 lengths.append(len(pattern.pattern))
             else:
                 lengths.append(len(self._literal(pattern)))
         self.assertEqual(tuple(lengths), self.PLUGIN_LENGTHS)
+
+
+class FollowUpSuggestionPrefixRuleTests(unittest.TestCase):
+    """规则 8：DSH「follow-up suggestion」系统提示词首句（4100406）。
+
+    与上面几类不同，这里**必须**写字面量：要锁的恰恰是**长度边界**（31 放行 /
+    32 拦截）、**前缀锚定**（不是 contains）、前导空白与大小写 —— 这些性质没法
+    从正则反解，只能拿真串逐字对比。
+
+    实测结论（2026-11-16 真机二分 26 次）：
+      · 命中长度恰好 32：`...suggestio`(31) → 200，`...suggestion`(32) → 403；
+      · 只查 system 角色，且**前缀锚定**：同一串前面加一句 → 200；
+      · 前导空白先 strip，大小写不敏感。
+    """
+
+    #: 上游黑名单的最小触发串（32 字符）。
+    POISON = "You are the follow-up suggestion"
+    #: 规则改写后的文本（the → a：破坏前缀、不删句子）。
+    REWRITTEN = "You are a follow-up suggestion"
+
+    def setUp(self):
+        self._env_backup = os.environ.get(marvis_gateway.SANITIZE_TENCENT_ENV)
+        os.environ.pop(marvis_gateway.SANITIZE_TENCENT_ENV, None)
+
+    def tearDown(self):
+        if self._env_backup is None:
+            os.environ.pop(marvis_gateway.SANITIZE_TENCENT_ENV, None)
+        else:
+            os.environ[marvis_gateway.SANITIZE_TENCENT_ENV] = self._env_backup
+
+    def test_poison_at_system_head_is_rewritten(self):
+        """毒串在 system 开头 → 走完整链路被改写，且改写后不再以毒前缀开头。"""
+        original = self.POISON + " engine. You suggest the next user message."
+        body = {"model": "x",
+                "messages": [{"role": "system", "content": original}]}
+
+        out = marvis_gateway._prepare_body(body, "main-auto")
+
+        rewritten = out["messages"][0]["content"]
+        self.assertNotEqual(rewritten, original)
+        self.assertFalse(rewritten.lower().startswith(self.POISON.lower()))
+        self.assertTrue(rewritten.startswith(self.REWRITTEN))
+        # 只动首句那几个词，尾部正文逐字保留。
+        self.assertTrue(
+            rewritten.endswith(" engine. You suggest the next user message."))
+        # 调用方 body 不被就地改。
+        self.assertEqual(body["messages"][0]["content"], original)
+
+    def test_thirty_two_char_boundary_hits_and_thirty_one_does_not(self):
+        """32 字符命中、31 字符放行：这条边界是真机二分出来的。"""
+        self.assertEqual(len(self.POISON), 32)
+        short = self.POISON[:-1]
+        self.assertEqual(len(short), 31)
+
+        out, hits = marvis_gateway.rewrite_tencent_fingerprints(short)
+        self.assertIs(out, short)
+        self.assertEqual(hits, 0)
+
+        out, hits = marvis_gateway.rewrite_tencent_fingerprints(self.POISON)
+        self.assertEqual(hits, 1)
+        self.assertNotEqual(out, self.POISON)
+        self.assertFalse(out.lower().startswith(self.POISON.lower()))
+
+    def test_prefix_anchored_not_contains(self):
+        """前缀锚定：同一串出现在句中 → 上游放行，这里也**不许**改。"""
+        text = "System note. " + self.POISON + " engine"
+        out, hits = marvis_gateway.rewrite_tencent_fingerprints(text)
+        self.assertIs(out, text)
+        self.assertEqual(hits, 0)
+
+    def test_case_insensitive(self):
+        """上游大小写不敏感：全小写同样要改。"""
+        text = self.POISON.lower() + " engine"
+        out, hits = marvis_gateway.rewrite_tencent_fingerprints(text)
+        self.assertEqual(hits, 1)
+        self.assertNotEqual(out, text)
+        self.assertFalse(out.lower().startswith(self.POISON.lower()))
+
+    def test_leading_whitespace_is_covered(self):
+        """前导空白先 strip：空格 / 换行 / 制表符开头的毒串照样命中。"""
+        for prefix in (" ", "  ", chr(10), "  " + chr(10), chr(9)):
+            text = prefix + self.POISON + " engine"
+            out, hits = marvis_gateway.rewrite_tencent_fingerprints(text)
+            self.assertEqual(hits, 1, "前导空白 %r 没命中" % (prefix,))
+            self.assertNotEqual(out, text)
+            self.assertFalse(out.lower().startswith(self.POISON.lower()))
+
+    def test_control_sentence_with_other_noun_is_not_rewritten(self):
+        """对照：只换名词（question）→ 真机 200，这里也不许改。"""
+        text = "You are the follow-up question engine"
+        out, hits = marvis_gateway.rewrite_tencent_fingerprints(text)
+        self.assertIs(out, text)
+        self.assertEqual(hits, 0)
+
+    def test_other_auxiliary_prompts_are_not_rewritten(self):
+        """其余辅助提示词一个字都不许动（规则不许写宽）。"""
+        for text in (
+                "You complete the message a USER is drafting in a coding agent chat UI.",
+                "Generate a title for a coding-assistant conversation.",
+                "你是记忆库提炼助手。根据下面的会话内容，提炼出值得长期记住的事实。",
+                "You are the memory curation assistant."):
+            out, hits = marvis_gateway.rewrite_tencent_fingerprints(text)
+            self.assertIs(out, text, "被误改：%r" % (text,))
+            self.assertEqual(hits, 0)
+
+    def test_rule_is_eighth_and_prefix_anchored(self):
+        """规则 8 必须存在、必须锚在行首、必须大小写不敏感。"""
+        rules = marvis_gateway._TENCENT_FINGERPRINT_RULES
+        self.assertEqual(len(rules), 8)
+        pattern, replacement = rules[7]
+        self.assertTrue(pattern.pattern.startswith("^"),
+                        "规则 8 丢了行首锚点：%r" % (pattern.pattern,))
+        self.assertEqual(pattern.flags & re.IGNORECASE, re.IGNORECASE)
+        self.assertEqual(replacement, self.REWRITTEN)
+        # 锚点真的生效：句中同一串不命中，行首命中。
+        self.assertIsNone(pattern.search("System note. " + self.POISON))
+        self.assertIsNotNone(pattern.search(self.POISON))
 
 
 if __name__ == "__main__":
