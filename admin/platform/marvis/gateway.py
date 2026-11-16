@@ -223,87 +223,139 @@ def _bill(key, account, model, usage, *, request, started=None, error="",
 #:      system 放进 `messages[0]`（线上失败画像 `msgs=338`），F1 救不了那条路。
 #:      ⇒ 落地选 **F2**（本函数），它是唯一对「system 在 messages[] 里」有效的形态。
 #:
-#: ## 移植纪律
+#: ## 移植纪律（⚠️ 这一节是 2026-11-16 一次**真实缺陷**换来的）
 #:
-#: · 每条保留 JS 里的**匹配语义**：`find` 是**字面量**（`re.escape` + `re.I`，
-#:   上游大小写不敏感），第 4 条用它登记的 `findRegex`（同时容忍
-#:   `DeepSeek Harness` 与 `DeepSeekRuntime` 两种形态）；
-#: · **只改内容，不删句子**：替换值与插件逐字一致，语义等义；
+#: · **每条 `find` 必须与插件 verbatim 逐字符一致**：上游认的是**整句
+#:   字面量**，**砍掉前半或后半就放行** ⇒ 写短了、写错一个词 = **静默空跑**。
+#:   空跑的症状是「表里登记了、日志里 `rules_hit` 恒 0、上游仍每轮
+#:   403/4100406」，与「完全没登记」同形，极难归因。
+#:   第一版就踩了这条：规则 1 首词写成 `Default branch`（插件真值是
+#:   `Main branch`）、规则 3 只留半句（插件真值是 99 字符整句，含
+#:   `https://github.com/anthropics/claude-code/issues`），两条因此**永不命中**；
+#:   规则 2 多写了一个 `tool`、规则 7 写成 `hdr`（截断后把原串尾巴留在
+#:   后面，改出垃圾串）。现由 `tests/test_marvis_content_fingerprint.py` 的
+#:   `FindLiteralDriftTests` 直接锁字面量（首词 / 长度 / 整句内容）。
+#: · `find` 是**字面量**（`re.escape` + `re.I`，上游大小写不敏感）；第 4 条用
+#:   插件登记的 `findRegex`（容忍空白归一与 `an AI agent` /
+#:   `an AI coding agent`、`powered by` / `powered by the` 等形态漂移）。
+#: · **只改内容，不删句子**：替换值与插件逐字一致，语义等义。
 #: · **不命中的文本逐字符不变**（先 `search` 预检，命中才 `sub`）——
-#:   腾讯侧按前缀缓存，无谓重建字符串会白吃缓存命中；
+#:   腾讯侧按前缀缓存，无谓重建字符串会白吃一次全量重算。
 #: · ⚠️ 插件侧还实测过 **assistant 正文**同样会被拦，这里**不**顺手扩过去：
 #:   本次故障的证据链只落在 system（8 次探针 + 线上 403 dump），扩大到
 #:   assistant 会篡改会话历史。将来真出现「assistant 复述被拦」的报障，
 #:   再按插件那张表补，别凭「统一一下」直接加。
+
+#: 改写开关（默认开）：设为 0 / false / off / no 时**完全跳过**改写，请求原样
+#: 发上游。这是「替用户改写内容」的行为，必须能一键退回原样透传。
+SANITIZE_TENCENT_ENV = "MIRAIHUB_MARVIS_SANITIZE_TENCENT"
+_SANITIZE_OFF_VALUES = frozenset({"0", "false", "off", "no"})
+
+
+def _tencent_sanitize_enabled() -> bool:
+    """开关当前状态。
+
+    每次调用现读环境变量而不是模块级求值：开关是排障用的，改 `.env` 重启即
+    生效；也便于测试逐例切换两种状态而不必重载模块。
+    """
+    raw = (os.getenv(SANITIZE_TENCENT_ENV) or "").strip().lower()
+    return raw not in _SANITIZE_OFF_VALUES
+
+
 _TENCENT_FINGERPRINT_RULES = (
-    # 1. ZCode 内建常量（每个 git 仓库会话都会被注入）
-    (re.compile(re.escape("Default branch (you will usually use this for PRs)"), re.I),
+    # 1. ZCode 内建常量（每个 git 仓库会话都会被注入）。位置无关。
+    #    ⚠️ 首词是 `Main`，不是 `Default`：上一版写成 Default 后**永不命中**。
+    (re.compile(re.escape("Main branch (you will usually use this for PRs)"), re.I),
      "Main branch (PRs usually go here)"),
-    # 2. Claude Code 身份句（刻意不带尾句点，一条覆盖两个常量形态）
-    (re.compile(re.escape("You are Claude Code, Anthropic's official CLI tool for Claude"), re.I),
+    # 2. Claude Code 身份句。**行首锚定**；刻意不带尾句点，一条覆盖两种常量形态。
+    #    ⚠️ 插件原文是 `official CLI for Claude`，别顺手补 `tool`（补了就空跑）。
+    (re.compile(re.escape("You are Claude Code, Anthropic's official CLI for Claude"), re.I),
      "You are Claude Code, Anthropic's CLI for Claude"),
-    # 3. Claude Code 反馈句
-    (re.compile(re.escape("To give feedback, users should report the issue at "), re.I),
+    # 3. Claude Code 反馈句（每轮必带的固定段落）。位置无关。
+    #    find 必须写整句（含 URL，99 字符）：上游认逐字符，砍掉半句等于静默空跑。
+    (re.compile(re.escape("To give feedback, users should report the issue at "
+                          "https://github.com/anthropics/claude-code/issues"), re.I),
      "To give feedback, users should report the issue at the project issue tracker"),
-    # 4. **DSH 身份首句 —— 本次 4100406 的触发串就是它**（system 绝对行首）
+    # 4. DSH 身份首句（**行首锚定**；本条就是 4100406 的触发串）。
+    #    用插件登记的 findRegex：容忍空白归一（\s+）以及 `an AI agent` /
+    #    `an AI coding agent`、`powered by` / `powered by the` 等形态漂移。
     (re.compile(r"You\s+are\s+an?\s+AI\s+(?:coding\s+)?agent\s*,?\s*powered\s+by\s+"
                 r"(?:the\s+)?DeepSeek\s+Harness", re.I),
      "You are an AI coding assistant, powered by a large language model"),
-    # 5. DSH Web 运行面的开头两句
-    (re.compile(r"You are interacting with the user through the DeepSeek\s+Harness Web GUI ", re.I),
-     "You are interacting with the user through the harness Web GUI "),
-    # 6. DSH 的 `@` 文件引用说明句 —— 触发串**跨句边界**（两半各自放行），
-    #    所以 find 必须写整段，砍半 = 静默空跑。
-    (re.compile(re.escape("Tokens prefixed with @ are paths the user explicitly referenced. "
-                          "Relative paths resolve from the workspace root"), re.I),
+    # 5. DSH Web 运行面的开头两句。位置无关。
+    #    触发串**跨句边界**（前半句、后半句各自都放行），find 必须是前两句的
+    #    并集；砍半 = 静默空跑。改写只去掉品牌串，其余逐字不动。
+    (re.compile(re.escape(
+        'You are interacting with the user through the DeepSeek Harness Web GUI '
+        'whose URL the runtime context names. When the user refers to "this page", '
+        '"this GUI", or "this app" without naming another target, they mean this GUI.'),
+        re.I),
+     'You are interacting with the user through the harness Web GUI '
+     'whose URL the runtime context names. When the user refers to "this page", '
+     '"this GUI", or "this app" without naming another target, they mean this GUI.'),
+    # 6. DSH 的 `@` 文件引用说明句。位置无关，同样跨句边界。
+    #    只调整语序；后半段（目录 list / 用 read / 不得声称已读过 / 引号语法）
+    #    是防模型编造文件内容的核心约束，一个字都不许删。
+    (re.compile(re.escape(
+        "Tokens prefixed with @ are paths the user explicitly referenced. "
+        "Relative paths resolve from the workspace root"), re.I),
      "Tokens prefixed with @ are paths the user explicitly referenced. "
      "Paths resolve relative to the workspace root"),
-    # 7. 客户端 SDK 的计费头字样
-    (re.compile(re.escape("x-anthropic-billing-hdr"), re.I),
+    # 7. 客户端 SDK 的计费头字样。位置无关；连裸词也会被拦。
+    #    ⚠️ find 必须是完整的 `header`：上一版写成 `hdr`，虽然命中，却把
+    #    原串尾巴（`eader`）留在后面，改出一串垃圾。
+    (re.compile(re.escape("x-anthropic-billing-header"), re.I),
      "x-client-billing-header"),
 )
 
 
-def sanitize_tencent_fingerprints(text: str) -> str:
-    """把一段文本里已知的腾讯内容风控指纹做**窄改写**（表见上）。
+def rewrite_tencent_fingerprints(text: str) -> tuple[str, int]:
+    """按上表做窄改写，返回 `(改写后的文本, 命中的规则条数)`。
 
-    · 不含任何指纹的文本**逐字符不变**（预检不命中就直接返回同一份内容）；
-    · 只改内容，不删句子、不改结构。
+    **零重建**：开关关闭、空文本、非字符串、无命中时原样返回**入参对象** ——
+    上游按前缀缓存计费，无谓的字符串重建会让缓存失效、白吃一次全量重算。
     """
     if not isinstance(text, str) or not text:
-        return text
+        return text, 0
+    if not _tencent_sanitize_enabled():
+        return text, 0
     out = text
+    hits = 0
     for pattern, replacement in _TENCENT_FINGERPRINT_RULES:
-        if pattern.search(out) is None:
+        if pattern.search(out) is None:      # 预检：不命中连 sub 都不进
             continue
         out = pattern.sub(replacement, out)
-    return out
+        hits += 1
+    return out, hits
 
 
-def _sanitize_messages(messages: list) -> list:
+def _sanitize_messages(messages: list) -> tuple[list, int]:
     """对**每一条 system 消息**的 `content` 做指纹改写，其余角色原样不动。
 
-    为什么是「每一条」而不是 `messages[0]`：插件那张表实测过**非首位 system
-    同样被拦**，只改第一条等于留一条随时会踩的路径。改的时候**新建 dict**，
-    不就地改调用方的 body（`_profile_of` 等已经读过它）。
+    为什么不是只改 `messages[0]`：非首位 system 同样会被上游拦，只改第一条
+    等于留一条随时会踩的路径。
+
+    命中时**新建 dict**，不就地改调用方的 body（同一份 body 后面还要取会话
+    粘性键、记账）；零命中时连列表都不重建。
     """
-    out = []
-    for message in messages:
+    out = list(messages)
+    hits = 0
+    changed = False
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
-            out.append(message)
+            continue
+        if str(message.get("role") or "") != "system":
             continue
         content = message.get("content")
-        if str(message.get("role") or "") != "system" or not isinstance(content, str):
-            out.append(message)
+        if not isinstance(content, str):
             continue
-        rewritten = sanitize_tencent_fingerprints(content)
-        if rewritten == content:
-            out.append(message)
+        rewritten, n = rewrite_tencent_fingerprints(content)
+        if n == 0:
             continue
-        copied = dict(message)
-        copied["content"] = rewritten
-        out.append(copied)
-    return out
+        out[index] = dict(message, content=rewritten)
+        hits += n
+        changed = True
+    return (out if changed else messages), hits
 
 
 def _prepare_body(body: dict, slot: str) -> dict:
@@ -312,16 +364,18 @@ def _prepare_body(body: dict, slot: str) -> dict:
     · `model` 换成槽位名；
     · 流式时补 `stream_options.include_usage` —— 少了它上游不返回 usage 帧，
       这张卡片和用量统计就永远是 0；
-    · **system 正文过一遍腾讯内容风控指纹改写**（`4100406` 的修法，见上面
-      `_TENCENT_FINGERPRINT_RULES` 的表与实测格）。`/v1/messages` 与
-      `/v1/responses` 都经 `_run_normalized` → `chat_completions` 落到这里，
-      所以只改这一处就覆盖三个入口。
+    · **system 正文过一遍腾讯内容风控指纹改写**（`4100406` 的修法，表见上）。
+      `/v1/messages` 与 `/v1/responses` 都经 `_run_normalized` → `chat_completions`
+      落到这里，所以只改这一处就覆盖三个入口。
     """
     out = dict(body)
     out["model"] = slot
     messages = out.get("messages")
     if isinstance(messages, list):
-        out["messages"] = _sanitize_messages(messages)
+        out["messages"], hits = _sanitize_messages(messages)
+        if hits:
+            # 只记命中条数，**不记原文**：system 里可能带用户的 prompt / 路径 / 密钥。
+            logger.info("Marvis 内容风控指纹改写 | rules_hit=%d", hits)
     if out.get("stream"):
         opts = dict(out.get("stream_options") or {})
         opts["include_usage"] = True
