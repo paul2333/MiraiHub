@@ -5,7 +5,7 @@
     host            https://yybadaccess.3g.qq.com
     模型网关        POST /v1/chat/completions      OpenAI 协议，SSE 流式
     令牌钱包        POST /v3/marvis_get_wallet     业务签名接口
-    续签            GET  /marvis_client_login/marvis_refresh_token
+    续签            POST /marvis_client_login/marvis_refresh_token        （见下）
     登录回调        GET  /marvis_client_login/marvis_oauth?login_type=&code=&state=
     QQ 授权         https://graph.qq.com/oauth2.0/authorize  (client_id=1903794758)
     微信授权        https://open.weixin.qq.com/connect/qrconnect (appid=wxb650708317d56f88)
@@ -363,6 +363,48 @@ def business_headers(acct: dict, *, query: str, method: str = "GET") -> dict:
         "Ual-Access-Login-Type": str(acct.get("login_type") or "1"),
         "Ual-Access-Openid": str(acct.get("openid") or ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# 续签请求体
+# ---------------------------------------------------------------------------
+#: 续签 body 里 `loginType` 的取值：**恒为字面量 `"Marvis"`**。
+#:
+#: 它不是 `Ual-Access-Login-Type`（那个是 QC→"1" / WX→"2"）。写成 "2" 会回
+#: `{"code":-109,"msg":"RefreshToken missing required param (openid, guid, token)"}`
+#: —— 「参数明明都给了却说缺参数」的真因就在这一层（2026-11-16 依 magpie
+#: 客户端实现复核，见 `refresh_body` docstring）。
+REFRESH_LOGIN_TYPE = "Marvis"
+
+
+def refresh_body(acct: dict) -> str:
+    """续签请求体 —— **原样字符串**，签名对象就是这串字节。
+
+    ## 形状是打通的唯一关键（一次嵌套都不能少）
+
+        {"userInfo":{"openId":"…","refreshToken":"…","accessToken":"…",
+                     "loginType":"Marvis"}}
+
+    ## 为什么以前一直 -109
+
+    上游读参数的路径是 `body.userInfo.{openId,refreshToken,accessToken}`：
+
+      · 少一层 `userInfo` 嵌套 → 读不到；
+      · 字段名写 `openid`（全小写）→ 读不到（要 `openId`）；
+      · `loginType` 写成 `"1"` / `"2"`（登录方式码）→ 读不到（要 `"Marvis"`）。
+
+    三种都回同一句 `RefreshToken missing required param (openid, guid, token)`，
+    所以从错误文案反推参数位置永远推不出来 —— 必须照客户端自己的形状发。
+    """
+    payload = {
+        "userInfo": {
+            "openId": str(acct.get("openid") or ""),
+            "refreshToken": str(acct.get("refresh_token") or ""),
+            "accessToken": str(acct.get("access_token") or ""),
+            "loginType": REFRESH_LOGIN_TYPE,
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def authorize_url(login_type: str = "QC", guid: str = "", state: str = "") -> str:

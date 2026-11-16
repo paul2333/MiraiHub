@@ -3642,6 +3642,40 @@ function expiryBadge(daysLeft, expired, expiringSoon) {
 }
 
 /**
+ * 登录态到期徽标（Marvis 这类「凭证会过期」的平台）。
+ *
+ * 与 `expiryBadge()` 的区别：那个讲的是**积分包**到期（`credits_*`），
+ * 这个讲的是**登录凭证**本身的有效期（`token_expiry`）。两者不能混：
+ * Marvis 是令牌钱包制、没有积分包，所以「积分到期」列永远为空，
+ * 界面就恒显示「长期有效」—— 而它的微信凭证实测只有约 2 小时。
+ *
+ * 后端 `token_expiry` 四档：`unknown`（老凭证没记录签发时间）/ `fresh` /
+ * `soon`（进入预警窗口）/ `expired`。`unknown` 返回空串，让调用方回落旧逻辑。
+ */
+function tokenExpiryBadge(t) {
+  if (!t || !t.state || t.state === "unknown") return "";
+  const ttl = Number(t.ttl_seconds || 0);
+  const left = Number(t.remaining_seconds || 0);
+  if (t.state === "expired") {
+    return `<span class="exp-badge dead"><span class="wb-icon "><svg class="wb-ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/></svg></span>已过期 · 需重登</span>`;
+  }
+  // 微信档只有 2 小时，用「分钟」比「小时」更有紧迫感；QQ 档按天显示。
+  let txt;
+  if (left < 3600) {
+    txt = `约 ${Math.max(1, Math.round(left / 60))} 分钟后过期`;
+  } else if (left < 86400) {
+    txt = `约 ${Math.round(left / 3600)} 小时后过期`;
+  } else {
+    txt = `约 ${Math.round(left / 86400)} 天后过期`;
+  }
+  if (t.state === "soon") {
+    return `<span class="exp-badge soon"><span class="wb-icon "><svg class="wb-ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3q1 4 4 6.5t3 5.5a1 1 0 0 1-14 0 5 5 0 0 1 1-3 1 1 0 0 0 5 0c0-2-1.5-3-1.5-5q0-2 2.5-4"/></svg></span>${txt}</span>`;
+  }
+  // fresh：正常状态，灰底即可，不要制造焦虑
+  return `<span class="exp-badge ever" title="凭证有效期约 ${Math.round(ttl / 3600)} 小时（推断值，上游不下发 expires_in）">${txt}</span>`;
+}
+
+/**
  * 积分明细弹窗里的单行（比 pkgRowHtml 多显示总量与已用量）。
  * 抽成独立函数是为了让「仍有剩余」与「已用完」两组共用同一份渲染 ——
  * 两处各写一遍很容易在改动时只改一处，出现同一种包两种样式的割裂。
@@ -3786,6 +3820,24 @@ function pagerHtml(total, page, totalPages, fn) {
  * 完整逐包明细挂到 `title`，鼠标悬停即可见 —— 信息没丢，只是不占版面。
  */
 function accExpiryCell(a) {
+  // **登录态优先**：凭证会过期的平台（Marvis）没有积分包，`credits_*` 全是空，
+  // 走下面的逻辑就会一律显示「长期有效」—— 而它的微信 token 实测只有 2 小时，
+  // 这个提示方向正好是反的。所以先看后端给的 `token_expiry`。
+  const tokenBadge = tokenExpiryBadge(a.token_expiry);
+  if (tokenBadge) {
+    const lt = (a.token_expiry && a.token_expiry.login_type === "QC")
+      ? "QQ 登录" : "微信登录";
+    const age = Number((a.token_expiry || {}).age_seconds);
+    const ageNote = Number.isFinite(age) && age > 0
+      ? `· 已登录 ${age >= 3600 ? Math.round(age / 3600) + " 小时" : Math.round(age / 60) + " 分钟"}`
+      : "";
+    const tip = (a.token_expiry.state === "expired"
+      ? "凭证已过期，请点「授权登录」重新扫码"
+      : "上游不下发 expires_in，有效期是按实测推断的")
+      + (ageNote ? "\n" + ageNote.replace("· ", "") : "");
+    return `<span class="acc-exp" data-tooltip="${esc(tip)}">${tokenBadge}
+      <span class="acc-exp-note">${lt} ${ageNote}</span></span>`;
+  }
   const soon = Number(a.credits_expiring_soon || 0);
   const next = a.credits_next_expiring || [];
   if (!a.credits_synced_at) {
@@ -6697,8 +6749,12 @@ async function platformBeginAuth(spec, storage) {
          border:1px solid var(--border);border-radius:8px;padding:8px 10px">
         <b>授权后页面显示 <code>{"code":-109,"msg":"RC_PARAMS_INVALID"}</code> 是正常的</b>，
         不是失败：那一步是浏览器直接打开回调页，缺我们自己要带的设备标识。
-        <b>授权码没有被消耗</b>，照常复制地址栏回来提交即可。
-        QQ / 微信的授权码只有几分钟有效期，<b>拿到后请立刻提交</b>，否则会变成「已过期（-107）」。
+        看到这个页面就说明<b>授权已经成功</b>，直接复制地址栏那条地址提交。
+        <br>
+        ⚠ <b>一个授权码只能用一次</b>（提交过一次、无论成功失败都作废）。
+        如果提交后报「已过期或已被使用（-107）」，说明这个 code 已经用掉了 ——
+        <b>重新扫码拿新的</b>，不要反复提交同一条。输入框会在提交后自动清空。
+        QQ / 微信的 code 只有几分钟有效期，<b>拿到后请立刻提交</b>。
       </p>
       <div class="flex gap-2 mb-3">
         <button type="button" data-mv="QC" class="console-btn primary">QQ 登录</button>
@@ -6771,7 +6827,19 @@ async function platformBeginAuth(spec, storage) {
         if (callback === lastTried) return;
         if (!/code=/i.test(callback) && callback.length < 8) return;
       }
+      // ⚠ **防重必须在这里一并把 busy 算进去**（2026-11-16）。
+      //
+      // 授权码是一次性的：`focus`（自动读剪贴板）、`paste`、点「粘贴并入库」
+      // 三个入口会各自独立调一次本函数。原来只判 `if (busy) return` 在
+      // `lastTried = callback` **之前**，但 `lastTried` 的赋值也在靠后位置，
+      // 于是同一串 code 能被两次通过（第二次进来时 busy 已被第一次置 true 却
+      // 在 await 之间让出，时序上仍会重入），上游对第二次必然回 `-107 已过期
+      // 或已被使用` —— 而其实**第一次已经成功入库了**。
+      //
+      // 用户看到的结果就是：账号明明导进去了，弹窗却报「授权码已过期/已被使用」，
+      // 以为失败，又去重扫一遍，越搞越乱。
       if (busy) return;
+      if (callback === lastTried) return;
       busy = true;
       lastTried = callback;
       if (submitBtn) submitBtn.disabled = true;
@@ -6783,20 +6851,55 @@ async function platformBeginAuth(spec, storage) {
           body: JSON.stringify({ auth_id: authId, callback: callback }),
         }));
         if (!ok) {
-          const msg = (data && (data.detail || data.message)) || "提交失败";
+          // `data.detail` 可能是**对象**（FastAPI 的 `detail={"message","step"}`），
+          // 直接拼进字符串会渲染成 "[object Object]" —— 截图里那个报错就是
+          // 这么来的，用户只看到一串无意义的字符，完全不知道 -107 是什么。
+          // 这里统一抽成可读文本：对象取 message / error / msg，再兜底 JSON。
+          const detail = data && data.detail;
+          let msg;
+          if (typeof detail === "string") {
+            msg = detail;
+          } else if (detail && typeof detail === "object") {
+            msg = detail.message || detail.error || detail.msg
+              || JSON.stringify(detail);
+          } else {
+            msg = (data && (data.message || data.error)) || "提交失败";
+          }
+          if (typeof msg !== "string") msg = String(msg);
           if (el) el.textContent = "▸ " + msg;
           toast(msg, "err");
+          // **失败后清空输入框**（2026-11-16 用户实测指出）。
+          //
+          // 授权码一次性：这个 code 已经废了，留在框里的话用户下次
+          // 一点「提交并入库」还是拿它去打，必然又是 -107 —— 表现就是
+          // 「怎么老是弹这个错」，而真正该做的是重扫拿新 code。
+          //
+          // 清空 + 把焦点交回去，顺手读一次剪贴板（用户通常已经复制好
+          // 新的回调了）。`lastTried` 也要清，否则新 code 恰好等于旧串
+          // 时会被防重挡掉。
+          if (cbInput) cbInput.value = "";
+          lastTried = "";
+          if (cbInput) {
+            try { cbInput.focus(); } catch (e) { /* 忽略 */ }
+          }
           if (submitBtn) submitBtn.disabled = false;
           busy = false;
           return;
         }
         stopPoll();
         toast("已入库：" + ((data && data.account && (data.account.name || data.account.uid)) || "Marvis 账号"));
+        // 成功同样清空：code 已消耗，留着只会在下次误提交时刷 -107。
+        if (cbInput) cbInput.value = "";
+        lastTried = "";
         closeModal();
         loadAccounts();
         if (window.WBPlatform) window.WBPlatform.refreshCounts();
       } catch (e) {
         if (el) el.textContent = "▸ 提交失败：" + (e && e.message ? e.message : e);
+        // 网络层失败也清空：这个 code 的状态未知，重试同一串很可能撞 -107，
+        // 让用户拿新的更稳。
+        if (cbInput) cbInput.value = "";
+        lastTried = "";
         if (submitBtn) submitBtn.disabled = false;
         busy = false;
       }

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -23,9 +24,83 @@ from . import endpoints
 logger = logging.getLogger("admin.platform.marvis.client")
 DEFAULT_TIMEOUT = 30.0
 
-#: 哪些 kind 要上报哨兵（区分「账号问题」与「实现问题」）
+#: 进程级共享 opener 的惰性缓存（见 `_opener()`）。
+_OPENER = None
+#: 不跟随重定向的 opener 缓存（换登录态那次请求专用，见 `_no_redirect_opener()`）。
+_NO_REDIRECT_OPENER = None
+
 SENTINEL_KINDS = frozenset({"auth", "quota_exceeded", "network",
                              "signature_invalid", "upstream_business"})
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随 3xx —— 换登录态要看 302 的 `Set-Cookie`，跟过去等于把凭证扔掉。"""
+
+    def redirect_request(self, *_args, **_kwargs):  # noqa: D401
+        return None
+
+
+def _opener():
+    """进程级共享的 urllib opener（**别用裸 `urllib.request.urlopen`**）。
+
+    ## 为什么（2026-11-16 全站无响应事故）
+
+    `urlopen()` 用的是默认 opener，`HTTPSConnection(context=None)` 会为
+    **每一条新连接**调 `ssl._create_default_https_context()` → 在 Windows 上
+    重扫系统证书库（`ssl._load_windows_store_certs`）。实测单次 3~13 秒，
+    而且每次连接都重来一遍 —— 期间单 worker 的事件循环完全停摆。
+
+    `admin.upstream_http.urllib_opener()` 把共享 SSL 上下文（系统库 + certifi）
+    建一次复用，并默认不走系统代理（加速器塞进注册表的代理会让 TLS 校验失败，
+    见 issue #5）。与 Loomy 等平台同一条链路，不再各写各的。
+    """
+    global _OPENER
+    if _OPENER is None:
+        from admin.upstream_http import urllib_opener
+
+        _OPENER = urllib_opener()
+    return _OPENER
+
+
+def _no_redirect_opener():
+    """同 `_opener()`，但不跟随重定向（`exchange_code` 专用）。
+
+    ## 为什么必须用「替换」而不是「追加」
+
+    `urllib.request.build_opener()` 会自动装上默认的 `HTTPRedirectHandler`。
+    之后再 `opener.add_handler(_NoRedirect())` 只是往链尾**追加**，
+    默认处理器仍在前头、先命中，302 照样被跟随 —— 表现就是请求被带到
+    落地页「登录成功」HTML，`Set-Cookie` 里的 token 丢掉，报
+    「登录接口没有下发 accesstoken」（2026-11-16 真机逐层排查确认）。
+
+    正确做法是把自定义 handler 作为 `build_opener()` 的**位置参数**传进去，
+    urllib 才会按「子类替换父类」把默认的顶替掉。
+
+    `admin.upstream_http.build_opener` 因此加了 `*extra_handlers` 形参；
+    这里做一次兼容判断：老版本没这个形参时，退回直接用标准库构造
+    （TLS 上下文仍从 `ssl_context()` 取，与其它请求一致）。
+    """
+    global _NO_REDIRECT_OPENER
+    if _NO_REDIRECT_OPENER is None:
+        import inspect
+
+        from admin import upstream_http
+
+        fn = upstream_http.build_opener
+        try:
+            accepts = "extra_handlers" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        if accepts:
+            _NO_REDIRECT_OPENER = fn(None, _NoRedirect())
+        else:
+            # 兜底：标准库构造，把 _NoRedirect 作为位置参数传入（关键所在）
+            _NO_REDIRECT_OPENER = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(
+                    context=upstream_http.ssl_context()),
+                _NoRedirect())
+    return _NO_REDIRECT_OPENER
+
 
 
 class UpstreamError(Exception):
@@ -107,7 +182,7 @@ def _request(url: str, *, method: str = "GET", body: dict | None = None,
     if data:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener().open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", "replace")
             return json.loads(text) if text.strip() else {}
     except urllib.error.HTTPError as exc:
@@ -200,7 +275,7 @@ def open_chat_stream(credential: dict, realm: str, body: dict, *,
     for key, value in endpoints.llm_headers(acct).items():
         req.add_header(str(key), str(value))
     try:
-        return urllib.request.urlopen(req, timeout=STREAM_TIMEOUT)
+        return _opener().open(req, timeout=STREAM_TIMEOUT)
     except urllib.error.HTTPError as exc:
         payload = ""
         try:
@@ -353,18 +428,136 @@ def list_models(_credential: dict | None = None, realm: str = "") -> list[dict]:
     return out
 
 
-def refresh_credentials(refresh_token: str, realm: str = "cn", *,
-                        account_id: int = 0) -> dict:
-    """续签。
+#: 续签失败时「登录态真的死了」的业务码。
+#:
+#: · `-107 RC_NO_AUTH_ERR` —— 凭证无效；
+#: · `-101` —— 未授权（同类）；
+#: · `-114` —— 上游把 OAuth 的报错原样回给你，实测形状是
+#:   `code:-114, msg:callback({"error":100036,"error_description":"invalid refresh token"})`。
+#:   参数形状对、只是这张 refresh_token 已经不能用了（被客户端轮换掉、或过期）。
+#:
+#: 除了这几个，其余（`-109` 参数、`-7` 签名、`-5` 缺头）都是**本端**的问题 ——
+#: 把它们也当成 auth 失败会把好账号标成「需要重新登录」，比不续签更糟。
+FATAL_REFRESH_CODES = frozenset({-107, -101, -114})
 
-    上游是 `GET /marvis_client_login/marvis_refresh_token`，走**设备标识 +
-    登录态**而不是 OAuth 表单。实测需要原 access_token 与 guid 一起带上，
-    光有 refresh_token 换不出来 —— 所以这里接受整份凭证。
+#: `msg` 里出现这些片段同样判死（上游有时把 OAuth 原文塞进 msg 而不改 code）。
+FATAL_REFRESH_HINTS = ("invalid refresh token", "refresh token expired",
+                       "refresh_token invalid")
+
+
+def _expires_in_seconds(info: dict) -> int:
+    """取续签下发的有效期秒数 —— **数字与数字字符串都收**。
+
+    上游给的是字符串（微信实测 `"7200"`），只认 number 会让 `expires_at`
+    恒为 0，下一次就又要走「按推断 TTL 算」那条腿，面板上的到期时间永远是猜的。
     """
+    for key in ("expires_in", "expiresIn", "access_token_expire_time"):
+        raw = info.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            seconds = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if seconds > 1e9:      # 已经是绝对时间戳，交给 expires_at 那条腿
+            return 0
+        if seconds > 0:
+            return seconds
+    return 0
+
+
+def refresh_credentials(refresh_token: str = "", realm: str = "cn", *,
+                        account_id: int = 0,
+                        credential: dict | None = None) -> dict:
+    """续签登录态 —— `POST /marvis_client_login/marvis_refresh_token`。
+
+    ## 请求形状（这一层嵌套就是全部关键，见 `endpoints.refresh_body`）
+
+        {"userInfo":{"openId":"…","refreshToken":"…","accessToken":"…",
+                     "loginType":"Marvis"}}
+
+    签名口径与 `/v3/*` 相同（签名对象是 **body 原文**），`Ual-Access-Guid` 必带。
+    上游读的是 `body.userInfo.{openId,refreshToken,accessToken}`：少一层嵌套、
+    字段写成 `openid`、或把 `loginType` 填成登录方式码（"1"/"2"），一律回
+    `-109 RefreshToken missing required param (openid, guid, token)` —— 所以
+    从错误文案反推参数位置永远推不出来（issue #41 的穷举都卡在这一步）。
+
+    ## 响应语义
+
+        {"code":0,"msg":"RC_SUCCESS",
+         "user_info":{"access_token":"…","refresh_token":"…","expires_in":"7200"}}
+
+      · `access_token` **不变** —— 续签只重置有效期，不要指望换出新票面；
+      · `refresh_token` 可能回**空串**（微信实测如此）：空串 = 这次没给新值，
+        必须回落旧值，否则下一次续签直接没票可用；
+      · `expires_in` 是**字符串**，见 `_expires_in_seconds()`；
+      · `-107 / -101` 才是登录态真死，`-109` 一类是本端问题（`FATAL_REFRESH_CODES`）。
+    """
+    data = dict(credential or {})
+    if refresh_token and not data.get("refresh_token"):
+        data["refresh_token"] = refresh_token
+
+    openid = str(data.get("openid") or data.get("openId") or "").strip()
+    guid = str(data.get("guid") or "").strip()
+    token = str(data.get("access_token") or data.get("accessToken") or "").strip()
+    refresh = str(data.get("refresh_token") or data.get("refreshToken") or "").strip()
+    if not (openid and token and refresh):
+        raise UpstreamError(
+            "续签需要 openid + access_token + refresh_token，缺一换不出来："
+            "请在控制台「授权登录」重新扫码（QQ / 微信）",
+            status=401, code="credential_incomplete", kind="auth")
+
+    acct = {"openid": openid, "access_token": token, "refresh_token": refresh,
+            "guid": guid,
+            "login_type": str(data.get("login_type") or data.get("loginType") or "1")}
+    # 签名对象是**实际发出的那串字节**：先序列化，再拿同一串去做签名头。
+    body = endpoints.refresh_body(acct)
+    headers = endpoints.business_headers(acct, query=body, method="POST")
+    # business_headers 已含该头；显式再写一遍是为了让「guid 到底带没带」这件事
+    # 在代码里看得见（issue #41 曾把它当成 -109 的根因，值相同不影响签名）。
+    headers["Ual-Access-Guid"] = guid
+
+    payload = _request(endpoints.refresh_url(realm), method="POST",
+                       raw_body=body, headers=headers, realm=realm,
+                       account_id=account_id)
+
+    code = None
+    inner = None
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        inner = payload.get("user_info") or payload.get("userInfo")
+
+    if code in (0, "0") and isinstance(inner, dict):
+        new_access = str(inner.get("access_token") or inner.get("accesstoken")
+                         or inner.get("accessToken") or token)
+        # 空串回落旧值 —— 「这次没给」不等于「清空」
+        new_refresh = str(inner.get("refresh_token") or inner.get("refreshtoken")
+                          or inner.get("refreshToken") or "") or refresh
+        seconds = _expires_in_seconds(inner)
+        return {
+            "access_token": new_access,
+            "refresh_token": new_refresh,
+            "expires_in": seconds,
+            "expires_at": int(time.time()) + seconds if seconds else 0,
+            "login_type": acct["login_type"],
+            "openid": str(inner.get("openid") or inner.get("openId") or openid),
+            "nickname": str(inner.get("nick_name") or inner.get("nickname") or ""),
+            "avatar": str(inner.get("head_img_url") or ""),
+            "raw": payload,
+        }
+
+    msg = str((payload or {}).get("msg") or "") if isinstance(payload, dict) else ""
+    blob = msg.lower()
+    fatal = (code in FATAL_REFRESH_CODES
+             or any(hint in blob for hint in FATAL_REFRESH_HINTS))
     raise UpstreamError(
-        "Marvis 的续签需要完整凭证（openid + guid + access_token），"
-        "请通过导入刷新后的凭证或重新扫码登录",
-        status=401, kind="auth")
+        "Marvis 续签被上游拒绝（code=%s %s）%s"
+        % (code, msg,
+           "：这张 refresh_token 已经不能用了，请重新扫码登录（QQ / 微信）"
+           if fatal else "——这是本端参数/签名问题，账号本身没坏"),
+        status=401, code=str(code or ""),
+        kind=("auth" if fatal else "refresh_rejected"),
+        detail=json.dumps(payload, ensure_ascii=False)[:300])
 
 
 def exchange_code(code: str, login_type: str, realm: str = "cn", *,
@@ -388,18 +581,13 @@ def exchange_code(code: str, login_type: str, realm: str = "cn", *,
         params["state"] = str(state)
     url = endpoints.oauth_url(realm) + "?" + urlencode(params)
 
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *_args, **_kwargs):  # noqa: D401
-            return None
-
-    opener = urllib.request.build_opener(_NoRedirect)
     req = urllib.request.Request(url, method="GET")
     req.add_header("Accept",
                    "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8")
     req.add_header("User-Agent", endpoints.BROWSER_UA)
     req.add_header("Ual-Access-Guid", str(guid))
     try:
-        resp = opener.open(req, timeout=DEFAULT_TIMEOUT)
+        resp = _no_redirect_opener().open(req, timeout=DEFAULT_TIMEOUT)
     except urllib.error.HTTPError as exc:
         # 302 在 urllib 里会以 HTTPError 抛出 —— 这里正是要它的 Set-Cookie
         resp = exc
@@ -409,11 +597,19 @@ def exchange_code(code: str, login_type: str, realm: str = "cn", *,
 
     cookies = _cookies_of(resp)
     body_text = ""
-    if getattr(resp, "status", 0) != 302:
-        try:
-            body_text = resp.read().decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001
-            body_text = ""
+    # **302 也要尽量读一遍 body**（2026-11-16）。
+    #
+    # 原来写成 `if status != 302: read()`，理由是「302 没有 body」。但上游
+    # 有两种失败形态会夹在 302 里一起回来（带 JSON 错误码），不读就只剩
+    # 一个空 info → biz_code=0 → 直接掉到「没有下发 accesstoken」这个
+    # 什么也没说清楚的兜底分支。
+    #
+    # 读不到/不是 JSON 无害（下面 `json.loads` 失败就退化成空 info），
+    # 所以这里不设条件、统一尝试。
+    try:
+        body_text = resp.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - 302 的 body 可能不可读
+        body_text = ""
 
     info = {}
     if body_text.strip():
@@ -450,8 +646,10 @@ def exchange_code(code: str, login_type: str, realm: str = "cn", *,
             detail=body_text[:200])
     if biz_code == -107:
         raise UpstreamError(
-            "授权码已过期或已被使用（-107）：QQ / 微信的 code 只有几分钟有效期。"
-            "请重新扫码，拿到回调地址后立刻贴进来提交（别再刷新那个页面）。",
+            "授权码已过期或已被使用（-107）：QQ / 微信的 code 是一次性的、"
+            "只有几分钟有效期。常见原因是**这次授权其实已经成功过**，或者"
+            "你把同一条链接提交/打开过两次。请重新扫码，拿到回调后在 1 分钟内"
+            "提交一次；如果账号列表里已经多了这个号，说明上一次已经入库了。",
             status=400, code="-107", kind="auth",
             detail=body_text[:200])
     if biz_code not in (0, 200):
@@ -473,8 +671,14 @@ def exchange_code(code: str, login_type: str, realm: str = "cn", *,
                   or info.get("refreshToken") or cookies.get("refreshtoken")
                   or cookies.get("refresh_token") or "")
     if not access or not openid:
+        # 到这一步说明：既没有业务错误码，也没拿到 token。最可能是上游换了
+        # 响应形状，或者 302 的 Set-Cookie 没被读到。把「看到了什么」原样
+        # 带出来，否则用户只看到一句「没有下发」，排查无从下手。
+        seen = (body_text or "").strip()[:160] or "（空响应体）"
         raise UpstreamError(
-            "登录接口没有下发 accesstoken / openid",
+            "登录接口没有下发 accesstoken / openid。"
+            "这通常是授权码已被使用过（一次性的），或上游响应形状变了。"
+            "请重新扫码再试一次；仍然不行请把下面这段反馈：%s" % seen,
             kind="auth",
             detail=(body_text or str(cookies))[:200])
 
