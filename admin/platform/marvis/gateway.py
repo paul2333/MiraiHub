@@ -27,6 +27,24 @@ DSH 侧就显示成「API key is invalid」）。
 所以现在：**建连**（`open_chat_stream` / `chat_completions`）、**逐块读**
 （`resp.read`）、以及**同步 DB**（选号 / 租约 / 记账）全部走
 `asyncio.to_thread`；事件循环线程上只剩 await。
+
+## 为什么每一步都要 `to_thread`（2026-11-16 全站无响应事故）
+
+`core/client.py` 走的是 `urllib`（**同步**）。`admin.server` 是单进程单 worker 的
+uvicorn，所以任何同步上游调用只要留在事件循环线程上，就会把**全网关**钉住 ——
+控制台、账号导入、健康检查、其它平台的请求一起排队。
+
+2026-11-16 的现场（`admin.loop_watch` 抓的栈）有两条，都属于这一类：
+
+    http/client.py getresponse → ssl.read              （13.5 秒）
+    urllib/request.py https_open → ssl._load_windows_store_certs （13.3 秒）
+
+第一条是 `_attempt()` 里的 `open_chat_stream` / `chat_completions` 直接跑在事件
+循环上；第二条是裸 `urlopen` 每条新连接都重扫 Windows 证书库（已由
+`admin.upstream_http.install_ssl_defaults()` 统一成共享上下文）。
+
+现在：鉴权 + 选号 + 建连（`_acquire`）、记账（`_bill`）全部丢进工作线程，
+事件循环只负责转发字节。
 """
 from __future__ import annotations
 
@@ -228,6 +246,71 @@ def _bill(key, account, model, usage, *, request, started=None, error="",
     except Exception:  # noqa: BLE001
         logger.exception("Marvis 记账失败")
 
+
+async def _bill_async(*args, **kwargs) -> None:
+    """在工作线程里记账（`_bill` 是同步 DB 写，不能占事件循环）。
+
+    用 `shield` 包住：客户端中途关掉页面时，流式生成器的 `finally` 会立刻收到
+    `CancelledError`；不 shield 的话记账直接被取消 —— 用户已经消耗的额度就
+    查不到了。shield 之后内部任务照旧跑完，只是本协程不再等它。
+    """
+    try:
+        await asyncio.shield(asyncio.to_thread(_bill, *args, **kwargs))
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - 记账失败绝不影响响应
+        logger.exception("Marvis 记账线程异常")
+
+
+# ---------------------------------------------------------------------------
+# 腾讯内容风控指纹改写（修 403 / 4100406）
+# ---------------------------------------------------------------------------
+#
+# ## 现象
+#
+# 上游 `yybadaccess.3g.qq.com` 对 `messages[]` 里的 **system 正文**做**字面量**
+# 黑名单匹配（与 buddy / workbuddy 同一套内容风控）。命中即整条请求被拒：
+#
+#     HTTP 403 {"code": 4100406, "msg": "非法请求"}
+#
+# 业务码不进响应体，上层框架常把它渲染成「鉴权失败 / API key invalid」之类的
+# 无关错误 —— 客户端既看不出是内容被拦，也看不出拦的是哪一句。
+#
+# ## 为什么中间网关必须自己做一遍
+#
+# 客户端插件（dsh-providers-hub 的 `tencent-fingerprint.js`）已有同一张表，但
+# 它按 **provider 白名单**放行：`TENCENT_PROVIDERS = ['buddy', 'workbuddy',
+# 'marvis']`。客户端直连 marvis 时 `provider='marvis'`，改写生效；一旦中间隔了
+# 任何网关，`provider` 就变成网关自己的 id，改写短路、原文原样透传 → 403。
+# ⇒ 这类改写必须在网关侧再做一遍，本表即为此存在。
+#
+# ## 改写边界（有意不扩大）
+#
+#   · **只改 system**；user / assistant / tool 一律不碰 —— 改用户内容或会话
+#     历史会污染对话语义，也违背「网关不篡改用户输入」。
+#   · 只换写法、不删句子：替换值与客户端插件逐字一致，语义等义。
+#   · **不命中的文本逐字符不变**（先 `search` 预检，命中才 `sub`）：上游按前缀
+#     缓存计费，无谓的字符串重建会让缓存失效、白吃一次全量重算。
+#   · `MIRAIHUB_MARVIS_SANITIZE_TENCENT=0` 可整体关闭，恢复原样透传。
+#
+# ## 表的来源与匹配语义
+#
+# 7 条规则逐条移植自客户端插件的 `CONTENT_FINGERPRINTS`：`find` 是**字面量**
+# （`re.escape` + `re.IGNORECASE`，上游匹配大小写不敏感）；第 4 条用插件登记的
+# `findRegex`（容忍空白归一与可选词漂移）。
+#
+# ⚠️ 各条的**锚点语义不同**，不要统一加 `^`：
+#
+#   1. ZCode 分支名常量 —— 位置无关
+#   2. Claude Code 身份句 —— 行首锚定（前接任意字符即放行）
+#   3. Claude Code 反馈句 —— 位置无关
+#   4. DSH 身份首句 —— 行首锚定
+#   5. DSH Web 面开头两句 —— 位置无关
+#   6. DSH `@` 引用说明句 —— 位置无关
+#   7. SDK 计费头字样 —— 位置无关
+#
+# 本实现**不**给任何一条加行首锚定：改写范围宁可略宽 —— 漏改一处就是整轮
+# 403，多改一处只是语义等价的措辞变化（与客户端插件同一取舍）。
 
 #: 腾讯内容级风控**指纹表**（7 条全量移植自 DSH 插件
 #: `dsh-providers-hub/lib/openai-gateway/tencent-fingerprint.js` 的
@@ -858,11 +941,43 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
         headers={"Retry-After": "3"})
 
 
+def _acquire(request, body: dict, realm: str, *, stream: bool):
+    """鉴权 + 选号 + 打开上游，**全程同步、必须在工作线程里跑**。
+
+    ## 为什么整段都在线程里
+
+    这里三件事都是**阻塞**的：`shared.authenticate`（SQLAlchemy 同步会话 +
+    查 Key/配额）、`_attempt`（选号 + 租约 + `urlopen`），而 `urlopen` 会一直
+    等到上游把**响应头**吐出来（流式也是：`STREAM_TIMEOUT=300s`）。
+    单 worker 的 uvicorn 上，这段留在事件循环里就是「一次上游卡顿，全站停摆」
+    —— 2026-11-16 事故即此。
+
+    会话在**本线程内**新建、`finally` 里关闭：SQLAlchemy 的 Session 不跨线程
+    复用，交给上层就一定会踩到「连接已被归还但对象还在用」的坑。
+
+    返回 `(key, resp, account, started)`；异常（`PlatformRejected` /
+    `UpstreamError`）原样抛出，由调用方转成对应协议的响应。
+    """
+    from admin.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        key = shared.authenticate(db, request, platform=PUBLIC)
+        resp, account, started = _attempt(db, request, key, body, realm,
+                                          stream=stream)
+        return key, resp, account, started
+    finally:
+        db.close()
+
+
 async def _iter_upstream(resp):
     """逐块读上游 SSE —— **每一块都在工作线程里读**，事件循环上不留阻塞调用。
 
     每取一块才发起下一次 `read`，消费者慢下来就自然形成背压；线程里的
     异常会在 `await` 处原样抛回，不需要自己搬运。
+
+    用 `asyncio.to_thread`（而不是裸 `run_in_executor`）：它会带上当前
+    contextvars，`request_metrics` / 实时面板那套按请求隔离的上下文才不会丢。
 
     ⚠ 建连（`open_chat_stream`）也是阻塞的，已经在上游的 `to_thread` 里；
     这里只负责「已建好的连接」的读取。
@@ -893,34 +1008,20 @@ async def chat_completions(request: Request):
     upstream_body = _prepare_body(body, slot)
     wants_stream = bool(body.get("stream"))
 
-    from admin.db import SessionLocal
-
-    db = SessionLocal()
     try:
-        # 鉴权、选号、上游调用全是同步实现 —— 一律在工作线程里跑（见 _attempt）。
-        key = await asyncio.to_thread(
-            shared.authenticate, db, request, platform=PUBLIC)
-        resp, account, started = await _attempt(
-            db, request, key, upstream_body, realm, stream=wants_stream)
+        key, resp, account, started = await asyncio.to_thread(
+            _acquire, request, upstream_body, realm, stream=wants_stream)
     except shared.PlatformRejected as exc:
-        db.close()
         # `openai()` 本身返回的就是 **JSONResponse**，不要再包一层 ——
         # 包了会 TypeError: Object of type JSONResponse is not JSON serializable。
         return exc.openai()
     except client.UpstreamError as exc:
-        db.close()
         return _fail(exc)
-    except Exception:
-        db.close()
-        raise
-    db.close()
 
     if not wants_stream:
-        # 非流式：整段响应体已经在 _call_upstream 的线程里读完（不再阻塞循环）；
-        # 记账是同步 DB，也放到线程里。
         usage = _usage_of(resp)
-        await asyncio.to_thread(
-            _bill, key, account, slot, usage, request=request, started=started)
+        await _bill_async(key, account, slot, usage, request=request,
+                          started=started)
         return JSONResponse(resp)
 
     async def generator():
@@ -960,8 +1061,10 @@ async def chat_completions(request: Request):
             # 会把刚才 note_failure 记的失败计数清零，等于把坏号洗白。
             shared.note_success(account)
             shared.release(account)
-            _bill(key, account, slot, usage, request=request, started=started,
-                  stats=stats)
+            # 记账是同步 DB 写，必须离开事件循环（客户端断开时也不会丢账，
+            # 见 `_bill_async` 里的 shield）。
+            await _bill_async(key, account, slot, usage, request=request,
+                              started=started, stats=stats)
 
     return StreamingResponse(generator(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -1109,7 +1212,15 @@ async def responses(request: Request):
     body = await _body_of(request)
     normalized = _responses_to_openai(body)
     return await _run_normalized(request, normalized, protocol="responses")
-    """本地估算。口径：CJK 1 token/字，其它 4 字符 1 token（保守近似）。"""
+
+
+async def count_tokens(request: Request):
+    """本地估算。口径：CJK 1 token/字，其它 4 字符 1 token（保守近似）。
+
+    ⚠ 这里原来是一段**接在 `responses()` 的 `return` 之后**的死代码：
+    函数永远走不到，`dispatch()` 调 `count_tokens(request)` 时直接
+    `NameError` → 500。测试从不打这个路径，所以一直没人发现。
+    """
     body = await _body_of(request)
     parts: list[str] = []
     if isinstance(body.get("system"), str):
