@@ -695,9 +695,9 @@ def _dump_403_body(body: dict, *, status: int | None,
     return path
 
 
-async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
-                         stream: bool, profile: dict | None = None):
-    """调上游 —— **整个调用跑在工作线程里**，只对「瞬时」失败同号重试（最多 2 次）。
+def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
+                   stream: bool, profile: dict | None = None):
+    """调上游 —— **同步实现**，由 `_acquire` 所在的工作线程承载；只对「瞬时」失败同号重试。
 
     ## 什么算「瞬时」
 
@@ -706,14 +706,27 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
        （当前只有 `4100406 非法请求`）—— 实测同号同分钟 200/403 交替，属上游
        偶发，重打一次就过；参数类错误（400/422）不在此列，换号/重打都无用。
 
-    ## 为什么必须 `to_thread`
+    ## 为什么是**同步**，以及谁负责把它挪出事件循环
 
     `client.open_chat_stream` 内部是 `urllib.request.urlopen`：它会一直阻塞
     到上游把**响应状态行 + 响应头**吐回来。`admin.server` 是单进程单 worker
     的 uvicorn，在事件循环线程里调它等于把整个网关钉死 —— 2026-11-15 实测
     单次阻塞 3.3s/7s/17s/27s/**63.5s**，43 个在飞请求被串行化后超期，
     上游回 `4100406 非法请求`。非流式的 `chat_completions` 会 `read()`
-    整个响应体，同样是阻塞调用，同样要挪出去。
+    整个响应体，同样是阻塞调用。
+
+    ⇒ 阻塞是真的，所以**整条 `_acquire`（鉴权 + 选号 + 建连）在工作线程里同步
+    跑完**，事件循环只做 `await asyncio.to_thread(_acquire, ...)`。本函数因此在
+    线程里**同步调用** client，**不许**再出现 `asyncio.to_thread` —— 线程里套
+    线程只是多一次上下文切换，还把「谁在事件循环上」这件事搞模糊了。
+
+    ## 2026-11-17：758ab76 全量 502 的根因
+
+    29f245f 合并时把本函数与 `_attempt` 改成 `async def`（旧的「每步 to_thread」
+    写法），却留下了上游同步的 `_acquire` —— 它在工作线程里 `_attempt(...)`，
+    拿到的是 coroutine 对象，解包即 `TypeError: cannot unpack non-iterable
+    coroutine object`，marvis 100% 502。现在统一回上游的同步形状：阻塞调用在
+    线程池，异步只留给 `chat_completions` 的 `to_thread(_acquire)` 与记账。
 
     ## 为什么重试**不重新选号**
 
@@ -744,12 +757,10 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
     for index in range(1 + SAME_ACCOUNT_RETRIES):
         try:
             if stream:
-                return await asyncio.to_thread(
-                    client.open_chat_stream, data, realm, body,
-                    account_id=account_id)
-            return await asyncio.to_thread(
-                client.chat_completions, data, realm, body,
-                account_id=account_id)
+                return client.open_chat_stream(
+                    data, realm, body, account_id=account_id)
+            return client.chat_completions(
+                data, realm, body, account_id=account_id)
         except client.UpstreamError as exc:
             # 失败画像：与「成功画像」同列，按 bytes/msgs/tools 直接对比。
             logger.info(
@@ -760,11 +771,10 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                 profile["sys_chars"], index + 1, 1 + SAME_ACCOUNT_RETRIES)
             # 403 时把「本次实际发出的 body」转储一份（仅当
             # MIRAIHUB_MARVIS_DUMP_403=1；默认关闭，连目录都不建）。
-            # 放 to_thread：3.5MB 的 gzip 要十几毫秒，不能钉在事件循环上。
+            # 3.5MB 的 gzip 要十几毫秒 —— 这里本来就在工作线程里，直接落盘。
             if exc.status == 403:
-                await asyncio.to_thread(
-                    _dump_403_body, body, status=exc.status,
-                    account_id=account_id)
+                _dump_403_body(body, status=exc.status,
+                               account_id=account_id)
             # 白名单 kind（网络抖动 / 瞬断）**或** 上游偶发业务码（4100406）。
             # 后者只在 kind 已经是 `upstream_business` 时才看 —— `auth` /
             # `risk_control` 即便 detail 里带了同一个码也不重试。
@@ -787,13 +797,14 @@ async def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                 "acc=%s 第 %s/%s 次重试，退避 %.2fs",
                 exc.kind, exc.status or "-", exc.code or "-", account_id,
                 index + 1, SAME_ACCOUNT_RETRIES, delay)
-            await asyncio.sleep(delay)
+            # 退避是「本请求」的等待：工作线程里同步 sleep，事件循环照旧转。
+            time.sleep(delay)
 
 
-async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
+def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     """选号 + 租约 + 调上游。换号语义与其它平台一致。
 
-    ## 为什么是 async，且每一步都要 `to_thread`
+    ## 为什么是**同步**：它整段都跑在工作线程里
 
     这里的三类调用全是**同步阻塞**的：
 
@@ -802,7 +813,14 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
       · `client.open_chat_stream` / `chat_completions`：`urllib` 同步 HTTP。
 
     留在事件循环线程上，任何一次慢调用都是**全站**慢（见 `_call_upstream`
-    的 63.5 秒事故）。所以这里一步都不留在循环上。
+    的 63.5 秒事故）。正确的挪法不是「在 async 函数里给每一步套 to_thread」，
+    而是**整条 `_acquire` 一次性丢进工作线程**：鉴权、选号、建连、记账各走各的
+    线程会让同一个 SQLAlchemy Session 跨线程复用（上游 `_acquire` 的
+    docstring 明确写了这条禁忌），也平白多出几次线程切换。
+
+    ⇒ 本函数是普通 `def`，只允许由 `_acquire`（已在线程池里）调用。
+    **不要**改回 `async def`：`_acquire` 是同步的，改了就是 758ab76 那个
+    `TypeError: cannot unpack non-iterable coroutine object`。
 
     ## 两层重试（2026-11-16 解耦）
 
@@ -836,8 +854,8 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
         # 它又排回队首（这些号从没成功过，`last_used_at` 恒为 NULL，选号按它升序）
         # —— 用户感受到的就是「一直失败，用不了」。NULL 余额（从没同步过）仍放行，
         # 否则新导入的号会被全部误杀。
-        account = await asyncio.to_thread(
-            shared.select_account, db, storage=STORAGE, realm=realm, key=key,
+        account = shared.select_account(
+            db, storage=STORAGE, realm=realm, key=key,
             model=model, exclude_ids=exclude, min_balance=0)
         if account is None:
             break
@@ -848,15 +866,14 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                 switch_from, int(account.id or 0),
                 switch_reason[0] or "-", switch_reason[1] or "-")
             switch_from = 0
-        if not await asyncio.to_thread(shared.lease, account):
+        if not shared.lease(account):
             exclude.add(account.id)
             continue
         started = time.perf_counter()
         try:
-            data = await asyncio.to_thread(
-                marvis_accounts.ensure_token, db, account)
+            data = marvis_accounts.ensure_token(db, account)
             tried += 1
-            result = await _call_upstream(
+            result = _call_upstream(
                 data, realm, body, int(account.id or 0), stream=stream,
                 profile=profile)
             if not stream:
@@ -891,8 +908,8 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                     "Marvis 登录态已过期%s：请在控制台「授权登录」重新扫码（QQ / 微信）"
                     % extra, status=401, code="credential_expired", kind="auth",
                     detail=detail)
-            await asyncio.to_thread(
-                shared.note_failure, db, account, kind=exc.kind,
+            shared.note_failure(
+                db, account, kind=exc.kind,
                 detail=exc.detail or exc.message, status=exc.status,
                 model=model, public_platform=PUBLIC,
                 cool_seconds=(600 if exc.kind in ("auth", "risk_control") else 0))
@@ -933,7 +950,7 @@ async def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     # 原因只有两种，得分开讲清楚（2026-11-15 用户实测被这句话误导：账号明明
     # 是 active、凭证也在，只是 access_token 过了约 2 小时有效期）。
     try:
-        rows = await asyncio.to_thread(marvis_accounts.accounts_for, db, realm)
+        rows = marvis_accounts.accounts_for(db, realm)
         alive = [r for r in rows if (getattr(r, "status", "") or "") == "active"]
         expired = [r for r in alive
                    if "过期" in str(getattr(r, "last_err_msg", "") or "")]

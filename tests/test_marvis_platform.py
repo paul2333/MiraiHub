@@ -340,25 +340,52 @@ class ErrorClassifyTests(unittest.TestCase):
 class EventLoopSafetyTests(unittest.TestCase):
     """阻塞调用必须在工作线程里（2026-11-15 事件循环被钉死 63.5 秒）。"""
 
-    def test_attempt_is_a_coroutine_function(self):
+    def test_attempt_is_sync_and_acquire_is_the_one_offloaded(self):
+        """`_attempt` 必须是**同步 def**，由同步的 `_acquire` 在线程池里调。
+
+        758ab76 线上事故：合并把 `_attempt` 改成了 `async def`，而 `_acquire`
+        仍是同步 `def` —— 工作线程里 `resp, account, started = _attempt(...)`
+        拿到的是 coroutine 对象，直接
+        `TypeError: cannot unpack non-iterable coroutine object`，marvis 全量 502。
+        """
         import inspect
 
         from admin.platform.marvis import gateway
 
-        self.assertTrue(
+        self.assertFalse(
             inspect.iscoroutinefunction(gateway._attempt),
-            "_attempt 必须是 async：同步实现会把 urlopen 留在事件循环上")
+            "_attempt 必须是同步 def：它整段都是阻塞调用，只能跑在工作线程里")
+        self.assertFalse(
+            inspect.iscoroutinefunction(gateway._acquire),
+            "_acquire 必须是同步 def：chat_completions 用 to_thread 把它丢进线程池")
+        self.assertIn("asyncio.to_thread",
+                      inspect.getsource(gateway.chat_completions),
+                      "chat_completions 必须用 to_thread 调 _acquire")
 
-    def test_upstream_call_goes_through_to_thread(self):
+    def test_upstream_call_is_sync_inside_worker_thread(self):
+        """`_call_upstream` 同步直连 client —— 它本来就跑在工作线程里。
+
+        旧写法（async + 每步 `to_thread`）与上游同步的 `_acquire` 不兼容，
+        合并时只改了一半就是 758ab76 的 502。这里钉死「线程里不再套线程」。
+        """
+        import ast
         import inspect
+        import textwrap
 
         from admin.platform.marvis import gateway
 
-        src = inspect.getsource(gateway._call_upstream)
-        self.assertIn("asyncio.to_thread", src)
-        # 裸的同步调用（`client.open_chat_stream(`）一行都不许留
-        self.assertNotIn("client.open_chat_stream(", src)
-        self.assertNotIn("client.chat_completions(", src)
+        self.assertFalse(inspect.iscoroutinefunction(gateway._call_upstream))
+        # 只看代码，不看 docstring（docstring 里提到 to_thread 是说明文字）。
+        node = ast.parse(textwrap.dedent(
+            inspect.getsource(gateway._call_upstream))).body[0]
+        if (isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)):
+            node.body = node.body[1:]
+        code = ast.unparse(node)
+        self.assertNotIn("asyncio.to_thread", code,
+                         "工作线程里再套 to_thread 只会多一次上下文切换")
+        self.assertIn("client.open_chat_stream(", code)
+        self.assertIn("client.chat_completions(", code)
 
     def test_stream_reader_goes_through_to_thread(self):
         import inspect
@@ -420,7 +447,7 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
             return "STREAM"
 
         self.mclient.open_chat_stream = fake_open
-        got = await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+        got = self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
         self.assertEqual(got, "STREAM")
         self.assertEqual(calls, [7, 7], "必须是同一个账号重试")
 
@@ -439,7 +466,7 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
             return "STREAM"
 
         self.mclient.open_chat_stream = fake_open
-        got = await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+        got = self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
         self.assertEqual(got, "STREAM")
         self.assertEqual(calls, [7, 7], "4100406 必须同号重试（首发失败后重试成功）")
 
@@ -461,22 +488,25 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.mclient.open_chat_stream = fake_open
         with self.assertRaises(self.mclient.UpstreamError):
-            await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+            self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
         self.assertEqual(len(calls), 3, "只许重试两次（1 次首发 + 2 次重试）")
 
     async def test_backoff_increases_and_jitters(self):
         """退避 = 基数 × (index + 1) + U(0, 抖动)：递增且带抖动。
 
         递增是为了避开上游短时抖动窗口；抖动是为了避免同频重发。
-        这里把 `asyncio.sleep` / `random.uniform` 换成记录器，只断言「喂给
+        这里把 `time.sleep` / `random.uniform` 换成记录器，只断言「喂给
         sleep 的秒数」—— 不真的睡。
+
+        ⚠ 退避用的是 `time.sleep`（同步）：`_call_upstream` 整段在工作线程里
+        跑，睡的是那个线程，事件循环不受影响。
         """
         from unittest import mock
 
         sleeps = []
         calls = []
 
-        async def fake_sleep(seconds):
+        def fake_sleep(seconds):
             sleeps.append(seconds)
 
         def fake_open(data, realm, body, *, account_id=0):
@@ -489,11 +519,11 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
         self.mclient.open_chat_stream = fake_open
         self.gateway.SAME_ACCOUNT_RETRY_DELAY = 0.3
         self.gateway.SAME_ACCOUNT_RETRY_JITTER = 0.3
-        with mock.patch.object(self.gateway.asyncio, "sleep", fake_sleep), \
+        with mock.patch.object(self.gateway.time, "sleep", fake_sleep), \
                 mock.patch.object(self.gateway.random, "uniform",
                                   return_value=0.25):
             with self.assertRaises(self.mclient.UpstreamError):
-                await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+                self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
 
         self.assertEqual(len(calls), 3)
         self.assertEqual(len(sleeps), 2, "两次重试各退避一次")
@@ -514,7 +544,7 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.mclient.open_chat_stream = fake_open
         with self.assertRaises(self.mclient.UpstreamError):
-            await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+            self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
         self.assertEqual(len(calls), 1, "非 4100406 的 upstream_business 不许重试")
 
     async def test_param_error_400_is_not_retried(self):
@@ -530,7 +560,7 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.mclient.open_chat_stream = fake_open
         with self.assertRaises(self.mclient.UpstreamError):
-            await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+            self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
         self.assertEqual(len(calls), 1, "400 参数错不许重试")
 
     async def test_auth_kind_with_same_code_is_not_retried(self):
@@ -546,7 +576,7 @@ class SameAccountRetryTests(unittest.IsolatedAsyncioTestCase):
 
             self.mclient.open_chat_stream = fake_open
             with self.assertRaises(self.mclient.UpstreamError):
-                await self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
+                self.gateway._call_upstream({}, "cn", {}, 7, stream=True)
             self.assertEqual(len(calls), 1, "kind=%s 不许重试" % kind)
 
 
@@ -627,7 +657,8 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
             detail='{"code":4100406,"msg":"非法请求"}')
 
     async def _run(self, body=None):
-        return await self.gateway._attempt(
+        # `_attempt` 是同步 def（整段跑在工作线程里），这里直接调。
+        return self.gateway._attempt(
             None, None, None, body or {"model": "main-auto"}, "cn",
             stream=True)
 
@@ -900,8 +931,8 @@ class Dump403Tests(unittest.IsolatedAsyncioTestCase):
                 "messages": [{"role": "user", "content": "big"}]}
         with self.assertLogs("admin.platform.marvis.gateway", level="WARNING"):
             with self.assertRaises(mclient.UpstreamError):
-                await self.gateway._call_upstream({}, "cn", body, 189,
-                                                  stream=True)
+                self.gateway._call_upstream({}, "cn", body, 189,
+                                             stream=True)
         self.assertEqual(len(self._files()), 1, "403 必须落一份，且只落一份")
 
         os.environ.pop(self.gateway.DUMP_403_ENV, None)
@@ -918,8 +949,8 @@ class Dump403Tests(unittest.IsolatedAsyncioTestCase):
         # 500 走 kind=upstream_error ⇒ 不重试、也不落盘；这里只要求「不落盘」。
         with self.assertLogs("admin.platform.marvis.gateway", level="INFO"):
             with self.assertRaises(mclient.UpstreamError):
-                await self.gateway._call_upstream({}, "cn", body, 189,
-                                                  stream=True)
+                self.gateway._call_upstream({}, "cn", body, 189,
+                                             stream=True)
         self.assertEqual(set(self._files()), before, "500 不许落盘")
 
 
