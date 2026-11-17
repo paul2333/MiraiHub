@@ -56,6 +56,7 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 
 from fastapi import Request
@@ -170,6 +171,21 @@ def _fail(exc: client.UpstreamError) -> JSONResponse:
         status = 502
     code = exc.code or "upstream_error"
     message = exc.message
+    headers: dict[str, str] = {}
+    if exc.kind == "risk_control":
+        # 4100404 是**出口 IP 级**风控：不是 Key 的问题、不是账号的问题，
+        # 也不是这条请求的内容有问题。原样透 403 会被客户端渲染成「Key 无效」
+        # 或「请求非法」，用户去翻一个根本没问题的 Key —— 换成 503 +
+        # Retry-After 才是「稍后再试」的可重试语义，与账号登录态失效同一处理。
+        status = 503
+        message = (
+            "Marvis 出口 IP 被上游风控拦截（4100404）：这是**出口 IP** 的问题，"
+            "与你的 API Key、账号余额、请求内容都无关，重试或换 Key 都不会改变"
+            "结果。网关已进入平台级退避（不再打上游），请在 Retry-After 之后"
+            "重试；长期修复需要给 Marvis 配一个干净出口 IP"
+            "（MIRAIHUB_MARVIS_PROXY）。原始信息：%s" % message)
+        retry_after = int(risk_backoff_remaining()) or RISK_BACKOFF_DEFAULT_SECONDS
+        headers["Retry-After"] = str(max(1, retry_after))
     if status == 401 or exc.kind == "auth" or code == "credential_expired":
         status = 503
         if "重新扫码" not in message and "授权登录" not in message:
@@ -182,7 +198,72 @@ def _fail(exc: client.UpstreamError) -> JSONResponse:
         {"error": {"type": exc.kind, "code": code, "message": message,
                    # 给客户端一个可读的提示位：明确「不是 Key 的问题」
                    "upstream_account": status == 503}},
-        status_code=status)
+        status_code=status, headers=headers or None)
+
+
+#: 请求体上限（字节）：超过就直接 413，**不送去撞上游**。
+#:
+#: 2026-11-17 线上 27 次 `400 3000101 invalid parameter` **全部**是同一个形状：
+#: bytes≈11.4MB / msgs=2 / sys_chars=252 —— 客户端把单条 11MB 的消息塞进
+#: messages[0]。上游对单条消息体积有自己的上限，超了只回一个看不出原因的
+#: 参数错误，于是每次都要走完「选号 → 建连 → 4xx → 换号」才失败，白占上游配额。
+#:
+#: 阈值取 4MB：正常大对话有 3.7MB 的成功先例（270 条消息 / sys 143K），
+#: 4MB 是安全值 —— 卡在「正常对话之上、11MB 之下」，不会误杀正常请求。
+MAX_BODY_ENV = "MIRAIHUB_MARVIS_MAX_BODY_BYTES"
+MAX_BODY_DEFAULT_BYTES = 4 * 1024 * 1024
+
+
+def _max_body_bytes() -> int:
+    """单次请求体的上限（字节）。未设置 / 非法 / 非正值退回 4MB。"""
+    raw = str(os.environ.get(MAX_BODY_ENV) or "").strip()
+    if not raw:
+        return MAX_BODY_DEFAULT_BYTES
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return MAX_BODY_DEFAULT_BYTES
+    return value if value > 0 else MAX_BODY_DEFAULT_BYTES
+
+
+def _too_large(size: int, limit: int) -> JSONResponse:
+    """413：把「单条消息太大」这件事说清楚，别让它伪装成模型 / 账号问题。"""
+    logger.warning(
+        "Marvis 请求体过大已本地拒绝 bytes=%d limit=%d（未打上游）",
+        size, limit)
+    return JSONResponse(
+        {"error": {
+            "type": "invalid_request_error",
+            "code": "body_too_large",
+            "message": (
+                "请求体过大（约 %.1f MB，上限 %.1f MB）：**单条消息**太大，"
+                "不是模型问题，也不是账号 / 额度问题（上游根本没被调用）。"
+                "请把这条超长消息拆成几条，或先裁剪其中的长文本 / 附件再发送。"
+                "上限可用环境变量 %s 调整。"
+                % (size / 1048576.0, limit / 1048576.0, MAX_BODY_ENV)),
+        }},
+        status_code=413)
+
+
+async def _reject_oversized(request: Request):
+    """体积检查：超限返回 413 响应，否则返回 None。
+
+    先看 `Content-Length`（不读 body，零成本）；缺这个头时才把 body 读出来量
+    （Starlette 会缓存已读的 body，后续 `request.json()` 不会重复读流）。
+    """
+    limit = _max_body_bytes()
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            size = int(declared)
+        except (TypeError, ValueError):
+            size = 0
+        return _too_large(size, limit) if size > limit else None
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001 - 读不出来就交给下游按原逻辑报错
+        return None
+    return _too_large(len(raw), limit) if len(raw) > limit else None
 
 
 async def _body_of(request: Request) -> dict:
@@ -558,6 +639,106 @@ SAME_ACCOUNT_RETRY_DELAY = 0.3
 #: 退避抖动上限（秒），与 `SAME_ACCOUNT_RETRY_DELAY` 一起构成递增 + 抖动退避。
 SAME_ACCOUNT_RETRY_JITTER = 0.3
 
+# ---------------------------------------------------------------------------
+# 风控（4100404）= **平台级**退避，不是账号级冷却（2026-11-17）
+# ---------------------------------------------------------------------------
+#: 账号级冷却秒数 —— 只有「这个号自己坏了」才配。
+#:
+#: auth（4100403 登录态过期）：600 秒，期间不选这个号。
+COOL_SECONDS_AUTH = 600
+#: 需要给**账号**打冷却（cool_until）的 kind。
+#:
+#: ⚠ risk_control **故意不在**这里 —— 判据见 _cool_seconds 的 docstring。
+COOL_KINDS = frozenset({"auth"})
+
+
+def _cool_seconds(kind: str) -> int:
+    """按失败类型决定**账号级**冷却秒数；0 = 不给这个号打冷却。
+
+    ## 为什么 risk_control 必须是 0（2026-11-17 线上死循环的根因）
+
+    4100404「请求被风控拦截」是**出口 IP 级**的风控，不是账号级。真机证据：
+
+      · 3 个号的 guid / openid 全不同，同一秒被拦；
+      · 2KB 的 ping 请求同样被拦（与请求内容、模型、账号都无关）；
+      · 4100403（凭证失效）零次、4100406（指纹非法）零次
+        ⇒ 凭证与设备指纹都是好的；
+      · 唯一共享因子是**出口 IP**（3.105.136.123，AWS 悉尼）。
+
+    把 IP 级的错误按账号级处理会**自放大**成整站不可用：
+
+      1. 请求撞 4100404 → 给当前号打 600 秒冷却；
+      2. _attempt 换号重试，把**同一份 body** 在 1 秒内重放给另外 2 个号
+         → 3 个号全部吃 600 秒冷却；shared.select_account 的
+         cool_until <= now 过滤随即返回空 → 503 accounts_cooling；
+      3. 600 秒到期 → 下一个请求再次 4100404 → 重新冷却 → **无限循环**
+         （实测 10:05:08 UTC 到期、10:05:46 又被续到 10:15:46）。
+
+    ⇒ 风控只做**平台级退避**（note_risk_control），一个号都不冷却：
+    换掉出口 IP 之后号池原样可用，不需要人工解冻。
+    """
+    return COOL_SECONDS_AUTH if kind in COOL_KINDS else 0
+
+
+#: 平台级风控退避的默认窗口（秒），可用 MIRAIHUB_MARVIS_RISK_BACKOFF_SECONDS 覆盖。
+RISK_BACKOFF_ENV = "MIRAIHUB_MARVIS_RISK_BACKOFF_SECONDS"
+RISK_BACKOFF_DEFAULT_SECONDS = 60
+
+#: 平台级风控状态：until = 退避截止的 monotonic 时间戳，at = 最近一次命中。
+#:
+#: ## 为什么是模块级 dict + threading.Lock，不是 asyncio 全局变量
+#:
+#: _attempt（真正打上游的那段）**整段跑在 asyncio.to_thread 的工作线程里**
+#: （见 _acquire 的 docstring），线程里没有运行中的事件循环 ——
+#: asyncio.Lock 拿不到也没法用。而 marvis 的并发请求来自线程池里的
+#: **不同线程**，所以这里要的是**线程间**互斥：一把 threading.Lock 保护
+#: 这几个浮点数，把「读 → 比较 → 写 max」放在同一次加锁里完成。否则两个线程
+#: 同时命中 4100404 会各写各的截止时间，退避窗口可能被更早的那次覆盖成更短。
+_RISK_LOCK = threading.Lock()
+_RISK_STATE: dict[str, float] = {"at": 0.0, "until": 0.0, "hits": 0.0}
+
+
+def _risk_backoff_seconds() -> int:
+    """退避窗口长度（秒）。未设置 / 非法 / 非正值一律退回默认 60。"""
+    raw = str(os.environ.get(RISK_BACKOFF_ENV) or "").strip()
+    if not raw:
+        return RISK_BACKOFF_DEFAULT_SECONDS
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return RISK_BACKOFF_DEFAULT_SECONDS
+    return value if value > 0 else RISK_BACKOFF_DEFAULT_SECONDS
+
+
+def note_risk_control() -> float:
+    """记一次风控命中，返回本次退避的剩余秒数。**绝不抛**。"""
+    seconds = _risk_backoff_seconds()
+    now = time.monotonic()
+    with _RISK_LOCK:
+        until = now + seconds
+        if _RISK_STATE["until"] < until:
+            _RISK_STATE["until"] = until
+        _RISK_STATE["at"] = now
+        _RISK_STATE["hits"] = float(_RISK_STATE.get("hits") or 0.0) + 1.0
+        remaining = _RISK_STATE["until"] - now
+    return remaining
+
+
+def risk_backoff_remaining() -> float:
+    """平台级风控退避还剩几秒（0 = 没有退避，可以打上游）。"""
+    now = time.monotonic()
+    with _RISK_LOCK:
+        return max(0.0, _RISK_STATE["until"] - now)
+
+
+def reset_risk_backoff() -> None:
+    """清空平台级退避状态（测试 / 人工恢复用）。"""
+    with _RISK_LOCK:
+        _RISK_STATE["at"] = 0.0
+        _RISK_STATE["until"] = 0.0
+        _RISK_STATE["hits"] = 0.0
+
+
 
 def _warn_upstream_failure(account, exc: client.UpstreamError, *,
                            model: str, stream: bool) -> None:
@@ -834,6 +1015,23 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     2026-11-16 之前这两条日志都不存在，线上 403 无法区分「没号可换」和
     「没换号」—— 这次把换号做成**可数的事实**。
     """
+    # 平台级风控退避：窗口内再有请求**直接 503**，一个字节都不打上游。
+    #
+    # 这是「出口 IP 被上游风控」时唯一正确的处置：继续打上游只会让风控评分
+    # 更差，并把本来能成的请求一起拖成 403。注意它**不动任何账号**
+    # （不打 cool_until、不 exclude），所以退避一过号池原样可用。
+    remaining = risk_backoff_remaining()
+    if remaining > 0:
+        logger.warning(
+            "Marvis 平台级风控退避中，拒绝上游调用：剩余 %.0fs model=%s",
+            remaining, str(body.get("model") or "") or "-")
+        raise shared.PlatformRejected(
+            503,
+            "Marvis 出口 IP 正在被上游风控（4100404），已进入平台级退避："
+            "约 %d 秒后自动恢复。这与你的 API Key、账号余额都无关，"
+            "不需要换 Key 或重试。" % (int(remaining) + 1),
+            kind="server_error", code="risk_control_backoff",
+            headers={"Retry-After": str(int(remaining) + 1)})
     model = str(body.get("model") or "")
     exclude: set[int] = set()
     last_error: client.UpstreamError | None = None
@@ -912,12 +1110,32 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                 db, account, kind=exc.kind,
                 detail=exc.detail or exc.message, status=exc.status,
                 model=model, public_platform=PUBLIC,
-                cool_seconds=(600 if exc.kind in ("auth", "risk_control") else 0))
+                code=str(exc.code or ""),
+                # 账号级冷却：只有 auth（这个号自己坏了）才配。
+                # risk_control 是**出口 IP 级**风控 —— 给号打冷却等于把好号
+                # 一起打挂，而且冷却到期立刻复发，见 _cool_seconds 的 docstring。
+                cool_seconds=_cool_seconds(exc.kind),
+                # 额度耗尽走**降级窗口**（degrade_until = QUOTA_DEGRADE_SECONDS），
+                # 而不是把余额写成 0：余额是事实数据，写 0 会让这个号永久出池。
+                zero_balance=(exc.kind == "quota_exceeded"))
+            # 风控：**不 exclude、不换号、不重试**，直接抛 + 记平台级退避。
+            #
+            # 换号会把**同一份 body** 在 1 秒内重放给另外两个号 —— 那正是风控
+            # 引擎最敏感的「同源短时重放」特征，等于主动喂特征；而且 3 个号会
+            # 一起吃冷却（2026-11-17 死循环的第二步）。
+            # 正确处置：整平台退避，等出口 IP 换掉 / 风控自然过期。
+            if exc.kind == "risk_control":
+                backoff = note_risk_control()
+                logger.warning(
+                    "Marvis 风控命中（code=%s acc=%s）：不换号、不重试，"
+                    "平台级退避 %.0fs",
+                    exc.code or "-", int(account.id or 0), backoff)
+                raise exc
             last_error = exc
             exclude.add(account.id)
             # 参数类错误换号也没用，直接抛（不再浪费一次上游往返）。
             if exc.status in (400, 422) and exc.kind not in (
-                    "auth", "rate_limit", "risk_control"):
+                    "auth", "rate_limit", "risk_control", "quota_exceeded"):
                 raise exc
             # 走到这里 = 同号重试已经在 `_call_upstream` 里**耗尽**
             # （白名单 kind + 4100406 业务码，最多 2 次）⇒ 该换号了：
@@ -1032,6 +1250,9 @@ def _usage_of(result: dict) -> dict:
 
 async def chat_completions(request: Request):
     """OpenAI 兼容入口 —— 本平台的唯一主路径。"""
+    oversized = await _reject_oversized(request)
+    if oversized is not None:
+        return oversized
     body = await _body_of(request)
     realm = _realm(request)
     try:
@@ -1238,6 +1459,9 @@ async def _run_normalized(request: Request, normalized: dict, *, protocol: str):
 
 async def messages(request: Request):
     """Anthropic 入口 → 转成 OpenAI 请求跑主路径 → 响应翻回 Anthropic。"""
+    oversized = await _reject_oversized(request)
+    if oversized is not None:
+        return oversized
     body = await _body_of(request)
     normalized = _anthropic_to_openai(body)
     return await _run_normalized(request, normalized, protocol="anthropic")
@@ -1245,6 +1469,9 @@ async def messages(request: Request):
 
 async def responses(request: Request):
     """Responses 入口 → 折叠成 chat/completions → 响应翻回 Responses。"""
+    oversized = await _reject_oversized(request)
+    if oversized is not None:
+        return oversized
     body = await _body_of(request)
     normalized = _responses_to_openai(body)
     return await _run_normalized(request, normalized, protocol="responses")

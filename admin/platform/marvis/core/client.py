@@ -24,7 +24,8 @@ from . import endpoints
 logger = logging.getLogger("admin.platform.marvis.client")
 DEFAULT_TIMEOUT = 30.0
 
-#: 进程级共享 opener 的惰性缓存（见 `_opener()`）。
+#: 历史遗留：opener 现在由 `admin.upstream_http.platform_opener()` 按平台缓存
+#: （见 `_opener()`），这个全局不再使用；保留是为了不破坏外部对它的引用。
 _OPENER = None
 #: 不跟随重定向的 opener 缓存（换登录态那次请求专用，见 `_no_redirect_opener()`）。
 _NO_REDIRECT_OPENER = None
@@ -50,16 +51,25 @@ def _opener():
     重扫系统证书库（`ssl._load_windows_store_certs`）。实测单次 3~13 秒，
     而且每次连接都重来一遍 —— 期间单 worker 的事件循环完全停摆。
 
-    `admin.upstream_http.urllib_opener()` 把共享 SSL 上下文（系统库 + certifi）
+    `admin.upstream_http.platform_opener()` 把共享 SSL 上下文（系统库 + certifi）
     建一次复用，并默认不走系统代理（加速器塞进注册表的代理会让 TLS 校验失败，
     见 issue #5）。与 Loomy 等平台同一条链路，不再各写各的。
-    """
-    global _OPENER
-    if _OPENER is None:
-        from admin.upstream_http import urllib_opener
 
-        _OPENER = urllib_opener()
-    return _OPENER
+    ## 2026-11-17：出口 IP 可配
+
+    改走按**平台**的 opener：`MIRAIHUB_MARVIS_PROXY` 配了就走它，没配就还是
+    老的「硬禁代理」直连。Marvis 的出口 IP 被上游按 IP 风控（4100404）时，
+    这是代码层面唯一能换出口的地方。
+    """
+    from admin.upstream_http import platform_opener
+
+    # 按**平台**取 opener：出口代理来自 MIRAIHUB_MARVIS_PROXY（见
+    # admin/upstream_http.py::platform_proxy_url）。没配代理时与改动前
+    # 完全一致 —— 直连、不读系统代理、不读全局 HTTP_PROXY。
+    #
+    # 这里不再留进程级全局变量：opener 的缓存（含「改了 env 立刻生效」）
+    # 由 platform_opener 统一管，缓存键里带代理 URL 本身。
+    return platform_opener(endpoints.PLATFORM)
 
 
 def _no_redirect_opener():
@@ -80,11 +90,18 @@ def _no_redirect_opener():
     这里做一次兼容判断：老版本没这个形参时，退回直接用标准库构造
     （TLS 上下文仍从 `ssl_context()` 取，与其它请求一致）。
     """
+    from admin import upstream_http
+
+    # 走**按平台**的 opener：代理与 TLS 信任库和普通请求完全一致；
+    # `_NoRedirect` 作为**位置参数**传下去才会顶替默认的 HTTPRedirectHandler。
+    opener_fn = getattr(upstream_http, "platform_opener", None)
+    if opener_fn is not None:
+        return opener_fn(endpoints.PLATFORM, _NoRedirect())
+
+    # 兜底：老版 upstream_http（没有 platform_opener）时的降级路径。
     global _NO_REDIRECT_OPENER
     if _NO_REDIRECT_OPENER is None:
         import inspect
-
-        from admin import upstream_http
 
         fn = upstream_http.build_opener
         try:
@@ -313,6 +330,19 @@ def close_stream(resp) -> None:
 #: 一个好号冷却 600 秒，而真正的处置是换出口 / 换设备指纹。
 BIZ_AUTH_CODES = frozenset({"4100403"})
 
+#: 上游业务码里属于「**额度耗尽**」的那几个。
+#:
+#: `3000001 用户名下token不足` —— 2026-11-17 实测：账号 189 余额只剩 5%
+#: （510504 / 10000000），上游 402 回这个码，6 小时内打了 **1501 次**，
+#: 占全部失败的 98%。旧实现把它归成 `upstream_business`（不冷却、不隔离、
+#: 不换号），于是 `select_account` 按 `last_used_at` 升序永远先选到它，
+#: 每个请求都先白撞一次 402 才轮到好号。
+#:
+#: 归到 `quota_exceeded` 之后走 `shared.note_failure(zero_balance=True)` 的
+#: **降级窗口**（degrade_until，QUOTA_DEGRADE_SECONDS = 1800 秒）：30 分钟内
+#: 它不再进候选集，窗口到期 + 下一次余额同步自动回到池子里（不需要人工解禁）。
+BIZ_QUOTA_CODES = frozenset({"3000001"})
+
 #: 从错误体里抠业务码：`{"code":4100406,...}` / `{"code":"4100403",...}`。
 _BIZ_CODE_RE = re.compile(r'"code"\s*:\s*"?(-?[A-Za-z0-9_.]+)"?')
 
@@ -381,6 +411,10 @@ def _classify(status: int, text: str) -> str:
     code = _biz_code_of(blob)
     if code == "4100404" or "4100404" in low or "risk" in low or "风控" in blob:
         return "risk_control"
+    # 额度耗尽必须在 `auth` 之前判：402 + 3000001 与凭证无关，
+    # 归错就会变成「永不隔离的号永远排第一，每次请求先白撞一次」。
+    if code in BIZ_QUOTA_CODES:
+        return "quota_exceeded"
     if status == 401:
         return "auth"
     if code:

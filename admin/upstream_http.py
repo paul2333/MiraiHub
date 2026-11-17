@@ -36,8 +36,44 @@ def upstream_trust_env() -> bool:
 
 import urllib.request  # noqa: E402  (延迟导入，仅给 urllib 系平台复用)
 
+#: 按平台读出口代理的环境变量名模板：`MIRAIHUB_<PLATFORM>_PROXY`。
+PLATFORM_PROXY_ENV_TEMPLATE = "MIRAIHUB_%s_PROXY"
 
-def build_opener(trust_env: bool | None = None, *extra_handlers):
+
+def platform_proxy_env(platform: str) -> str:
+    """平台代理的环境变量名（平台名大写，非字母数字换成下划线）。"""
+    name = "".join(ch if ch.isalnum() else "_"
+                   for ch in str(platform or "")).upper()
+    return PLATFORM_PROXY_ENV_TEMPLATE % name
+
+
+def platform_proxy_url(platform: str) -> str:
+    """按平台读出口代理；没配返回 ""（= 维持「无代理」直连）。
+
+    ## 为什么按平台分环境变量（2026-11-17）
+
+    Marvis 的出口 IP（3.105.136.123，AWS 悉尼）被上游按 **IP** 风控
+    （4100404），而 `build_opener` 当时**硬禁用**代理（`ProxyHandler({})`）
+    —— 代码层面没有任何办法换出口。这里开一个**按平台**的口子：
+    只有显式配了 `MIRAIHUB_<平台>_PROXY` 的平台才走代理，其余平台**完全
+    保持原样**（直连、不读系统代理、不读全局 HTTP_PROXY），不会因为某一个
+    平台要换 IP 而把全站的出网路径改掉。
+
+    ## 为什么不用 `proxy_endpoints` 表
+
+    那张表（`admin/models.py::ProxyEndpoint`）是**按池**分的：`pool` 列 +
+    `max_concurrency` 槽位，**没有平台列**，服务对象是批量任务调度
+    （`scheduler.py` 按 `schedule.proxy_pool` 取槽）。网关的上游调用是
+    同步、每请求一条，套那张表要引入「每请求查库 + Session 跨线程」，
+    收益不对等 —— 网关要的是「这个平台走哪个出口」，不是「这个任务用哪个池」。
+    真要接库：`proxy_pool.pick(db, pool)` 返回的就是一个能直接塞进
+    `build_opener(proxy=...)` 的 URL，接口已经留好。
+    """
+    return str(os.environ.get(platform_proxy_env(platform)) or "").strip()
+
+
+def build_opener(trust_env: bool | None = None, *extra_handlers,
+                 proxy: str | None = None):
     """构造带「系统+ certifi 信任库」且默认**不走系统代理**的 urllib opener。
 
     平台模块（`admin/platform/<name>/`）的上游调用走 `urllib.request` 而非 httpx，
@@ -62,7 +98,14 @@ def build_opener(trust_env: bool | None = None, *extra_handlers):
     if trust_env is None:
         trust_env = upstream_trust_env()
     handlers = [urllib.request.HTTPSHandler(context=ssl_context())]
-    if not trust_env:
+    proxy_url = str(proxy or "").strip()
+    if proxy_url:
+        # 显式代理（按平台配的）：http / https 都走它 —— 上游全是 https，
+        # 只配 http 键等于没配。
+        handlers.append(urllib.request.ProxyHandler(
+            {"http": proxy_url, "https": proxy_url}))
+    elif not trust_env:
+        # 没配代理：保持历史行为（硬禁代理），与改动前**逐字节一致**。
         handlers.append(urllib.request.ProxyHandler({}))
     for handler in extra_handlers:
         handlers.append(handler)
@@ -77,6 +120,36 @@ def urllib_opener():
     if _opener is None:
         _opener = build_opener()
     return _opener
+
+
+#: 按平台的 opener 缓存。键含**代理 URL 本身** —— 改过环境变量后下一次调用
+#: 就会建新的 opener，不需要重启进程（排障时改 env 立刻生效）。
+_PLATFORM_OPENERS: dict = {}
+_PLATFORM_OPENERS_LOCK = threading.Lock()
+
+
+def platform_opener(platform: str, *extra_handlers):
+    """按平台取 opener（带缓存），代理来自 `MIRAIHUB_<平台>_PROXY`。
+
+    没配代理时与 `urllib_opener()` 行为一致（直连、不读系统代理）。
+    缓存键里带上 `extra_handlers` 的类型名，避免「禁跟随重定向」与「普通」
+    两个 opener 互相串（Marvis 换登录态必须用前者）。
+    """
+    proxy = platform_proxy_url(platform)
+    key = (str(platform or ""), proxy,
+           tuple(type(handler).__name__ for handler in extra_handlers))
+    with _PLATFORM_OPENERS_LOCK:
+        opener = _PLATFORM_OPENERS.get(key)
+        if opener is None:
+            opener = build_opener(None, *extra_handlers, proxy=proxy or None)
+            _PLATFORM_OPENERS[key] = opener
+        return opener
+
+
+def reset_platform_openers() -> None:
+    """丢掉按平台的 opener 缓存（测试用；改过 env 想立刻重建也用它）。"""
+    with _PLATFORM_OPENERS_LOCK:
+        _PLATFORM_OPENERS.clear()
 
 
 class _UploadStream(httpx.AsyncByteStream):
