@@ -206,6 +206,51 @@ def _error_payload(exc: client.UpstreamError,
     code = exc.code or "upstream_error"
     message = exc.message
     headers: dict[str, str] = {}
+    # 类型默认跟随 kind；下面几条专用分支会覆盖（content_too_long 等）。
+    err_type = exc.kind
+    #: 显式覆盖 upstream_account；None 表示按「status == 503」推断。
+    upstream_account = None
+    # ------------------------------------------------------------------
+    # 签名器不可用（fail-closed）—— **请求根本没发出去**（上游 PR #55）
+    # ------------------------------------------------------------------
+    #
+    # 必须排在最前面：它不是上游给的结论，是网关自己拒的。用 503 而不是
+    # 4xx：这是「本机环境没配好」，客户端会按 Retry-After 退避重试，也不会
+    # 误渲染成「API 密钥无效」。upstream_account=False 让上层不再换号
+    # （换号也签不出来）。
+    if exc.kind == "signer_unavailable":
+        detail = (exc.detail or "").strip()
+        status = 503
+        code = "signer_unavailable"
+        err_type = "signature_unavailable"
+        upstream_account = False
+        headers["Retry-After"] = "30"
+        message = (
+            "Marvis 客户端指纹签名器不可用，网关已按 fail-closed 拒绝本次"
+            "请求（请求一个字节都没发给上游）。这与你的 API Key、"
+            "Marvis 账号状态都无关，换号 / 重扫码 / 换 Key 都不会好。"
+            "处理方式：① 确认本机 uskey 签名链路可用（qimei 真值表 / 侧车）；"
+            "② 或设 MARVIS_USKEY_FAIL_CLOSED=0 临时退回随机填充，仅限排查用。"
+            + ("诊断：%s" % detail[:300] if detail else ""))
+    # ------------------------------------------------------------------
+    # 内容风控（4100406）单独处理 —— 这是**请求内容**的问题
+    # ------------------------------------------------------------------
+    #
+    # 上游 403 传到 Claude Code / Codex 会被渲染成「API 密钥无效」，用户去翻
+    # Key / 重扫码 / 换号 —— 三个方向全是错的：是提示词命中黑名单。
+    # 400 + content_filter 是 OpenAI 语义里「请求内容不被接受」的标准表达。
+    elif exc.kind == "content_block":
+        detail = (exc.detail or "").strip()
+        status = 400
+        code = "content_blocked"
+        err_type = "content_filter"
+        upstream_account = False
+        message = (
+            "上游内容风控拦截：系统提示词命中腾讯黑名单"
+            "（与你的 API Key、Marvis 账号都无关，换号也没用）。"
+            "网关已按指纹规则表改写仍被拦，说明命中的是别的形态，"
+            "请把原始提示词首行发维护者。"
+            + ("上游原文：%s" % detail[:300] if detail else ""))
     if exc.kind == "risk_control":
         # 4100404「请求被风控拦截」：**不是** Key 的问题，也**不是**账号/余额的问题。
         # 原样透 403 会被客户端渲染成「Key 无效」或「请求非法」，用户去翻一个
@@ -281,9 +326,29 @@ def _error_payload(exc: client.UpstreamError,
         # 账号级总额度（3000001 等）：文案保持原样，只补 quota 族标记，
         # 让下游按同一族聚合；1000007 已走上面的「当次额度」文案。
         family = "quota"
-    error_obj = {"type": exc.kind, "code": code, "message": message,
+    elif status == 400:
+        # 参数类 400 必须带出**上游原文**（上游 PR #55）。以前只有一句
+        # 「模型网关失败（HTTP 400）」，客户端 / 控制台 / 日志三处都看不出
+        # 是哪个字段踩的 —— 2026-11-17 排查 response_format=json_object
+        # 时正是卡在这一句上，只能逐个字段手试。
+        upstream = (exc.detail or "").strip()
+        if _is_context_overflow(exc):
+            code = "context_length_exceeded"
+            err_type = "context_too_long"
+            # 上游原文带「已自动重发 N 次」，本项目未移植那 4 次原样重发
+            # 循环（b9 只并入参数降级），所以这里不能说假话，去掉重发次数。
+            message = (
+                "这轮对话的上下文太长，Marvis 上游装不下（与你的 API Key、"
+                "账号额度都无关）。请新建一个对话继续，或让客户端清理历史后重试。")
+            if upstream:
+                message = "%s；上游原文：%s" % (message, upstream[:200])
+        elif upstream:
+            message = "%s；上游原文：%s" % (message, upstream[:300])
+    error_obj = {"type": err_type, "code": code, "message": message,
                  # 给客户端一个可读的提示位：明确「不是 Key 的问题」
-                 "upstream_account": status == 503}
+                 "upstream_account": (status == 503
+                                       if upstream_account is None
+                                       else upstream_account)}
     if family:
         error_obj["family"] = family
     if upstream_code:
@@ -888,6 +953,62 @@ def _normalize_max_tokens(body: dict) -> None:
     body.pop("max_completion_tokens", None)
 
 
+#: 上游只认的 response_format.type
+_RESPONSE_FORMAT_OK = frozenset({"text", "json_schema"})
+
+#: json_object 的等价物：不约束字段、只约束「是一个 JSON 对象」。
+_JSON_OBJECT_AS_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "json_object",
+        "schema": {"type": "object", "additionalProperties": True},
+        "strict": False,
+    },
+}
+
+
+def _normalize_response_format(value) -> tuple[dict | None, str]:
+    """把 response_format 归一成上游认的形状，返回 (新值, 说明)。
+
+    新值为 None 表示「翻译不了，这个字段整个摘掉」：宁可少一个 JSON 约束，
+    也不要整条请求 400 —— 客户端拿到出字总比拿到一句无用的参数错误强。
+    （上游 PR #55：json_object 未实现，改写成等价 json_schema。）
+    """
+    if not isinstance(value, dict):
+        return None, "不是 dict，已摘除"
+    kind = str(value.get("type") or "").strip().lower()
+    if kind in _RESPONSE_FORMAT_OK:
+        return value, ""
+    if kind == "json_object":
+        return dict(_JSON_OBJECT_AS_SCHEMA), (
+            "json_object → json_schema（上游未实现 json_object）")
+    return None, "未知 type=%r，已摘除" % kind
+
+
+def _normalize_token_limit(out: dict) -> None:
+    """把 max_completion_tokens 并进 max_tokens（上游 PR #55 口径）。
+
+    ⚠ 主链路用的是本项目的 _normalize_max_tokens()（冲突时以
+    max_completion_tokens 为准并打 WARNING，见其 docstring 的测试契约）。
+    这里保留上游那份「取两者较小值」的实现，供需要更保守语义的调用方显式
+    使用 —— 两份**不要**同时跑，否则后跑的会覆盖先跑的。
+    """
+    if "max_completion_tokens" not in out:
+        return
+    alias = out.pop("max_completion_tokens")
+    try:
+        limit = int(alias)
+    except (TypeError, ValueError):
+        return
+    current = out.get("max_tokens")
+    try:
+        current_int = int(current)
+    except (TypeError, ValueError):
+        current_int = None
+    out["max_tokens"] = (limit if current_int is None
+                         else min(limit, current_int))
+
+
 def _prepare_body(body: dict, slot: str) -> dict:
     """把下游请求整理成上游能接受的样子。
 
@@ -932,6 +1053,16 @@ def _prepare_body(body: dict, slot: str) -> dict:
     if hits:
         # 只记命中条数，**不记原文**：system 里可能带用户的 prompt / 路径 / 密钥。
         logger.info("Marvis 内容风控指纹改写 | rules_hit=%d", hits)
+    # ⓷ response_format 归一（上游 PR #55）：上游未实现 json_object，
+    # 直接透传会整条 400（3000101）。放在指纹改写之后、补 stream_options 之前。
+    if "response_format" in out:
+        shape, note = _normalize_response_format(out["response_format"])
+        if note:
+            logger.info("Marvis response_format 归一 | %s", note)
+        if shape is None:
+            out.pop("response_format", None)
+        else:
+            out["response_format"] = shape
     if out.get("stream"):
         opts = dict(out.get("stream_options") or {})
         opts["include_usage"] = True
@@ -1759,6 +1890,99 @@ def _note_model_quota_tight(db, account, model: str, *,
             pass
 
 
+#: 上游回 3000101 invalid parameter 时按顺序剥掉的可选字段（上游 PR #55）。
+#:
+#: 网关对 OpenAI 扩展字段是**原样透传**的（那是客户端的自由），代价是上游
+#: 一旦不认就整条 400。上游又不告诉你是哪个字段，只回一句 invalid parameter。
+#: 所以留一条降级路径：撞上 3000101 就按这张表逐个摘，摘掉后能过就照常出字。
+#: 顺序是「最可能被误加 -> 最不可能」：response_format 已在前置归一里处理，
+#: 剩下的按客户端常见溢出来排；工具相关放最后（剥掉会让模型不再调工具）。
+_DEGRADE_FIELDS = (
+    "response_format",
+    "max_completion_tokens",
+    "parallel_tool_calls",
+    "reasoning_effort",
+    "stream_options",
+    "metadata",
+    "service_tier",
+    "store",
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "n",
+    "modalities",
+    "seed",
+    "user",
+    "top_k",
+    "repetition_penalty",
+    "prompt_cache_key",
+    "session_id",
+    "tool_choice",
+    "tools",
+    "functions",
+)
+
+
+def _degrade_body(body: dict, dropped: set[str]) -> dict | None:
+    """按 _DEGRADE_FIELDS 摘掉**一个**还没摘过的字段，返回新 body。
+
+    没有可摘的字段时返回 None（说明这条请求已经没什么可退的了）。
+    dropped 由调用方持有，保证同一个字段不会反复摘、也不会无限重试。
+    """
+    for field in _DEGRADE_FIELDS:
+        if field in body and field not in dropped:
+            dropped.add(field)
+            out = dict(body)
+            out.pop(field, None)
+            return out
+    return None
+
+
+def _is_param_error(exc: client.UpstreamError) -> bool:
+    """这条 400 是不是「参数不被上游接受」（而不是账号 / 额度 / 风控）。
+
+    判据取上游原文：3000101 invalid parameter。只有这一类**换号无用、降级
+    有效** —— 换号只会把好号一个个撞成「有错误记录」，而降级能真出字。
+    """
+    if int(exc.status or 0) not in (400, 422):
+        return False
+    blob = ("%s %s" % (exc.detail or "", exc.message or "")).lower()
+    return "3000101" in blob or "invalid parameter" in blob
+
+
+#: 上游表达「上下文超限」的各种措辞（不同后端说法不一样）。
+#:
+#: 判据取「够具体、不会误伤」的短语 —— 不能只匹配 token，否则把
+#: invalid token 这类参数错也吃进来。必须在 _is_param_error **之前**判断：
+#: 3000100 和 3000101 前缀相同，但一是内容长度、一是字段不认，处理方式相反。
+_CONTEXT_OVERFLOW_WORDS = (
+    "max input token",
+    "maximum context length",
+    "context length exceeded",
+    "context_length_exceeded",
+    "input is too long",
+    "prompt is too long",
+    "too many tokens",
+    "exceeds the maximum",
+    "3000100",
+)
+
+#: 上下文超限时**原样重发**几次（每次都是一次重新路由的机会）。
+_MAX_CTX_RETRIES = 4
+
+#: 重试之间的间隔：不纯粹是退避 —— 上游路由决策带时间相关性，间隔一两秒
+#: 能显著提高「换一个后端」的概率。
+_CTX_RETRY_GAP = 1.2
+
+
+def _is_context_overflow(exc: "client.UpstreamError") -> bool:
+    """这条错误是不是「上下文太长，这次那个后端装不下」。"""
+    if int(exc.status or 0) not in (400, 413, 422):
+        return False
+    blob = ("%s %s" % (exc.detail or "", exc.message or "")).lower()
+    return any(word in blob for word in _CONTEXT_OVERFLOW_WORDS)
+
+
 def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     """选号 + 租约 + 调上游。换号语义与其它平台一致。
 
@@ -1791,6 +2015,18 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     一个号都没换成（池里只有它 / 全被 exclude）时打 `Marvis 换号终止`。
     2026-11-16 之前这两条日志都不存在，线上 403 无法区分「没号可换」和
     「没换号」—— 这次把换号做成**可数的事实**。
+
+    ## 参数类 400 / 上下文超限：同号重试，不记账号失败（上游 PR #55）
+
+    上游回 3000101 invalid parameter 时，**这个号是好的**、凭证是好的，
+    只是请求里某个字段它不认。以前这里直接 note_failure 后抛：号上留下
+    last_err_msg=invalid parameter、err_count +1，用户看到「号有错」，
+    而真正要动的是请求体。现在按 _DEGRADE_FIELDS 逐个摘，摘到能过就出字，
+    且不吃换号预算（attempts -= 1）。
+
+    上下文超限（400/413 + 3000100）同理：内容长度是请求属性，换号发也一样长，
+    靠 main-auto 的自动路由原样重发（_MAX_CTX_RETRIES 次）重新选路。
+
     """
     # 平台级风控退避：窗口内再有请求**直接 503**，一个字节都不打上游。
     #
@@ -1822,7 +2058,14 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     switch_from = 0
     switch_reason: tuple[str, str] = ("", "")
     tried = 0
-    for _ in range(MAX_ATTEMPTS):
+    # 换号预算（MAX_ATTEMPTS）与两类同号重试（参数降级 / 上下文超限）分开计数：
+    # 同号重试要 attempts -= 1，不吃「三次机会」—— 否则降级重试会把换号预算吃光。
+    attempts = 0
+    param_retries = 0
+    ctx_retries = 0
+    dropped: set[str] = set()
+    while attempts < MAX_ATTEMPTS:
+        attempts += 1
         # `min_balance=0` = 只要余额 > 0 的号。
         #
         # Marvis 是令牌钱包制：额度用完的号凭证**是好的**，但每次调用都会被上游
@@ -1872,6 +2115,72 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             return result, account, started
         except client.UpstreamError as exc:
             shared.release(account)
+            # ------------------------------------------------------------------
+            # 上游 PR #55 的四类「不记账号失败」处理（顺序有意：先判先停）
+            # ------------------------------------------------------------------
+            #
+            # ## 签名器不可用（fail-closed）
+            # 请求根本没发出去；换号也签不出来（签名器是进程级/环境级的东西，与
+            # 账号无关），立刻停且**不** note_failure —— 否则环境问题会被写成
+            # 「这些号都被风控」，用户去换号重扫码，全是白费。
+            if exc.kind == "signer_unavailable":
+                last_error = exc
+                logger.error(
+                    "Marvis 签名器不可用，fail-closed 拒绝（不换号、不记账号失败，"
+                    "与账号无关）| acc=%s | %s",
+                    int(account.id or 0), (exc.detail or exc.message or "")[:200])
+                break
+            # ## 内容风控（4100406）
+            # 请求正文命中上游黑名单：换号无用，而且会把好号逐个写成失败记录。
+            if exc.kind == "content_block":
+                last_error = exc
+                logger.warning(
+                    "Marvis 内容风控拦截（换号无效，不记账号失败）| acc=%s | %s",
+                    int(account.id or 0), (exc.detail or exc.message or "")[:200])
+                break
+            # ## 上下文超限（400/413 + 3000100）
+            # main-auto 是自动路由：原样重发让上游重新选路，可能就落到装得下的
+            # 后端。不裁消息（对话历史就是任务本身），不换号（长度是请求属性）。
+            # 3000100 已由 client 归成 max_input_tokens（额度族）：那条走 max_tokens
+            # 降级 + 换号，不能被「上下文超限」抢走（否则会死磕同一个号 4 次）。
+            if exc.kind != "max_input_tokens" and _is_context_overflow(exc):
+                last_error = exc
+                if ctx_retries < _MAX_CTX_RETRIES:
+                    ctx_retries += 1
+                    logger.warning(
+                        "Marvis 上下文超限（本次路由的后端装不下），原样重发第 %d/%d "
+                        "次以重新路由 | acc=%s | 消息 %d 条 | %s",
+                        ctx_retries, _MAX_CTX_RETRIES, int(account.id or 0),
+                        len(body.get("messages") or []),
+                        (exc.detail or exc.message or "")[:160])
+                    attempts -= 1
+                    time.sleep(_CTX_RETRY_GAP)
+                    continue
+                logger.warning(
+                    "Marvis 上下文超限，重发 %d 次仍装不下 | acc=%s | %s",
+                    _MAX_CTX_RETRIES, int(account.id or 0),
+                    (exc.detail or exc.message or "")[:300])
+                break
+            # ## 参数类 400（3000101 invalid parameter）
+            # 号是好的、凭证是好的，只是某个字段上游不认。按 _DEGRADE_FIELDS
+            # 逐个摘，摘到能过就出字；摘不干净才抛，且不污染账号。
+            if _is_param_error(exc):
+                degraded = _degrade_body(body, dropped)
+                last_error = exc
+                if degraded is not None and param_retries < len(_DEGRADE_FIELDS):
+                    param_retries += 1
+                    logger.warning(
+                        "Marvis 参数被上游拒绝，摘掉 %s 后同号重试 | acc=%s | %s",
+                        sorted(dropped), int(account.id or 0),
+                        (exc.detail or exc.message or "")[:180])
+                    body = degraded
+                    profile = _profile_of(body)
+                    attempts -= 1
+                    continue
+                logger.warning(
+                    "Marvis 参数被上游拒绝且无可降级字段 | acc=%s | %s",
+                    int(account.id or 0), (exc.detail or exc.message or "")[:300])
+                break
             # 可观测性：失败必须留痕（kind / status / 业务码 / detail / 号）。
             # ⚠ 放在「改写成用户文案」之前 —— 这里要的是**上游原话**。
             _warn_upstream_failure(account, exc, model=model, stream=stream)
@@ -2011,8 +2320,14 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
         alive = [r for r in rows if (getattr(r, "status", "") or "") == "active"]
         expired = [r for r in alive
                    if "过期" in str(getattr(r, "last_err_msg", "") or "")]
+        # 冷却中的号里，有多少是被**风控**挂起来的（cool_kind）。
+        # 两种「冷却」对用户含义相反：普通冷却等几十秒就好；风控冷却是出口
+        # 被平台拦了，等 3 秒没用，重试只会延长封禁（上游 PR #55）。
+        risk_cooling = [r for r in alive
+                        if str(getattr(r, "cool_kind", "") or "") == "risk_control"]
+        risk_ids = [r.id for r in risk_cooling]
     except Exception:  # noqa: BLE001
-        alive, expired = [], []
+        alive, expired, risk_cooling, risk_ids = [], [], [], []
     # 「一个号都没选到」同样是网关失败，而且是最难从响应里看出原因的一种：
     # 响应里只有 503 + 一句人话，没有 kind / 没有上游。这里补一条 warn。
     logger.warning("Marvis 无可用账号 realm=%s model=%s active=%d expired=%d",
@@ -2035,6 +2350,18 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     #
     # 判据只看 `alive`：active 且余额为 0 的号算「没配额」。NULL（从没同步过
     # 余额）不计入 —— 未知不等于耗尽，那种情况仍按冷却重试。
+    # 全池都在**风控冷却**里 —— 这是 17:24 那次 503 的真实原因，而不是
+    # 「排队中」。文案要能直接指到「出口风控」这个动作上（上游 PR #55）。
+    if risk_cooling and len(risk_cooling) == len(alive):
+        raise shared.PlatformRejected(
+            429,
+            "腾讯 Marvis 对当前出口做了风控拦截（4100404），全部 %d 个账号都在冷却中"
+            "（账号 id：%s）。这不是账号或 API Key 的问题：凭证钱包接口正常，"
+            "换号 / 重扫码 / 换 Key 都无效。请停止重试（重试会延长风控窗口），"
+            "等风控过去或换出口 IP 后再试。"
+            % (len(risk_cooling), "、".join(str(i) for i in risk_ids[:8])),
+            kind="upstream_risk_control", code="risk_control_cooling",
+            headers={"Retry-After": "600"})
     zero = [r for r in alive
             if getattr(r, "balance_remain", None) is not None
             and int(getattr(r, "balance_remain", 0) or 0) <= 0]
@@ -2174,6 +2501,110 @@ def _acquire_timeout_response(exc, *, stream: bool):
                         status_code=status, headers={"Retry-After": "5"})
 
 
+def _inband_error(obj: dict) -> str:
+    """识别「HTTP 200 + 流内错误帧」的那一类失败，返回错误描述（正常帧返回空串）。
+
+    上游有一部分失败**不走状态码**：HTTP 200、Content-Type: text/event-stream
+    照旧，但流里只有一条错误帧、没有 choices：
+
+        data: {"error":{"code":3000101,"message":"...非法参数..."}}
+
+    client._classify() 只看得到 200，整条链路会按成功处理：错误帧被原样当
+    正文透传、finally 里 note_success()、用量日志记一笔正常调用 —— 现场表现
+    是「网关全绿、客户端一直重试」。判据刻意收窄：有 choices 就不当错误。
+    """
+    if not isinstance(obj, dict):
+        return ""
+    if obj.get("choices"):
+        return ""
+    err = obj.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message") or err.get("msg") or err.get("detail") or ""
+        code = err.get("code") or err.get("error_code") or ""
+        return ("%s%s" % ("%s " % code if code else "", msg)).strip() or "stream error"
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    if obj.get("error_code") or obj.get("error_msg"):
+        return ("%s %s" % (obj.get("error_code") or "",
+                           obj.get("error_msg") or "")).strip()
+    return ""
+
+
+#: 流读到一半上游断开（socket reset / read timeout）时补发的 error 帧。
+#:
+#: _terminal_frame() 只保证「流有结尾」，不说原因；断流时上游并没有发过任何
+#: 错误帧，客户端看到的就是一个干净的 stop —— 所以这里先补一帧 error 把原因
+#: 说清楚，再让调用方补终止帧。只出现在异常路径上，正常流一个字节都不改。
+_STREAM_BROKEN_FRAME = ("data: %s\n\n" % json.dumps(
+    {"error": {"type": "upstream_stream_broken",
+               "code": "stream_broken",
+               "message": "Marvis 上游流在中途断开（读超时或连接被重置），"
+                          "已收到的内容保持有效，请重试本轮"}},
+    ensure_ascii=False)).encode()
+
+
+_KEEPALIVE_ENV = "MIRAIHUB_MARVIS_KEEPALIVE"
+_KEEPALIVE_OFF = frozenset({"0", "false", "off", "no"})
+
+
+def _keepalive_enabled() -> bool:
+    """心跳开关，默认开；MIRAIHUB_MARVIS_KEEPALIVE=0 整体关掉。
+
+    留开关的理由与内容改写（SANITIZE_TENCENT_ENV）一致：这是**往客户的流里
+    插入我们自己造的帧**，出问题必须能一键退回原样透传，而不是改代码。
+    """
+    return (os.getenv(_KEEPALIVE_ENV) or "").strip().lower() not in _KEEPALIVE_OFF
+
+
+async def _with_keepalive(source, *, interval: float, ping: bytes):
+    """给 async 生成器加空闲心跳：interval 秒没新块就发一帧 ping。
+
+    超时**不取消**内层那次读取：只把心跳先吐出去，再接着等同一个 task。
+    始终只有一个读线程，不会踩到 bridge 那个「取消后重起线程并发消费同一条
+    流、行被撕碎」的坑。
+    """
+    iterator = source.__aiter__()
+    pending: "asyncio.Future | None" = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                yield ping
+                continue
+            try:
+                chunk = pending.result()
+            except StopAsyncIteration:
+                return
+            finally:
+                pending = None
+            yield chunk
+    finally:
+        # 客户端断开 / 上层取消：把还挂着的读任务收掉，别让它悬着
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except BaseException:  # noqa: BLE001 - 取消与收尾异常都不外抛
+                pass
+
+
+def _wrap_keepalive(response, ping: bytes):
+    """给 StreamingResponse 套一层空闲心跳；其它响应原样返回。"""
+    if not _keepalive_enabled() or not isinstance(response, StreamingResponse):
+        return response
+    body = getattr(response, "body_iterator", None)
+    if body is None:
+        return response
+    from admin.platform import protocol_bridge as bridge
+
+    return StreamingResponse(
+        _with_keepalive(body, interval=bridge.PING_INTERVAL_S, ping=ping),
+        status_code=response.status_code,
+        headers=dict(response.headers))
+
+
 async def chat_completions(request: Request):
     """OpenAI 兼容入口 —— 本平台的唯一主路径。
 
@@ -2261,8 +2692,13 @@ async def chat_completions(request: Request):
     if not wants_stream:
         key, resp, account, started = acquired
         usage = _usage_of(resp)
+        # 非流式同样可能是「HTTP 200 + 错误体」：_classify() 只能按状态码判，
+        # 这类拒绝会一路被当成成功记账。原样把上游 body 交给调用方（不改语义），
+        # 但记账要标成失败，否则面板上看不出真实成功率。
+        # 记账口径用本项目的**槽位**（slot），不是上游回的 billed_model。
+        inband = _inband_error(resp)
         await _bill_async(key, account, slot, usage, request=request,
-                          started=started)
+                          started=started, error=inband)
         return JSONResponse(resp, headers=_degraded_headers(notes) or None)
 
     # 宽限期内拿到了上游响应头 -> 正常流式（与改动前完全一致，无心跳）。
@@ -2277,6 +2713,7 @@ async def chat_completions(request: Request):
         began = time.perf_counter()
         key = resp = account = started = None
         buffer = b""
+        pending = b""
         reaped = [False]
 
         def _reap_once() -> None:
