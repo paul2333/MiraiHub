@@ -8,6 +8,7 @@
   * 不可用模型回 401 → 上层当成登录失效，把整池好号全标死；
   * QQ 的 state 写成整数 → 上游判参数无效（必须与渲染层一致是小数）。
 """
+import base64
 import hashlib
 import json
 import os
@@ -26,10 +27,34 @@ os.environ.setdefault(
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from admin.platform.marvis.core import client, endpoints  # noqa: E402
+from admin.platform.marvis.core import uskey as uskey_sidecar  # noqa: E402
 from admin.platform.marvis.services import accounts as marvis_accounts  # noqa: E402
 
 ACCT = {"openid": "openid-abc", "access_token": "tok-xyz", "guid": "guid-123",
         "login_type": "1"}
+
+#: 侧车替身：单测不打真侧车（真侧车要 Wine + beacon_napi）。
+#: 这里只锁「header / bus_info / MarvisExt 三者自洽」；真实签名的
+#: 实发正确性由 `tests/test_marvis_uskey_sidecar.py` 覆盖。
+FAKE_QIMEI36 = "3aeda2c4343993fc64eec8c830001591ab11"
+
+
+def _fake_uskey(nbytes: int = 376) -> str:
+    return base64.b64encode(b"\x0a\xc0\xd5\x0c\x21\x11"
+                            + bytes(nbytes - 6)).decode()
+
+
+def _fake_signer(**_kwargs) -> dict:
+    return {"uskey": _fake_uskey(), "qimei36": FAKE_QIMEI36, "bus_info": "",
+            "uskey_bytes": 376, "uskey_len": 504, "ms": 0}
+
+
+def setUpModule():
+    uskey_sidecar.set_signer(_fake_signer)
+
+
+def tearDownModule():
+    uskey_sidecar.set_signer(None)
 
 
 class SignatureTests(unittest.TestCase):
@@ -85,18 +110,18 @@ class LlmHeaderTests(unittest.TestCase):
 
     def test_marvis_ext_is_compact_json(self):
         """`Ual-Access-MarvisExt` 必须无空格 —— 服务端按原文字符串校验。"""
-        ext = endpoints.marvis_ext(ACCT)
+        ext = endpoints.marvis_ext(
+            ACCT, uskey_value=_fake_uskey(), qimei36=FAKE_QIMEI36, nonce="n-1")
         self.assertNotIn(" ", ext, "含空格会被判无效")
         parsed = json.loads(ext)
         self.assertEqual(parsed["guid"], ACCT["guid"])
-        self.assertEqual(parsed["reqScene"], 1)
+        # 2026-11-18 实测 200 的那组值：reqScene=0 且带 qimei36
+        self.assertEqual(parsed["reqScene"], 0)
         self.assertEqual(parsed["taskType"], "user")
         self.assertIs(parsed["isIoa"], False)
-        # uskey 是 376 字节的 base64 → ceil(376/3)*4 = 504 字符（含 '=' 填充）
+        self.assertEqual(parsed["qimei36"], FAKE_QIMEI36)
         self.assertEqual(len(parsed["uskey"]), 504)
-        # nonce 每次不同（上游拿去去重）
-        self.assertNotEqual(parsed["nonce"],
-                            json.loads(endpoints.marvis_ext(ACCT))["nonce"])
+        self.assertEqual(parsed["nonce"], "n-1")
 
 
 class ModelTests(unittest.TestCase):
@@ -1040,6 +1065,108 @@ class DispatchModelForPlatformTests(unittest.TestCase):
             self._db, "marvis", "no-such-model-xyz")
         self.assertIsNotNone(error, "不存在的模型必须被拒")
         self.assertEqual(error["code"], "model_not_found")
+
+
+class QuotaExhaustedTests(unittest.IsolatedAsyncioTestCase):
+    """额度耗尽必须报 402 `quota_exhausted`，不是 503 `accounts_cooling`。
+
+    2026-11-18 事故：三个号的上游日配额（各 10,000,000 token）同时打满，
+    选号用 `min_balance=0` 把余额 0 的号全滤掉 ⇒ 「一个号都没选到」被报成
+    503「都在冷却或排队中，请稍后重试」。用户照着这句话等冷却，而真正要等的
+    是上游 00:00(+08) 的配额重置 —— 长则十几小时。
+    """
+
+    def setUp(self):
+        from admin.platform import shared
+        from admin.platform.marvis import gateway
+        from admin.platform.marvis.core import client as mclient
+
+        self.gateway = gateway
+        self.shared = shared
+        self.mclient = mclient
+        self._orig = {
+            "open": mclient.open_chat_stream,
+            "select": shared.select_account,
+            "lease": shared.lease,
+            "release": shared.release,
+            "success": shared.note_success,
+            "failure": shared.note_failure,
+            "ensure": gateway.marvis_accounts.ensure_token,
+            "accounts": gateway.marvis_accounts.accounts_for,
+            "delay": gateway.SAME_ACCOUNT_RETRY_DELAY,
+            "jitter": gateway.SAME_ACCOUNT_RETRY_JITTER,
+        }
+        gateway.SAME_ACCOUNT_RETRY_DELAY = 0
+        gateway.SAME_ACCOUNT_RETRY_JITTER = 0
+        shared.lease = lambda account: True
+        shared.release = lambda account: None
+        shared.note_success = lambda account: None
+        shared.note_failure = lambda db, account, **kw: None
+        gateway.marvis_accounts.ensure_token = lambda db, account: {"t": "x"}
+
+    def tearDown(self):
+        g = self.gateway
+        g.shared.select_account = self._orig["select"]
+        g.shared.lease = self._orig["lease"]
+        g.shared.release = self._orig["release"]
+        g.shared.note_success = self._orig["success"]
+        g.shared.note_failure = self._orig["failure"]
+        g.marvis_accounts.ensure_token = self._orig["ensure"]
+        g.marvis_accounts.accounts_for = self._orig["accounts"]
+        self.mclient.open_chat_stream = self._orig["open"]
+        g.SAME_ACCOUNT_RETRY_DELAY = self._orig["delay"]
+        g.SAME_ACCOUNT_RETRY_JITTER = self._orig["jitter"]
+
+    def _pool(self, *balances):
+        """造一个「有号但余额如上」的号池；select_account 一律返回 None。"""
+        rows = [SimpleNamespace(id=189 + i, status="active",
+                                balance_remain=value, last_err_msg="")
+                for i, value in enumerate(balances)]
+        self.gateway.shared.select_account = lambda db, **kw: None
+        self.gateway.marvis_accounts.accounts_for = lambda db, realm="": rows
+        return rows
+
+    async def test_all_zero_balance_raises_402_quota_exhausted(self):
+        """alive 全 avail=0 ⇒ 402 quota_exhausted（不是 503 accounts_cooling）。"""
+        self._pool(0, 0, 0)
+        with self.assertRaises(self.shared.PlatformRejected) as caught:
+            self.gateway._attempt(None, None, None, {"model": "main-auto"},
+                                  "cn", stream=False)
+        exc = caught.exception
+        self.assertEqual(exc.status, 402, "额度耗尽必须 402，不是 503")
+        self.assertEqual(exc.code, "quota_exhausted")
+        self.assertEqual(exc.kind, "quota_exceeded")
+        self.assertIn("额度已耗尽", exc.message)
+        self.assertIn("10,000,000", exc.message, "文案要给出重置口径")
+        self.assertEqual(exc.headers.get("Retry-After"), "3600")
+
+    async def test_unknown_balance_is_not_reported_as_exhausted(self):
+        """余额 NULL（从没同步过）= 未知，不等于耗尽：仍按冷却 503 重试。"""
+        self._pool(None, None)
+        with self.assertRaises(self.shared.PlatformRejected) as caught:
+            self.gateway._attempt(None, None, None, {"model": "main-auto"},
+                                  "cn", stream=False)
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(caught.exception.code, "accounts_cooling")
+
+    async def test_partial_balance_still_selects_account(self):
+        """alive 里还有 avail>0 的号 ⇒ 正常选号（不许被额度判断挡掉）。"""
+        rows = self._pool(0, 6180000)
+        picked = []
+
+        def fake_select(db, **kw):
+            picked.append(1)
+            return SimpleNamespace(id=190, auth_json="{}")
+
+        self.gateway.shared.select_account = fake_select
+        # `_attempt` 是同步 def；`stream=True` 时上游走 `open_chat_stream`。
+        self.mclient.open_chat_stream = lambda *a, **kw: "RESULT"
+        result, account, _started = self.gateway._attempt(
+            None, None, None, {"model": "main-auto"}, "cn", stream=True)
+        self.assertEqual(result, "RESULT")
+        self.assertEqual(account.id, 190)
+        self.assertEqual(picked, [1], "有余额的号必须照常被选中")
+        self.assertEqual(len(rows), 2)
 
 
 if __name__ == "__main__":

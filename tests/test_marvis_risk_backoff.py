@@ -9,12 +9,21 @@
     每个请求先白撞一次 402；
   · 11MB 单条消息被送去撞上游，只换回一个看不懂的 400 3000101；
   · 出口 IP 硬禁代理 → 被风控之后代码层面没有任何换 IP 的手段。
+
+2026-11-18 修订（本文件里跟着改了 5 处断言）：
+
+  · 4100404 **不再重试**（client.CHAT_ATTEMPTS = 1）—— 18:19:11 撞 4100404 后
+    整组轮换重发，18:23 同一个 token 就变成 401 4100403（登录态被打死）；
+  · 撞墙的那个号改为打 **300 秒**账号冷却（COOL_SECONDS_RISK），
+    但**仍然不换号、不 exclude** —— 自放大来自「重放同一份 body」，不是冷却；
+  · 平台级退避的阈值是**连续 5 次**（17:38 从 1 提到 5），单次命中只让本次失败。
 """
 import asyncio
 import json
 import os
 import sys
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 # 必须早于 admin.* 导入：admin/db.py 在模块级按 settings 建引擎（默认 MySQL）。
@@ -139,17 +148,33 @@ def _quota_error():
 # ---------------------------------------------------------------------------
 
 
-def test_cool_seconds_only_for_auth():
-    assert gateway._cool_seconds("risk_control") == 0
+def test_cool_seconds_auth_and_risk():
+    """auth 600s；risk_control 用 300s（2026-11-18 起，不再是 0）。"""
     assert gateway._cool_seconds("auth") == 600
+    assert gateway._cool_seconds("risk_control") == gateway.COOL_SECONDS_RISK
+    assert gateway.COOL_SECONDS_RISK == 300
     assert gateway._cool_seconds("quota_exceeded") == 0
     assert gateway._cool_seconds("upstream_business") == 0
 
 
-def test_risk_control_leaves_no_account_cool(monkeypatch, note_calls):
-    """风控命中后：账号的 cool_until 必须保持 None（不打冷却）。"""
+def test_cool_seconds_prefers_client_value():
+    """client 在撞墙处已经算好秒数（env 可调），gateway 不许覆盖它。"""
+    exc = marvis_client.UpstreamError(
+        "x", status=403, code="4100404", kind="risk_control", cool_seconds=420)
+    assert gateway._cool_seconds("risk_control", exc) == 420
+
+
+def test_risk_control_cools_only_the_hit_account(monkeypatch, note_calls):
+    """风控命中后：**只**给撞墙的号打 300 秒冷却，另一个号一点都不许动。
+
+    旧断言是「cool_until 必须保持 None」。改判的不是「要不要保护号」，
+    而是保护方式：18:19 的现场证明重试会把 4100404 推成 4100403（不可逆），
+    所以必须让这个号歇一会儿；而「换号重放」已经被 risk_control 分支的
+    raise（不 exclude、不换号）挡住了，冷却不会自放大。
+    """
     account = _FakeAccount(189)
-    _install_pool(monkeypatch, [account, _FakeAccount(190)])
+    other = _FakeAccount(190)
+    _install_pool(monkeypatch, [account, other])
     _run_attempt(monkeypatch, exc=_risk_error())
 
     with pytest.raises(marvis_client.UpstreamError):
@@ -157,10 +182,13 @@ def test_risk_control_leaves_no_account_cool(monkeypatch, note_calls):
                          "cn", stream=False)
 
     assert note_calls, '失败必须留痕（note_failure 没被调用）'
-    assert note_calls[0]["cool_seconds"] == 0
+    assert note_calls[0]["cool_seconds"] == 300
     assert note_calls[0]["kind"] == "risk_control"
-    assert account.cool_until is None, '风控不该给账号打 cool_until'
-    assert account.cool_kind == ""
+    assert account.cool_until is not None, '撞墙的号没被打冷却'
+    assert account.cool_kind == "risk_control"
+    left = (account.cool_until - datetime.utcnow()).total_seconds()
+    assert 250 <= left <= 310, left
+    assert other.cool_until is None, '别的号被连带冷却了（自放大）'
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +210,29 @@ def test_risk_control_does_not_switch_account(monkeypatch, note_calls):
     assert selected[0] == frozenset(), '失败号被加进了 exclude 集合'
 
 
+def test_local_cooldown_block_does_not_count_as_risk_hit(monkeypatch, note_calls):
+    """本端冷却拦下的请求（local=True）不算命中：没打上游就不可能被风控。"""
+    account = _FakeAccount(189)
+    _install_pool(monkeypatch, [account])
+    local_exc = marvis_client.UpstreamError(
+        "Marvis 风控冷却中：本次不上上游", status=429, code="4100404",
+        kind="risk_control", cool_seconds=120, local=True)
+    _run_attempt(monkeypatch, exc=local_exc)
+
+    with pytest.raises(marvis_client.UpstreamError):
+        gateway._attempt(_FakeDB(), None, None, {"model": "m"}, "cn", stream=False)
+
+    assert gateway.risk_hits() == 0, "本地拦截被算成上游命中（会自己推进退避）"
+    assert gateway.risk_backoff_remaining() == 0
+
+
 def test_platform_backoff_blocks_second_request(monkeypatch, note_calls):
-    """60 秒内第二次请求直接 503 + Retry-After，且**不再选号 / 不打上游**。"""
+    """退避窗口内第二次请求直接 503 + Retry-After，且**不再选号 / 不打上游**。
+
+    阈值在 2026-11-18 17:38 从 1 提到 5（单次 4100404 只让本次失败），
+    所以这里把阈值压到 1 才能测「退避已打开」这个状态本身。
+    """
+    monkeypatch.setenv(gateway.RISK_BACKOFF_THRESHOLD_ENV, "1")
     accounts = [_FakeAccount(189), _FakeAccount(190)]
     selected = _install_pool(monkeypatch, accounts)
     _run_attempt(monkeypatch, exc=_risk_error())
@@ -207,6 +256,7 @@ def test_platform_backoff_blocks_second_request(monkeypatch, note_calls):
 
 def test_backoff_window_is_env_tunable(monkeypatch):
     monkeypatch.setenv(gateway.RISK_BACKOFF_ENV, "5")
+    monkeypatch.setenv(gateway.RISK_BACKOFF_THRESHOLD_ENV, "1")
     gateway.reset_risk_backoff()
     gateway.note_risk_control()
     remaining = gateway.risk_backoff_remaining()
@@ -220,7 +270,7 @@ def test_risk_control_maps_to_503_for_client(monkeypatch):
     assert int(response.headers["retry-after"]) >= 1
     payload = json.loads(response.body)["error"]
     assert payload["type"] == "risk_control"
-    assert "出口 IP" in payload["message"]
+    assert "4100404" in payload["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -304,21 +354,26 @@ def test_oversized_body_rejected_locally(monkeypatch):
     calls = []
     monkeypatch.setattr(gateway, "_acquire", lambda *a, **k: calls.append(1))
 
-    request = _request(content_length=11 * 1024 * 1024)
+    # 超过 256MB 兜底才拒（原来 11MB 就拒，长对话发不出去）
+    request = _request(content_length=300 * 1024 * 1024)
     response = asyncio.run(gateway.chat_completions(request))
 
     assert response.status_code == 413
     payload = json.loads(response.body)["error"]
     assert payload["code"] == "body_too_large"
-    assert "单条消息" in payload["message"]
-    assert "不是模型问题" in payload["message"]
+    # 文案要点：说清是网关兜底、给出解法，不再教训用户去拆消息
+    assert "本网关的体积兜底" in payload["message"]
+    assert "不是模型" in payload["message"]
+    assert "MIRAIHUB_MARVIS_MAX_BODY_BYTES" in payload["message"]
+    assert "拆成几条" not in payload["message"]
     assert not calls, '超大请求被送去打上游了'
 
 
 def test_normal_large_body_still_passes(monkeypatch):
-    """3.7MB 的正常大对话有成功先例，必须放行（阈值不能设太小）。"""
-    request = _request(content_length=int(3.7 * 1024 * 1024))
-    assert asyncio.run(gateway._reject_oversized(request)) is None
+    """用户真实场景：6.5MB 单条消息必须放行；3.7MB 老先例当然也要放行。"""
+    for size in (int(3.7 * 1024 * 1024), 6500000):
+        request = _request(content_length=size)
+        assert asyncio.run(gateway._reject_oversized(request)) is None, size
 
 
 def test_body_limit_env_override(monkeypatch):
@@ -329,8 +384,21 @@ def test_body_limit_env_override(monkeypatch):
     assert response is not None and response.status_code == 413
 
 
-def test_body_limit_default_is_4mb():
-    assert gateway._max_body_bytes() == 4 * 1024 * 1024
+def test_body_limit_default_is_256mb():
+    assert gateway._max_body_bytes() == 256 * 1024 * 1024
+
+
+def test_body_limit_zero_disables_check(monkeypatch):
+    """MIRAIHUB_MARVIS_MAX_BODY_BYTES=0（或负数）= 完全关闭体积检查。"""
+    for raw in ("0", "-1"):
+        monkeypatch.setenv("MIRAIHUB_MARVIS_MAX_BODY_BYTES", raw)
+        assert gateway._max_body_bytes() <= 0
+        # 连 300MB 的声明长度也不该被拦
+        request = _request(content_length=300 * 1024 * 1024)
+        assert asyncio.run(gateway._reject_oversized(request)) is None, raw
+        # 没有 content-length 时读到 body 再量，同样放行
+        request = _request(body=b"x" * 4096)
+        assert asyncio.run(gateway._reject_oversized(request)) is None, raw
 
 
 # ---------------------------------------------------------------------------
