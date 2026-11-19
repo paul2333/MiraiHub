@@ -17,13 +17,9 @@ Qoder，29 个号），请求落到那边，上游不认这个词 → 404，用�
 
 ## 修法
 
-`_platform_for_model()` 认 `_GENERIC_MODEL_NAMES` 就返回 None：不按模型
-选平台，交给当前平台自己解释（默认平台由主应用 `proxy.py` 的自动选模型
-接住）。
-
-2026-11-18 用户要求「按平台来，不要串平台」后：`_reroute_target()` 整段
-删除（连同 dispatch 层的 404/502/503 跨平台重试），平台一旦解析出来就
-钉死；本文件里「普通模型照旧跨平台改道」的断言随契约一起改掉。
+`_reroute_target()` 与 `_platform_for_model()` 认 `_GENERIC_MODEL_NAMES`
+就返回 None：不改道、不按模型选平台，交给当前平台自己解释（默认平台由主
+应用 `proxy.py` 的自动选模型接住）。
 
 运行：
   python tests/test_dispatch_generic_models.py
@@ -59,6 +55,18 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  [!!] {name}  {detail}")
 
 
+def _db_factory(db):
+    """把 dispatch._db 指到夹具 Session（resolve 内部自己开/关）。"""
+    class _Ctx:
+        def __enter__(self):
+            return db
+
+        def __exit__(self, *exc_info):
+            return False
+
+    return lambda: _Ctx()
+
+
 def make_db():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
                            poolclass=StaticPool)
@@ -77,29 +85,22 @@ def make_db():
 
 
 def test_generic_names_not_rerouted(db) -> None:
-    print("\n== 通用路由名不选平台（跨平台改道入口已删除）==")
-    # 2026-11-18「按平台来，不要串平台」：改道入口整段删除。
-    # 这里直接钉住「模块里不再有这个函数」，防止以后被顺手加回来。
-    check("_reroute_target 已删除", not hasattr(dispatch, "_reroute_target"))
+    print("\n== 通用路由名不改道、不按模型选平台 ==")
     for name in ("auto", "AUTO", " auto ", "default", "chat", "best", "fast"):
+        target = dispatch._reroute_target(db, name, None)
+        check(f"{name!r} 不改道", target is None, target)
         picked = dispatch._platform_for_model(name, None)
         check(f"{name!r} 不选平台", picked is None, picked)
 
 
-def test_normal_models_single_platform_only(db) -> None:
-    print("\n== 普通模型只在目录里定位平台，不再跨平台改道 ==")
-    # 契约变了：平台一旦解析出来就钉死，dispatch 层不再有「换个平台再试」。
-    # 故意盯住模块属性：函数/常量被加回来 = 跨平台轮换复活。
-    check("_reroute_target 已删除", not hasattr(dispatch, "_reroute_target"))
-    check("_RETRYABLE_STATUS（跨平台重试状态集）已删除",
-          not hasattr(dispatch, "_RETRYABLE_STATUS"))
-    plats = dispatch._model_platforms(db, "hunyuan-vision-2.0")
-    check("hunyuan-vision-2.0 只在 marvis 的清单里",
-          plats == [("marvis", "")], plats)
-    # 默认平台自己有的模型：目录归属仍只有 workbuddy，不会向外改道。
-    same = dispatch._model_platforms(db, "deepseek-v4.1-flash")
-    check("deepseek-v4.1-flash 只属于 workbuddy",
-          same == [("workbuddy", "")], same)
+def test_normal_models_still_reroute(db) -> None:
+    print("\n== 普通模型照旧按归属改道（别把兜底一起关掉）==")
+    target = dispatch._reroute_target(db, "hunyuan-vision-2.0", None)
+    check("hunyuan-vision-2.0 -> marvis",
+          bool(target) and str(target[0]).startswith("marvis"), target)
+    # 默认平台自己有的模型不该改道
+    same = dispatch._reroute_target(db, "deepseek-v4.1-flash", None)
+    check("deepseek-v4.1-flash 留在默认平台", same is None, same)
 
 
 def test_resolve_keeps_generic_on_default(db) -> None:
@@ -116,30 +117,36 @@ def test_resolve_keeps_generic_on_default(db) -> None:
 
     saved = (dispatch._key_of, dispatch._disabled_platforms,
              dispatch._spread_unbound, dispatch._strategy_pick,
-             dispatch._platform_for_model)
+             dispatch._platform_for_model, dispatch._db)
     dispatch._key_of = lambda _r: None
     dispatch._disabled_platforms = lambda: set()
     dispatch._spread_unbound = lambda: True
     dispatch._strategy_pick = lambda: ("loomy", "")
     dispatch._platform_for_model = lambda _m, _k: None
+    # 2026-11-19 起「按模型归属选平台」不再依赖 key.aggregate：resolve() 会先问
+    # 「谁登记了这个模型」。这里把 _db 指到本文件的夹具库，否则它查的是真空库。
+    dispatch._db = _db_factory(db)
     try:
         check("auto -> 默认平台",
               dispatch.resolve(_Req("auto")) == (registry.DEFAULT_PLATFORM, ""),
               dispatch.resolve(_Req("auto")))
-        check("普通模型仍按策略分摊",
-              dispatch.resolve(_Req("deepseek-v4.1-flash")) == ("loomy", ""),
+        # 断言随规格更新（原值 "loomy" 来自「无头分摊」）：deepseek-v4.1-flash
+        # 在夹具里只有 workbuddy 登记，按模型归属应当直达 workbuddy，
+        # 而不是被策略分摊到根本没登记它的 loomy。
+        check("普通模型按归属直达唯一登记者",
+              dispatch.resolve(_Req("deepseek-v4.1-flash")) == ("workbuddy", ""),
               dispatch.resolve(_Req("deepseek-v4.1-flash")))
     finally:
         (dispatch._key_of, dispatch._disabled_platforms,
          dispatch._spread_unbound, dispatch._strategy_pick,
-         dispatch._platform_for_model) = saved
+         dispatch._platform_for_model, dispatch._db) = saved
 
 
 def main() -> int:
     db = make_db()
     try:
         test_generic_names_not_rerouted(db)
-        test_normal_models_single_platform_only(db)
+        test_normal_models_still_reroute(db)
         test_resolve_keeps_generic_on_default(db)
     finally:
         db.close()
