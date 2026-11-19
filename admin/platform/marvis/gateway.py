@@ -2492,11 +2492,33 @@ async def _iter_upstream(resp):
     #
     # 兜底：极老的 Python 或自定义 resp 没有 read1 时退回 read，行为与以前一致。
     read = getattr(resp, "read1", None) or resp.read
+    # WARN: must align to b"\n\n" frame boundaries BEFORE handing bytes up.
+    #
+    # read1() only promises one underlying recv: it splits at arbitrary byte
+    # offsets - cutting through data: {"choices":[{"index":0,"delta":{"content":"hel
+    # is normal (2026-11-19 measured: CH[5] tail 'data: {"code', CH[6] head ':0,"id":...').
+    # _with_keepalive injects idle heartbeats PER CHUNK: if a chunk stops mid-JSON and
+    # upstream then goes quiet for >PING_INTERVAL_S, the keepalive frame lands INSIDE
+    # that JSON and the client json.loads blows up (malformed server-sent event JSON).
+    # Emit only whole frames here and keep the partial tail buffered, so a heartbeat can
+    # only ever land between two frames. read1 low latency is preserved: frames are
+    # small, so they leave as soon as their trailing blank line arrives.
+    buf = b""
     while True:
         chunk = await asyncio.to_thread(read, _STREAM_CHUNK)
         if not chunk:
             break
-        yield chunk
+        buf += chunk
+        idx = buf.rfind(b"\n\n")
+        if idx < 0:
+            if len(buf) > 1_048_576:
+                yield buf
+                buf = b""
+            continue
+        yield buf[:idx + 2]
+        buf = buf[idx + 2:]
+    if buf:
+        yield buf
 
 
 def _usage_of(result: dict) -> dict:
@@ -2694,13 +2716,20 @@ async def _with_keepalive(source, *, interval: float, ping: bytes):
     """
     iterator = source.__aiter__()
     pending: "asyncio.Future | None" = None
+    # Trailing bytes of what we last handed out: a heartbeat is only legal on a
+    # frame boundary (blank line). A half JSON followed by
+    # data: {"id":"chatcmpl-keepalive"... is exactly the 2026-11-19 malformed-SSE
+    # shape - better to skip one keepalive than to tear a frame apart.
+    tail = b""
     try:
         while True:
             if pending is None:
                 pending = asyncio.ensure_future(iterator.__anext__())
             done, _ = await asyncio.wait({pending}, timeout=interval)
             if not done:
-                yield ping
+                # empty tail = nothing written yet (stream head), safe to ping
+                if not tail or tail.endswith(b"\n\n"):
+                    yield ping
                 continue
             try:
                 chunk = pending.result()
@@ -2709,6 +2738,7 @@ async def _with_keepalive(source, *, interval: float, ping: bytes):
             finally:
                 pending = None
             yield chunk
+            tail = (tail + chunk)[-4:] if isinstance(chunk, (bytes, bytearray)) else b""
     finally:
         # 客户端断开 / 上层取消：把还挂着的读任务收掉，别让它悬着
         if pending is not None and not pending.done():
