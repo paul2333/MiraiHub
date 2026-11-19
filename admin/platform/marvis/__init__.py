@@ -49,8 +49,16 @@ def _task_runners() -> dict:
             "marvis_keepalive": _pg._run_keepalive}
 
 
+def _validate_qimei_pool() -> None:
+    """启动即校验 qimei 池硬约束：owners>2 直接拒绝启动。"""
+    from admin.platform.marvis.core import qimei_assign
+    qimei_assign.validate_or_raise()
+    qimei_assign.install_orm_hooks()
+
+
 def install() -> None:
     """登记 PlatformSpec（幂等）。"""
+    _validate_qimei_pool()
     from admin.platform import registry as _registry
 
     for realm in REALMS:
