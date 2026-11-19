@@ -2512,12 +2512,23 @@ async def _iter_upstream(resp):
         idx = buf.rfind(b"\n\n")
         if idx < 0:
             if len(buf) > 1_048_576:
+                if not buf.endswith(b"\n\n"):
+                    buf += b"\n\n"
                 yield buf
                 buf = b""
             continue
         yield buf[:idx + 2]
         buf = buf[idx + 2:]
     if buf:
+        # Upstream occasionally ends the stream with a bare data: [DONE] and NO
+        # trailing blank line (measured 2026-11-19: 1 in 8 shots). Yielding that
+        # tail as-is makes the terminal frame we append glue onto it:
+        #     data: [DONE]data: {"id": "chatcmpl-gateway"...
+        # which is exactly another malformed-SSE shape. SSE events end with a blank
+        # line, so close the tail here: _scan_stream then actually sees [DONE]
+        # (no terminal frame appended) and any appended frame lands on a boundary.
+        if not buf.endswith(b"\n\n"):
+            buf += b"\n\n"
         yield buf
 
 
