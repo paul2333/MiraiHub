@@ -110,6 +110,18 @@ def set_signer(fn=None):
     return _signer
 
 
+def fail_closed() -> bool:
+    """签名不可用时是否 **fail-closed**（默认开启，与 endpoints.uskey_fail_closed 同义）。
+
+    `MARVIS_USKEY_FAIL_CLOSED=0` 可退回旧行为（随机填充）。线上主路径要的是
+    「宁可 503，也不要拿随机指纹去撞风控并污染账号池」；只有探针要复现
+    「随机 uskey → 4100404」的历史现象时才关。
+    """
+    raw = (os.getenv("MARVIS_USKEY_FAIL_CLOSED") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+
 def new_identity() -> dict:
     """每请求一组全新的 `(conversation_id, response_id, nonce)`。
 
@@ -277,6 +289,9 @@ def sign(*, agent_tag: str, conversation_id: str, response_id: str,
         return _http_sign(**kwargs)
     try:
         return _local_sign(device_key=account_key, **kwargs)
+    except ValueError:
+        # 配置类错误（没给账号标识之类）不是「本地 mint 挂了」，直接抛，别掩盖真因。
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("本地 mint uskey 失败，回落侧车（%s）：%s",
                        SIDECAR_URL, exc)
