@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -1983,6 +1984,37 @@ def _is_context_overflow(exc: "client.UpstreamError") -> bool:
     return any(word in blob for word in _CONTEXT_OVERFLOW_WORDS)
 
 
+def _sticky_key_for(body: dict) -> str:
+    """会话键：marvis|会话标识（PR #48）。
+
+    带平台前缀是必须的 —— session_key_for() 在各平台算法相同，不带前缀会让
+    「同时打 marvis 和 loomy 的同一段对话」共用一条绑定，换平台就命中不上
+    （更糟：命中到别的平台的 uid）。
+    """
+    try:
+        from admin.pool import session_key_for
+
+        key = session_key_for(body)
+    except Exception:  # noqa: BLE001 - 算不出来就退化成「不粘」
+        return ""
+    return ("marvis|" + key) if key else ""
+
+
+def _bind_sticky(sticky_key: str, account) -> None:
+    """成功后把这个会话绑到该号，后续同会话优先回到它。"""
+    if not sticky_key or account is None:
+        return
+    uid = str(getattr(account, "uid", "") or "")
+    if not uid:
+        return
+    try:
+        from admin.pool import POOL
+
+        POOL.sticky.bind(sticky_key, uid)
+    except Exception:  # noqa: BLE001 - 粘性只是优化，不能影响主链路
+        pass
+
+
 def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     """选号 + 租约 + 调上游。换号语义与其它平台一致。
 
@@ -2047,6 +2079,9 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             kind="server_error", code="risk_control_backoff",
             headers={"Retry-After": str(int(remaining) + 1)})
     model = str(body.get("model") or "")
+    # PR #48 会话亲和：同一会话在 TTL 内优先回到上次成功的号（算不出就是空串，
+    # 退化成完全不粘，行为与改动前一致）。
+    sticky_key = _sticky_key_for(body)
     exclude: set[int] = set()
     last_error: client.UpstreamError | None = None
     # 请求画像只算一次，本次请求的所有上游尝试共用（只记数字，不落内容）。
@@ -2073,9 +2108,22 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
         # 它又排回队首（这些号从没成功过，`last_used_at` 恒为 NULL，选号按它升序）
         # —— 用户感受到的就是「一直失败，用不了」。NULL 余额（从没同步过）仍放行，
         # 否则新导入的号会被全部误杀。
+        # 会话亲和只在「真能算出席位键 + 选号函数确实支持 sticky_key」时才传参：
+        # 老签名（第三方包装 / 测试替身）不会被多一个 kwarg 打挂，行为与「不粘」
+        # 完全一致。用签名探测而不是 try/except TypeError —— 后者会把选号实现内部
+        # 真正的 TypeError 一起吞掉。
+        sticky_kwargs = {}
+        if sticky_key:
+            try:
+                params = inspect.signature(shared.select_account).parameters
+            except (TypeError, ValueError):  # noqa: BLE001 - 拿不到签名就当不支持
+                params = {}
+            if "sticky_key" in params:
+                sticky_kwargs["sticky_key"] = sticky_key
         account = shared.select_account(
             db, storage=STORAGE, realm=realm, key=key,
-            model=model, exclude_ids=exclude, min_balance=0)
+            model=model, exclude_ids=exclude, min_balance=0,
+            **sticky_kwargs)
         if account is None:
             break
         if switch_from:
@@ -2112,6 +2160,8 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                 int(account.id or 0), model or "-", profile["bytes"],
                 profile["msgs"], profile["tools"], profile["sys_chars"],
                 elapsed_ms, elapsed_ms, profile["bytes"] / _MB)
+            # 只有**成功**才写绑定：失败号不该被会话粘住（下个请求还要重试它）。
+            _bind_sticky(sticky_key, account)
             return result, account, started
         except client.UpstreamError as exc:
             shared.release(account)
