@@ -27,13 +27,13 @@
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
 import random
 import time
-import uuid
+
+from . import uskey
 
 PLATFORM = "marvis"
 
@@ -71,8 +71,14 @@ BROWSER_UA = (
 #: 客户端版本，随 `Ual-Access-MarvisExt` 上报
 CLIENT_VERSION = "1.60.3300.765"
 
-#: 登录方式 → `Ual-Access-Login-Type`
+#: 登录方式 → `Ual-Access-Login-Type`（**`/v3/*` 业务接口**用这一组）
 LOGIN_TYPE = {"QC": "1", "WX": "2", "WXAPP": "2"}
+
+#: 模型网关（`/v1/chat/completions`）的 `Ual-Access-Login-Type`。
+#: 真客户端 200 抓包实测发的是 **6**，不是 QC→1 / WX→2 —— 这一处不对，
+#: 上游按"设备登录态不可信"直接 4100404。业务接口仍走上面的 LOGIN_TYPE
+#: （`/v3/*` 那边没有 6 的证据，别一起改）。
+LOGIN_TYPE_LLM = os.environ.get("MARVIS_LOGIN_TYPE_LLM") or "6"
 
 # ---- 路径 ----
 CHAT_PATH = "/v1/chat/completions"
@@ -270,29 +276,62 @@ def models_catalog(realm: str = "") -> list[dict]:
 # ---------------------------------------------------------------------------
 # 设备指纹
 # ---------------------------------------------------------------------------
-#: uskey 的字节长度（上游按长度校验格式）
-USKEY_BYTES = 376
+#: `Ual-Access-MarvisExt` 上报的客户端标识 —— 这一组是 2026-11-17/18
+#: 实测回 200 的值，改任何一个都必须重新实测。
+#:
+#: 2026-11-18 用真客户端 200 抓包对齐：osVersion 真品是 .29695（我们是 .26200，
+#: 差一个大版本，等于自报"另一台机器"）。
+EXT_OS_VERSION = "Windows-10-10.0.29695"
+EXT_CLIENT_VERSION = "1.60.3400.795"
+EXT_CLIENT_PLATFORM = "Windows"
+EXT_CLIENT_PLATFORM_VERSION = "1.60.3400.35"
+EXT_REQ_SCENE = 0
+EXT_TASK_TYPE = "user"
+
+#: 模型网关默认的槽位 / 场景 / agent tag。三者都进 bus_info，
+#: 必须与 header、请求体**一字不差**。
+EXT_MODEL = "main-auto"
+EXT_AGENT_TAG = "main"
+EXT_SCENE = "agent_chat"
 
 
-def uskey_of(_business_id: str = BUSINESS_ID) -> str:
-    """现签一个 uskey。
+def login_type_header(acct: dict) -> str:
+    """`Ual-Access-Login-Type` 的值。
 
-    Marvis 客户端用自带 Beacon SDK 签真值；这里按上游格式本地生成
-    （376 字节的 base64）。实测本地值可以通过模型网关的格式校验。
+    DB 里存的是 `QC` / `WX`，header 必须发 `1` / `2` —— 直接透传
+    `QC` 会被上游判参数无效（最终表现为 4100404）。
     """
-    return base64.b64encode(os.urandom(USKEY_BYTES)).decode("ascii")
+    raw = str(acct.get("login_type") or "").strip().upper()
+    if raw in LOGIN_TYPE:
+        return LOGIN_TYPE[raw]
+    if raw.isdigit():
+        return raw
+    return "1"
 
 
-def marvis_ext(acct: dict) -> str:
-    """`Ual-Access-MarvisExt` 的值 —— 紧凑 JSON，**不能有空格**（服务端按原文比对）。"""
+def marvis_ext(acct: dict, *, uskey_value: str, qimei36: str,
+               nonce: str) -> str:
+    """`Ual-Access-MarvisExt` 的值 —— 紧凑 JSON，**不能有空格**（服务端按原文比对）。
+
+    键序照客户端抓包：qimei36 → osVersion → guid → uskey → nonce →
+    reqScene(0) → taskType → clientVersion → clientPlatform →
+    clientPlatformVersion → isIoa。`json.dumps` 保序（3.7+ 字典插入序）。
+
+    ⚠ `uskey` 必须来自 beacon_napi 整块产出（见 `uskey.py`），本地拼装的
+    `magic + F(bus_info) + 随机尾` 100% 被拦成 4100404；`qimei36` 必须与签
+    这块 uskey 时 SDK 报的 `getQimei()` 完全相同。
+    """
     payload = {
-        "osVersion": "Windows-10-10.0.26200",
+        "qimei36": str(qimei36),
+        "osVersion": EXT_OS_VERSION,
         "guid": str(acct.get("guid") or ""),
-        "uskey": uskey_of(),
-        "nonce": str(uuid.uuid4()),
-        "reqScene": 1,
-        "taskType": "user",
-        "clientVersion": str(acct.get("client_version") or CLIENT_VERSION),
+        "uskey": str(uskey_value),
+        "nonce": str(nonce),
+        "reqScene": EXT_REQ_SCENE,
+        "taskType": EXT_TASK_TYPE,
+        "clientVersion": EXT_CLIENT_VERSION,
+        "clientPlatform": EXT_CLIENT_PLATFORM,
+        "clientPlatformVersion": EXT_CLIENT_PLATFORM_VERSION,
         "isIoa": False,
     }
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -301,15 +340,34 @@ def marvis_ext(acct: dict) -> str:
 # ---------------------------------------------------------------------------
 # 鉴权头
 # ---------------------------------------------------------------------------
-def llm_headers(acct: dict, *, scene: str = "preload_summary",
-                agent_tag: str = "auto_discovery",
-                conversation_id: str = "", response_id: str = "") -> dict:
+def llm_headers(acct: dict, *, scene: str = EXT_SCENE,
+                agent_tag: str = EXT_AGENT_TAG, model: str = EXT_MODEL,
+                conversation_id: str = "", response_id: str = "",
+                nonce: str = "", signer=None) -> dict:
     """模型网关请求头（`/v1/chat/completions`）。
 
-    ⚠ 不要签名、不要 Authorization 真实 token —— 这里 `Bearer placeholder`
-    是 Marvis agent 自己的写法，鉴权靠 `Ual-Access-*` 那几个头。
+    ⚠ 不要签名、不要真实 token —— `Bearer placeholder` 是 Marvis agent 自己
+    的写法，鉴权靠 `Ual-Access-*` 那几个头。
+
+    **每次调用都现签**：`conversation_id` / `response_id` / `nonce` 与 uskey
+    是同一组，只对这一次请求有效。撞 4100404 时重调本函数即是「整组轮换」，
+    绝不要复用上一组（复用会继续撞同一个风控判定）。
+
+    `model` 必须是**请求体里的那个 model 原文** —— 它会同时进 bus_info 的
+    `model=` 段，拼错一个字符 uskey 的 `F(bus_info)` 就对不上。
     """
-    return {
+    ident = uskey.new_identity()
+    cid = str(conversation_id or ident["conversation_id"])
+    rid = str(response_id or ident["response_id"])
+    non = str(nonce or ident["nonce"])
+    sign = signer or uskey.sign
+    # 设备串按账号派生（同一账号恒定、不同账号互不相同）：共享 qimei
+    # 会把多账号打成同一个设备簇，触发 4100404（见 core/uskey.py）。
+    sig = sign(agent_tag=agent_tag, conversation_id=cid, response_id=rid,
+               scene=scene, model=model, nonce=non,
+               openid=str(acct.get("openid") or ""),
+               account_key=uskey.account_key_of(acct))
+    headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": CLIENT_UA,
@@ -324,17 +382,24 @@ def llm_headers(acct: dict, *, scene: str = "preload_summary",
         "Authorization": "Bearer placeholder",
         "Ual-Access-Openid": str(acct.get("openid") or ""),
         "Ual-Access-Access-Token": str(acct.get("access_token") or ""),
-        "Ual-Access-Login-Type": str(acct.get("login_type") or "1"),
+        "Ual-Access-Login-Type": LOGIN_TYPE_LLM,
         "Ual-Access-Guid": str(acct.get("guid") or ""),
         "Marvis-AgentTag": agent_tag,
-        "Marvis-Conversation-ID": conversation_id,
-        "Marvis-Response-ID": response_id,
+        "Marvis-Conversation-ID": cid,
+        "Marvis-Response-ID": rid,
         "Marvis-Scene": scene,
+        # 真客户端 200 抓包里这个头恒等于 Marvis-Response-ID（同一个 uuid），
+        # 缺了它上游判"请求没带请求 id"→ 4100404。
+        "Ual-Access-Requestid": rid,
         "Marvis-Protocol-Version": "1000",
         "X-Device-GUID": str(acct.get("guid") or ""),
-        "Ual-Access-MarvisExt": marvis_ext(acct),
+        "Ual-Access-MarvisExt": marvis_ext(
+            acct, uskey_value=sig["uskey"], qimei36=sig["qimei36"], nonce=non),
     }
-
+    # 真客户端这两者恒等；且同一个 rid 已经进了 bus_info 的 marvisResponseID，
+    # md5(bus_info) 一旦与 header 不同源，uskey 立刻失效。
+    assert headers["Ual-Access-Requestid"] == headers["Marvis-Response-ID"] == rid
+    return headers
 
 def ual_signature(query: str, timestamp: str, nonce: str) -> str:
     """`/v3/*` 的签名：`md5(query + timestamp + accessKey + nonce)`。"""
@@ -360,7 +425,7 @@ def business_headers(acct: dict, *, query: str, method: str = "GET") -> dict:
         "Ual-Access-Signature": ual_signature(query, timestamp, nonce),
         "Ual-Access-Guid": str(acct.get("guid") or ""),
         "Ual-Access-Access-Token": str(acct.get("access_token") or ""),
-        "Ual-Access-Login-Type": str(acct.get("login_type") or "1"),
+        "Ual-Access-Login-Type": login_type_header(acct),
         "Ual-Access-Openid": str(acct.get("openid") or ""),
     }
 

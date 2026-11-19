@@ -173,19 +173,32 @@ def _fail(exc: client.UpstreamError) -> JSONResponse:
     message = exc.message
     headers: dict[str, str] = {}
     if exc.kind == "risk_control":
-        # 4100404 是**出口 IP 级**风控：不是 Key 的问题、不是账号的问题，
-        # 也不是这条请求的内容有问题。原样透 403 会被客户端渲染成「Key 无效」
-        # 或「请求非法」，用户去翻一个根本没问题的 Key —— 换成 503 +
-        # Retry-After 才是「稍后再试」的可重试语义，与账号登录态失效同一处理。
+        # 4100404「请求被风控拦截」：**不是** Key 的问题，也**不是**账号/余额的问题。
+        # 原样透 403 会被客户端渲染成「Key 无效」或「请求非法」，用户去翻一个
+        # 根本没问题的 Key —— 换成 503 + Retry-After 才是「稍后再试」的可重试语义。
+        #
+        # 2026-11-18：文案必须区分两种状态，否则会对用户说假话：
+        #   · 已开平台退避（连续命中撞满阈值）→ 说「平台在退避」；
+        #   · 单次命中（平台没退避）→ 只能说「这一条请求被拦」，并指向真因：
+        #     请求内容里的 system 提示词撞了上游内容黑名单（见
+        #     _TENCENT_FINGERPRINT_RULES），改 Key / 换账号都不会变。
         status = 503
-        message = (
-            "Marvis 出口 IP 被上游风控拦截（4100404）：这是**出口 IP** 的问题，"
-            "与你的 API Key、账号余额、请求内容都无关，重试或换 Key 都不会改变"
-            "结果。网关已进入平台级退避（不再打上游），请在 Retry-After 之后"
-            "重试；长期修复需要给 Marvis 配一个干净出口 IP"
-            "（MIRAIHUB_MARVIS_PROXY）。原始信息：%s" % message)
-        retry_after = int(risk_backoff_remaining()) or RISK_BACKOFF_DEFAULT_SECONDS
-        headers["Retry-After"] = str(max(1, retry_after))
+        remaining_backoff = risk_backoff_remaining()
+        if remaining_backoff > 0:
+            message = (
+                "Marvis 上游风控（4100404）：平台连续命中 %d 次后进入退避，"
+                "约 %d 秒后自动恢复。这与你的 API Key、账号余额都无关，"
+                "不需要换 Key。原始信息：%s"
+                % (risk_hits(), int(remaining_backoff) + 1, message))
+            headers["Retry-After"] = str(max(1, int(remaining_backoff) + 1))
+        else:
+            message = (
+                "Marvis 上游内容风控（4100404）：**这一条请求**被拦（连续命中 "
+                "%d/%d 次，未触发平台退避）。与你的 API Key、账号余额都无关，"
+                "换 Key / 换账号都不会改变结果 —— 触发源通常是 system 提示词里的"
+                "固定开场白撞了上游内容黑名单，需要在网关侧补指纹规则改写。"
+                "原始信息：%s" % (risk_hits(), _risk_backoff_threshold(), message))
+            headers["Retry-After"] = "1"
     if status == 401 or exc.kind == "auth" or code == "credential_expired":
         status = 503
         if "重新扫码" not in message and "授权登录" not in message:
@@ -208,26 +221,43 @@ def _fail(exc: client.UpstreamError) -> JSONResponse:
 #: messages[0]。上游对单条消息体积有自己的上限，超了只回一个看不出原因的
 #: 参数错误，于是每次都要走完「选号 → 建连 → 4xx → 换号」才失败，白占上游配额。
 #:
-#: 阈值取 4MB：正常大对话有 3.7MB 的成功先例（270 条消息 / sys 143K），
-#: 4MB 是安全值 —— 卡在「正常对话之上、11MB 之下」，不会误杀正常请求。
+#: （历史）阈值曾是 4MB：正常大对话有 3.7MB 的成功先例（270 条消息 / sys 143K），
+#: 但 4MB 对长对话太紧，见下方 2026-11-18 的调整。
+#: 2026-11-18 用户反馈：大量长对话被 4MB 挡住（线上报错约 6.5MB）。默认值提到
+#: 256MB —— 已远超任何真实对话，实际上等于「不设限」，但仍保留一个兜底，
+#: 防止单个请求把进程内存打爆。
+#:
+#: 环境变量 `MIRAIHUB_MARVIS_MAX_BODY_BYTES` 的语义：
+#:   * 未设置 / 非法值 → 用 `DEFAULT_MAX_BODY_BYTES`（256 MiB）
+#:   * 正数           → 用该值（临时调小）
+#:   * **0 或负数**   → 完全关闭体积检查（不限制）
 MAX_BODY_ENV = "MIRAIHUB_MARVIS_MAX_BODY_BYTES"
-MAX_BODY_DEFAULT_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_BODY_BYTES = 256 * 1024 * 1024   # 256 MiB：给长对话留足空间
+#: 旧名字保留，避免外部脚本/历史代码引用时炸掉。
+MAX_BODY_DEFAULT_BYTES = DEFAULT_MAX_BODY_BYTES
 
 
 def _max_body_bytes() -> int:
-    """单次请求体的上限（字节）。未设置 / 非法 / 非正值退回 4MB。"""
+    """单次请求体的上限（字节）。
+
+    返回值 **<= 0 表示不限制**（`MIRAIHUB_MARVIS_MAX_BODY_BYTES=0` 或负数）。
+    未设置 / 非法值退回 `DEFAULT_MAX_BODY_BYTES`（256 MiB）。
+    """
     raw = str(os.environ.get(MAX_BODY_ENV) or "").strip()
     if not raw:
-        return MAX_BODY_DEFAULT_BYTES
+        return DEFAULT_MAX_BODY_BYTES
     try:
         value = int(float(raw))
     except (TypeError, ValueError):
-        return MAX_BODY_DEFAULT_BYTES
-    return value if value > 0 else MAX_BODY_DEFAULT_BYTES
+        return DEFAULT_MAX_BODY_BYTES
+    return value
 
 
 def _too_large(size: int, limit: int) -> JSONResponse:
-    """413：把「单条消息太大」这件事说清楚，别让它伪装成模型 / 账号问题。"""
+    """413：说清这是**本网关**的体积兜底。
+
+    不再教用户「自己去拆消息」—— 用户要的是能发，解法是调上限或关掉检查。
+    """
     logger.warning(
         "Marvis 请求体过大已本地拒绝 bytes=%d limit=%d（未打上游）",
         size, limit)
@@ -236,10 +266,11 @@ def _too_large(size: int, limit: int) -> JSONResponse:
             "type": "invalid_request_error",
             "code": "body_too_large",
             "message": (
-                "请求体过大（约 %.1f MB，上限 %.1f MB）：**单条消息**太大，"
-                "不是模型问题，也不是账号 / 额度问题（上游根本没被调用）。"
-                "请把这条超长消息拆成几条，或先裁剪其中的长文本 / 附件再发送。"
-                "上限可用环境变量 %s 调整。"
+                "请求体过大（约 %.1f MB，当前网关上限 %.1f MB）。"
+                "这是本网关的体积兜底，不是模型 / 账号 / 额度问题"
+                "（上游根本没被调用）。"
+                "如需发送更大的请求，把环境变量 %s 设为更大的值，"
+                "或设为 0 完全关闭该检查。"
                 % (size / 1048576.0, limit / 1048576.0, MAX_BODY_ENV)),
         }},
         status_code=413)
@@ -248,10 +279,13 @@ def _too_large(size: int, limit: int) -> JSONResponse:
 async def _reject_oversized(request: Request):
     """体积检查：超限返回 413 响应，否则返回 None。
 
-    先看 `Content-Length`（不读 body，零成本）；缺这个头时才把 body 读出来量
-    （Starlette 会缓存已读的 body，后续 `request.json()` 不会重复读流）。
+    上限 <= 0（`MIRAIHUB_MARVIS_MAX_BODY_BYTES=0` 或负数）表示**关闭检查**，
+    直接放行。先看 `Content-Length`（不读 body，零成本）；缺这个头时才把 body
+    读出来量（Starlette 会缓存已读的 body，后续 `request.json()` 不会重复读流）。
     """
     limit = _max_body_bytes()
+    if limit <= 0:      # 0 / 负数 = 不限制
+        return None
     declared = request.headers.get("content-length")
     if declared:
         try:
@@ -479,12 +513,23 @@ _TENCENT_FINGERPRINT_RULES = (
     (re.compile(re.escape("To give feedback, users should report the issue at "
                           "https://github.com/anthropics/claude-code/issues"), re.I),
      "To give feedback, users should report the issue at the project issue tracker"),
-    # 4. DSH 身份首句（**行首锚定**；本条就是 4100406 的触发串）。
-    #    用插件登记的 findRegex：容忍空白归一（\s+）以及 `an AI agent` /
-    #    `an AI coding agent`、`powered by` / `powered by the` 等形态漂移。
+    # 4. DSH 身份首句（位置无关；本条就是 4100406 的触发串）。
+    #    2026-11-18：DSH 把品牌名从 `DeepSeek Harness` 改成 `DeepSeekRuntime`，
+    #    旧正则只认 Harness，真机上**空跑**（规则在表里、日志 rules_hit 恒 0、
+    #    上游照旧 403/4100406）。这里合并两种品牌名，`\s*` 容忍有无空格。
+    #    ⚠ 改写**不能**保留 `You are an AI ...` 这个开头：2026-11-18 实测两次
+    #    都 403/4100406（各 3 次尝试全 403）——
+    #      · `You are an AI agent powered by a large language model`（只换品牌）
+    #      · `You are an AI coding assistant, powered by a large language model`
+    #    ⇒ 黑名单覆盖的是 **`You are an AI` 前缀**，不是品牌词，也不只是
+    #    `AI agent powered by`。最终把 `capable` 插在 `AI` 前：
+    #    `You are a capable AI coding assistant, ...` —— 前缀被真实文本改动破坏，
+    #    语义仍是「由大模型驱动的、能力出众的 AI 编码助手」。
+    #    仍容忍空白归一（\s+）以及 `an AI coding agent`、`powered by` /
+    #    `powered by the` 等形态漂移。
     (re.compile(r"You\s+are\s+an?\s+AI\s+(?:coding\s+)?agent\s*,?\s*powered\s+by\s+"
-                r"(?:the\s+)?DeepSeek\s+Harness", re.I),
-     "You are an AI coding assistant, powered by a large language model"),
+                 r"(?:the\s+)?DeepSeek\s*(?:Harness|Runtime)", re.I),
+     "You are a capable AI coding assistant, powered by a large language model"),
     # 5. DSH Web 运行面的开头两句。位置无关。
     #    触发串**跨句边界**（前半句、后半句各自都放行），find 必须是前两句的
     #    并集；砍半 = 静默空跑。改写只去掉品牌串，其余逐字不动。
@@ -523,6 +568,28 @@ _TENCENT_FINGERPRINT_RULES = (
     #    文本改动；也不能把首句删掉（那会丢掉「只输出建议、不要别的内容」的约束）。
     (re.compile(r"^\s*You\s+are\s+the\s+follow-up\s+suggestion", re.I),
      "You are a follow-up suggestion"),
+    # 9-13. 上游 2026-11-18 新增的**通用开场白**黑名单（真机 23 次对照：
+    #    同一 Key / 模型下，不带 system 12 次全 200，带 system 12 次全 403；
+    #    长段自定义提示词 200 ⇒ 命中的是这些固定开头，不是长度）。
+    #    只把 `helpful` 换成 `capable` / 给 `AI assistant` 补 `capable`，
+    #    **不删句子**：这些开场白后面常跟同一条身份约束，删了会丢语义。
+    #    ⚠ 顺序：`helpful AI assistant` 必须排在 `helpful assistant` 前面。
+    #    两条正则的 `helpful` 与 `assistant` 之间分别是 `AI\s+` 与直接相接，
+    #    本不会互相吃掉；按「具体 → 泛化」排是防止以后有人把 `(?:AI\s+)?`
+    #    合进来时，前半被改成 `capable` 后又被后半二次改写。
+    (re.compile(r"You\s+are\s+a\s+helpful\s+AI\s+assistant", re.I),
+     "You are a capable AI assistant"),
+    (re.compile(r"You\s+are\s+a\s+helpful\s+assistant", re.I),
+     "You are a capable assistant"),
+    # `an AI assistant` → `a capable AI assistant`：替换文本里的冠词必须是
+    # `a`，否则会留下 `an capable`。句末句点不在匹配内，原样保留。
+    (re.compile(r"You\s+are\s+an?\s+AI\s+assistant", re.I),
+     "You are a capable AI assistant"),
+    (re.compile(r"You\s+are\s+a\s+coding\s+assistant", re.I),
+     "You are a capable coding assistant"),
+    # 中文开场白。句末标点（`。` / `！` / 无标点）不在匹配内，原样保留。
+    (re.compile(r"你是乐于助人的助手", re.I),
+     "你是一位能力出众的助手"),
 )
 
 
@@ -584,15 +651,26 @@ def _prepare_body(body: dict, slot: str) -> dict:
     · **system 正文过一遍腾讯内容风控指纹改写**（`4100406` 的修法，表见上）。
       `/v1/messages` 与 `/v1/responses` 都经 `_run_normalized` → `chat_completions`
       落到这里，所以只改这一处就覆盖三个入口。
+       系统提示有两种承载形态：`messages` 里 `role=system` 的消息，以及
+       Anthropic 风格 / 部分客户端的**顶层 `system` 字段** —— 两种都要洗。
     """
     out = dict(body)
     out["model"] = slot
+    hits = 0
     messages = out.get("messages")
     if isinstance(messages, list):
         out["messages"], hits = _sanitize_messages(messages)
-        if hits:
-            # 只记命中条数，**不记原文**：system 里可能带用户的 prompt / 路径 / 密钥。
-            logger.info("Marvis 内容风控指纹改写 | rules_hit=%d", hits)
+    # 顶层 `system` 字段不经过 `messages`，2026-11-18 之前这里**只洗消息**，
+    # 同一句触发串放进顶层字段就整条绕过规则表（latent 漏改路径）。
+    system = out.get("system")
+    if isinstance(system, str):
+        rewritten, n = rewrite_tencent_fingerprints(system)
+        if n:
+            out["system"] = rewritten
+            hits += n
+    if hits:
+        # 只记命中条数，**不记原文**：system 里可能带用户的 prompt / 路径 / 密钥。
+        logger.info("Marvis 内容风控指纹改写 | rules_hit=%d", hits)
     if out.get("stream"):
         opts = dict(out.get("stream_options") or {})
         opts["include_usage"] = True
@@ -642,47 +720,84 @@ SAME_ACCOUNT_RETRY_JITTER = 0.3
 # ---------------------------------------------------------------------------
 # 风控（4100404）= **平台级**退避，不是账号级冷却（2026-11-17）
 # ---------------------------------------------------------------------------
-#: 账号级冷却秒数 —— 只有「这个号自己坏了」才配。
+#: 账号级冷却秒数 —— 这个号自己坏了才配。
 #:
 #: auth（4100403 登录态过期）：600 秒，期间不选这个号。
 COOL_SECONDS_AUTH = 600
-#: 需要给**账号**打冷却（cool_until）的 kind。
+#: 风控（4100404）的**单号**冷却秒数（2026-11-18 起生效，默认 300）。
 #:
-#: ⚠ risk_control **故意不在**这里 —— 判据见 _cool_seconds 的 docstring。
-COOL_KINDS = frozenset({"auth"})
+#: 与 auth 的区别：4100404 不是这个号「坏了」，而是它刚撞了设备簇 / 出口 IP
+#: 级风控。冷却它的目的是**别再往同一个号上怼** —— 重试与并发会把 4100404
+#: 推成 4100403（登录态被打死，要重新扫码），这才是不可逆的损失。
+COOL_SECONDS_RISK = client.RISK_ACCOUNT_COOLDOWN_SECONDS
+#: 需要给**账号**打冷却（cool_until）的 kind。
+COOL_KINDS = frozenset({"auth", "risk_control"})
 
 
-def _cool_seconds(kind: str) -> int:
+def _cool_seconds(kind: str, exc=None) -> int:
     """按失败类型决定**账号级**冷却秒数；0 = 不给这个号打冷却。
 
-    ## 为什么 risk_control 必须是 0（2026-11-17 线上死循环的根因）
+    ## 2026-11-18：risk_control 从 0 改成「单号 300 秒」
 
-    4100404「请求被风控拦截」是**出口 IP 级**的风控，不是账号级。真机证据：
+    上一版把 risk_control 的账号冷却设成 0，理由是 2026-11-17 的
+    503 accounts_cooling 死循环。复盘那次的因果链：**自放大的不是冷却本身，
+    而是「冷却 + 立刻换号重放同一份 body」这一对** ——
 
-      · 3 个号的 guid / openid 全不同，同一秒被拦；
-      · 2KB 的 ping 请求同样被拦（与请求内容、模型、账号都无关）；
-      · 4100403（凭证失效）零次、4100406（指纹非法）零次
-        ⇒ 凭证与设备指纹都是好的；
-      · 唯一共享因子是**出口 IP**（3.105.136.123，AWS 悉尼）。
+      1. 撞 4100404 → 给当前号 600 秒冷却；
+      2. _attempt 换号，把**同一份 body** 在 1 秒内重放给另外 2 个号
+         → 3 个号一起吃冷却 → 池子空 → 503 accounts_cooling。
 
-    把 IP 级的错误按账号级处理会**自放大**成整站不可用：
+    所以这一版改的是**重放**，不是冷却：
 
-      1. 请求撞 4100404 → 给当前号打 600 秒冷却；
-      2. _attempt 换号重试，把**同一份 body** 在 1 秒内重放给另外 2 个号
-         → 3 个号全部吃 600 秒冷却；shared.select_account 的
-         cool_until <= now 过滤随即返回空 → 503 accounts_cooling；
-      3. 600 秒到期 → 下一个请求再次 4100404 → 重新冷却 → **无限循环**
-         （实测 10:05:08 UTC 到期、10:05:46 又被续到 10:15:46）。
+      · client 层**不再重试**（CHAT_ATTEMPTS = 1，见 core/client.py）；
+      · gateway 撞 risk_control 仍然**不换号、不 exclude、直接抛**
+        （见 _attempt 里 risk_control 分支），这份 body 不会被重放给第二个号；
+      · 冷却只落在**撞墙的那一个号**上，300 秒后才轮到它。
 
-    ⇒ 风控只做**平台级退避**（note_risk_control），一个号都不冷却：
-    换掉出口 IP 之后号池原样可用，不需要人工解冻。
+    效果：一个请求最多让**一个号**歇 300 秒。要打满整个池子得 8 个请求分别
+    撞 8 次 —— 而连续命中 5 次就已经触发平台级退避（note_risk_control），
+    第 6 个请求连上游都不会碰。冷却在这里是**刹车**，不是放大器。
+
+    真机时间线（2026-11-18，acc=192）：
+
+      18:19:11  4100404（首次命中）
+      18:19:13  4100404 ← client 层整组轮换重试，同一份 body 又打一遍
+      18:23     **401 4100403** ← 同一个 token 变成登录态过期（不可逆）
+
+    ⇒ 「不重试 + 单号冷却」是这两次事故的最小公倍数解法。
     """
-    return COOL_SECONDS_AUTH if kind in COOL_KINDS else 0
+    if kind in COOL_KINDS:
+        if kind == "risk_control":
+            requested = int(getattr(exc, "cool_seconds", 0) or 0)
+            return requested or COOL_SECONDS_RISK
+        return COOL_SECONDS_AUTH
+    return 0
 
 
 #: 平台级风控退避的默认窗口（秒），可用 MIRAIHUB_MARVIS_RISK_BACKOFF_SECONDS 覆盖。
+#:
+#: ⚠️ 2026-11-18 17:38 全站 503 事故：60 → 10。
+#: `4100404 请求被风控拦截` 命中的是**这一条请求的内容**（腾讯内容风控
+#: 对 system 正文做字面量黑名单），不是「整个出口 IP 失效」。用一个 60 秒的
+#: 平台级窗口去处置一次内容命中，等于把**一条坏提示词**放大成**全站不可用**：
+#: 实测 20 分钟内 59 次 503（退避期内直接拒），而上游真正被拦的只有 8 次。
+#: 10 秒是「保护上游不被连续轰炸」与「别把偶发放大成故障」之间的折中。
 RISK_BACKOFF_ENV = "MIRAIHUB_MARVIS_RISK_BACKOFF_SECONDS"
-RISK_BACKOFF_DEFAULT_SECONDS = 60
+RISK_BACKOFF_DEFAULT_SECONDS = 10
+
+#: **连续**命中多少次 4100404 才允许触发平台级退避（默认 5）。
+#:
+#: 阈值 = 1（旧行为）的问题：一次内容命中就把平台锁死。真实形态是「零散偶发」
+#: 与「成串」两种，只有成串才说明出口 IP 整段被风控、退避才有意义。
+#: 可用 MIRAIHUB_MARVIS_RISK_BACKOFF_THRESHOLD 覆盖。
+RISK_BACKOFF_THRESHOLD_ENV = "MIRAIHUB_MARVIS_RISK_BACKOFF_THRESHOLD"
+RISK_BACKOFF_THRESHOLD = 5
+
+#: 「连续」的时间窗（秒）：命中计数只统计最近这么久内的 4100404。
+#:
+#: 没有这个窗口的话，一天里零散撞 5 次也会把平台锁一次 —— 而「连续」的语义
+#: 本来就是「短时间成串」。窗口内没有新命中，计数自然过期归零。
+RISK_HIT_WINDOW_SECONDS = 120
 
 #: 平台级风控状态：until = 退避截止的 monotonic 时间戳，at = 最近一次命中。
 #:
@@ -698,6 +813,18 @@ _RISK_LOCK = threading.Lock()
 _RISK_STATE: dict[str, float] = {"at": 0.0, "until": 0.0, "hits": 0.0}
 
 
+def _risk_backoff_threshold() -> int:
+    """连续命中多少次才触发平台退避。未设置 / 非法 / 非正值一律退回默认 5。"""
+    raw = str(os.environ.get(RISK_BACKOFF_THRESHOLD_ENV) or "").strip()
+    if not raw:
+        return RISK_BACKOFF_THRESHOLD
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return RISK_BACKOFF_THRESHOLD
+    return value if value > 0 else RISK_BACKOFF_THRESHOLD
+
+
 def _risk_backoff_seconds() -> int:
     """退避窗口长度（秒）。未设置 / 非法 / 非正值一律退回默认 60。"""
     raw = str(os.environ.get(RISK_BACKOFF_ENV) or "").strip()
@@ -711,17 +838,55 @@ def _risk_backoff_seconds() -> int:
 
 
 def note_risk_control() -> float:
-    """记一次风控命中，返回本次退避的剩余秒数。**绝不抛**。"""
+    """记一次 4100404 命中，返回**当前**平台退避剩余秒数（0 = 没有触发退避）。
+
+    **绝不抛**，绝不主动锁平台。语义（2026-11-18 17:38 事故后重写）：
+
+      1. 单次 4100404 **不触发**平台退避 —— 只让这一条请求失败、原样报给客户端；
+      2. 最近 RISK_HIT_WINDOW_SECONDS 窗口内**连续**撞满
+         _risk_backoff_threshold() 次，才认为「出口 IP 成段被风控」，此时
+         才开一个 _risk_backoff_seconds() 的窗口；
+      3. 任何一次上游成功都会 clear_risk_hits() 把连击清零 ——「连续」是
+         真连续，不是累计。
+
+    ## 为什么单次不能锁平台（旧行为 = 全站 503）
+
+    4100404 的触发源里至少有一条是**请求内容**（system 正文里被拉黑的开场白 /
+    身份句，见 _TENCENT_FINGERPRINT_RULES）。同一条坏提示词每轮都会重发，旧实现
+    于是「命中 → 锁 60 秒 → 到期 → 再命中」，而这 60 秒里**所有**请求连上游都
+    打不到，直接 503：一条提示词拖垮整站（17:38 实测 20 分钟 59 次 503）。
+    """
     seconds = _risk_backoff_seconds()
+    threshold = _risk_backoff_threshold()
     now = time.monotonic()
     with _RISK_LOCK:
+        # 窗口外的旧命中不算「连续」：计数过期归零，再把这一次重新数进来。
+        if now - float(_RISK_STATE.get("at") or 0.0) > RISK_HIT_WINDOW_SECONDS:
+            _RISK_STATE["hits"] = 0.0
+        _RISK_STATE["hits"] = float(_RISK_STATE.get("hits") or 0.0) + 1.0
+        _RISK_STATE["at"] = now
+        if _RISK_STATE["hits"] < threshold:
+            return 0.0
         until = now + seconds
         if _RISK_STATE["until"] < until:
             _RISK_STATE["until"] = until
-        _RISK_STATE["at"] = now
-        _RISK_STATE["hits"] = float(_RISK_STATE.get("hits") or 0.0) + 1.0
-        remaining = _RISK_STATE["until"] - now
-    return remaining
+        return _RISK_STATE["until"] - now
+
+
+def risk_hits() -> int:
+    """最近窗口内的连续 4100404 次数（窗口过期返回 0；只读，绝不抛）。"""
+    now = time.monotonic()
+    with _RISK_LOCK:
+        if now - float(_RISK_STATE.get("at") or 0.0) > RISK_HIT_WINDOW_SECONDS:
+            return 0
+        return int(_RISK_STATE.get("hits") or 0)
+
+
+def clear_risk_hits() -> None:
+    """上游成功一次 ⇒ 连击计数归零（**不动**已有的退避窗口）。"""
+    with _RISK_LOCK:
+        _RISK_STATE["hits"] = 0.0
+        _RISK_STATE["at"] = 0.0
 
 
 def risk_backoff_remaining() -> float:
@@ -1017,9 +1182,10 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     """
     # 平台级风控退避：窗口内再有请求**直接 503**，一个字节都不打上游。
     #
-    # 这是「出口 IP 被上游风控」时唯一正确的处置：继续打上游只会让风控评分
-    # 更差，并把本来能成的请求一起拖成 403。注意它**不动任何账号**
-    # （不打 cool_until、不 exclude），所以退避一过号池原样可用。
+    # ⚠️ 2026-11-18：这里**只在连续命中撞满阈值后**才会被打开（见
+    # note_risk_control）—— 单次 4100404 不再进这个窗口。旧实现阈值 = 1，
+    # 一条坏提示词就把整站锁 60 秒。
+    # 注意它**不动任何账号**（不打 cool_until、不 exclude），退避一过号池原样可用。
     remaining = risk_backoff_remaining()
     if remaining > 0:
         logger.warning(
@@ -1027,9 +1193,9 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             remaining, str(body.get("model") or "") or "-")
         raise shared.PlatformRejected(
             503,
-            "Marvis 出口 IP 正在被上游风控（4100404），已进入平台级退避："
+            "Marvis 连续 %d 次命中上游风控（4100404），已进入平台级退避："
             "约 %d 秒后自动恢复。这与你的 API Key、账号余额都无关，"
-            "不需要换 Key 或重试。" % (int(remaining) + 1),
+            "不需要换 Key，等窗口过去即可。" % (risk_hits(), int(remaining) + 1),
             kind="server_error", code="risk_control_backoff",
             headers={"Retry-After": str(int(remaining) + 1)})
     model = str(body.get("model") or "")
@@ -1057,6 +1223,16 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             model=model, exclude_ids=exclude, min_balance=0)
         if account is None:
             break
+        # 本地风控冷却（进程内登记，见 core/client.py）：这个号刚撞过 4100404
+        # 就跳过。DB 里的 cool_until 由 note_failure 负责；这一道闸管的是
+        # 「同进程里先一步拿到租约的并发请求」—— 它们手上的租约早于那次写库。
+        risk_left = client.account_risk_cooldown_remaining(int(account.id or 0))
+        if risk_left > 0:
+            logger.info(
+                "Marvis 跳过风控冷却中的号 acc=%s（剩余 %.0fs）",
+                int(account.id or 0), risk_left)
+            exclude.add(account.id)
+            continue
         if switch_from:
             # 真换到号了才打这条 —— 日志里能直接数出「换号重试」触发了几次。
             logger.info(
@@ -1077,6 +1253,9 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             if not stream:
                 shared.note_success(account)
                 shared.release(account)
+            # 成功一次就把 4100404 的「连续」计数清零：阈值判的是**连续**成串，
+            # 不是历史累计（否则一天里零散撞 5 次也会把平台锁一次）。
+            clear_risk_hits()
             logger.info(
                 "Marvis 成功画像 acc=%s model=%s bytes=%d msgs=%d tools=%d "
                 "sys_chars=%d elapsed_ms=%d",
@@ -1111,10 +1290,11 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                 detail=exc.detail or exc.message, status=exc.status,
                 model=model, public_platform=PUBLIC,
                 code=str(exc.code or ""),
-                # 账号级冷却：只有 auth（这个号自己坏了）才配。
-                # risk_control 是**出口 IP 级**风控 —— 给号打冷却等于把好号
-                # 一起打挂，而且冷却到期立刻复发，见 _cool_seconds 的 docstring。
-                cool_seconds=_cool_seconds(exc.kind),
+                # 账号级冷却：auth（这个号自己坏了）600 秒；
+                # risk_control（2026-11-18 起）只冷却**撞墙的那一个号** 300 秒 ——
+                # 因为 client 层已经不重试、这里也不换号，冷却不再自放大，
+                # 见 _cool_seconds 的 docstring。
+                cool_seconds=_cool_seconds(exc.kind, exc),
                 # 额度耗尽走**降级窗口**（degrade_until = QUOTA_DEGRADE_SECONDS），
                 # 而不是把余额写成 0：余额是事实数据，写 0 会让这个号永久出池。
                 zero_balance=(exc.kind == "quota_exceeded"))
@@ -1125,11 +1305,37 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             # 一起吃冷却（2026-11-17 死循环的第二步）。
             # 正确处置：整平台退避，等出口 IP 换掉 / 风控自然过期。
             if exc.kind == "risk_control":
+                if getattr(exc, "local", False):
+                    # 本地冷却拦下的请求：一个字节都没打上游，**不算**命中风控。
+                    # 记进 risk_hits 会让「连自己拦住的请求」把平台推进退避
+                    # （5 次就 503），那是纯自伤。
+                    logger.info(
+                        "Marvis 本地风控冷却拦截 acc=%s（未打上游，剩余 %.0fs）",
+                        int(account.id or 0),
+                        client.account_risk_cooldown_remaining(
+                            int(account.id or 0)))
+                    raise exc
+                # 2026-11-18：单次 4100404 **不锁平台**，只让本次请求失败；
+                # 但「撞墙的那个号」已经由上面的 note_failure 写了 300 秒
+                # cool_until（COOL_SECONDS_RISK），client 层也不再重试
+                # （client.CHAT_ATTEMPTS = 1）。
+                # 这里仍然**不 exclude、不换号**：把同一份 body 重放给另一个号
+                # 是风控引擎最敏感的特征，也正是 2026-11-17 死循环的第二步。
+                # 只有**连续**撞满阈值才开平台窗口，见 note_risk_control。
                 backoff = note_risk_control()
-                logger.warning(
-                    "Marvis 风控命中（code=%s acc=%s）：不换号、不重试，"
-                    "平台级退避 %.0fs",
-                    exc.code or "-", int(account.id or 0), backoff)
+                hits = risk_hits()
+                threshold = _risk_backoff_threshold()
+                if backoff > 0:
+                    logger.warning(
+                        "Marvis 风控连续命中 %d/%d 次（code=%s acc=%s）："
+                        "进入平台级退避 %.0fs",
+                        hits, threshold, exc.code or "-",
+                        int(account.id or 0), backoff)
+                else:
+                    logger.warning(
+                        "Marvis 内容风控命中（code=%s acc=%s）：单次不触发平台"
+                        "退避，仅本次请求失败（连续 %d/%d 次）",
+                        exc.code or "-", int(account.id or 0), hits, threshold)
                 raise exc
             last_error = exc
             exclude.add(account.id)
@@ -1184,6 +1390,31 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                  "（access_token 由上游按天轮换，过期后只能重登）",
             kind="server_error", code="credential_expired",
             headers={"Retry-After": "5"})
+    # **额度耗尽 ≠ 冷却**（2026-11-18 事故的直接放大器）。
+    #
+    # 上游 3000001 是**账号级**总额度用尽：三个号的日配额（各 10,000,000
+    # token）同时在 16:18 打满，凭证、登录态、风控全部正常，只有钱包是 0。
+    # 选号用的是 `min_balance=0`（见 `_attempt`），余额 0 的号**全部**被滤掉
+    # ⇒ 一个号都选不到，走到这里被报成 503「都在冷却或排队中，请稍后重试」。
+    # 那句话把用户送去「等冷却到期」，而冷却永远不会到期 —— 真正要等的是
+    # **上游每日 00:00(+08) 的配额重置**，长则十几小时。两种结局完全不同，
+    # 必须分开报：一个是「几分钟后就好」，一个是「等重置或加号」。
+    #
+    # 判据只看 `alive`：active 且余额为 0 的号算「没配额」。NULL（从没同步过
+    # 余额）不计入 —— 未知不等于耗尽，那种情况仍按冷却重试。
+    zero = [r for r in alive
+            if getattr(r, "balance_remain", None) is not None
+            and int(getattr(r, "balance_remain", 0) or 0) <= 0]
+    if alive and len(zero) == len(alive):
+        logger.warning(
+            "Marvis 额度已耗尽 realm=%s model=%s active=%d 余额全为 0"
+            "（上游 3000001：等待 00:00+08 配额重置）",
+            realm, model or "-", len(alive))
+        raise shared.PlatformRejected(
+            402, "Marvis 账号额度已耗尽（上游 3000001 用户名下token不足），"
+                 "上游每日 00:00(+08) 各号重置 10,000,000 token，请等待重置或加号",
+            kind="quota_exceeded", code="quota_exhausted",
+            headers={"Retry-After": "3600"})
     if alive:
         raise shared.PlatformRejected(
             503, "Marvis 账号都在冷却或排队中，请稍后重试",
