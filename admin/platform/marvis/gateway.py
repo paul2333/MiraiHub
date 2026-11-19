@@ -336,11 +336,13 @@ def _error_payload(exc: client.UpstreamError,
         if _is_context_overflow(exc):
             code = "context_length_exceeded"
             err_type = "context_too_long"
-            # 上游原文带「已自动重发 N 次」，本项目未移植那 4 次原样重发
-            # 循环（b9 只并入参数降级），所以这里不能说假话，去掉重发次数。
+            # 重发循环已在 _attempt 里落地（_MAX_CTX_RETRIES=4，原样重发靠
+            # main-auto 重新路由），所以这里可以如实说重发了几次。
             message = (
                 "这轮对话的上下文太长，Marvis 上游装不下（与你的 API Key、"
-                "账号额度都无关）。请新建一个对话继续，或让客户端清理历史后重试。")
+                "账号额度都无关）。已自动重发 %d 次仍未通过，说明不是"
+                "临时路由问题。请新建一个对话继续，或让客户端清理历史后重试。"
+                % _MAX_CTX_RETRIES)
             if upstream:
                 message = "%s；上游原文：%s" % (message, upstream[:200])
         elif upstream:
