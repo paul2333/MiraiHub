@@ -16,6 +16,7 @@ import contextvars
 import threading
 import json
 import logging
+import os
 import re
 import time
 import urllib.error
@@ -309,13 +310,16 @@ def open_chat_stream(credential: dict, realm: str, body: dict, *,
     data = json.dumps(body, ensure_ascii=False).encode()
     # bus_info 的 `model=` 段必须是**请求体原文**（不是显示名、不是别名），
     # 所以从这里透传下去，别让 endpoints 用自己的默认值。
-    model = str((body or {}).get("model") or endpoints.EXT_MODEL)
+    # 上游 8aba19a 口径：**只认请求体里的 model 原文**，缺省就是空串 ——
+    # 不拿 endpoints.EXT_MODEL 去猜，否则 bus_info 的 model= 段与 body 不一致，
+    # 服务端复核 nonce 时直接判非法客户端（4100404）。
+    model = str(body.get("model") or "")
     for attempt in range(CHAT_ATTEMPTS):
         req = urllib.request.Request(url, data=data, method="POST")
         for key, value in endpoints.llm_headers(acct, model=model).items():
             req.add_header(str(key), str(value))
         try:
-            return _opener().open(req, timeout=STREAM_TIMEOUT)
+            resp = _opener().open(req, timeout=STREAM_TIMEOUT)
         except urllib.error.HTTPError as exc:
             payload = ""
             try:
@@ -342,6 +346,85 @@ def open_chat_stream(credential: dict, realm: str, body: dict, *,
             note_sentinel(realm, account_id, "network", detail=str(exc)[:200])
             raise UpstreamError("模型网关网络失败", status=0, kind="network",
                                 detail=str(exc)[:200]) from exc
+        # 200 但回 application/json：不是 SSE，是上游业务错误体（见下）。
+        return _reject_json_body(resp, body, realm, account_id)
+
+
+def _classify_json_body(payload: str) -> str:
+    """200 + application/json 的归类（上游 PR #55 / keepalive 测试口径）。
+
+    ⚠ 与 _classify() 故意不同：HTTP 200 说明传输层正常，这里只按业务码定性。
+    4100406 在 200+JSON 上是内容风控（content_block，不换号）；而在 403 上
+    仍按 _classify() 归 upstream_business（同号可重试，见
+    tests/test_marvis_platform.py 与 tests/test_marvis_risk_backoff.py）。
+    """
+    blob = str(payload or "")
+    low = blob.lower()
+    code = _biz_code_of(blob)
+    if code == "4100406" or "4100406" in low or "非法请求" in blob:
+        return "content_block"
+    if code == "4100404" or "4100404" in low or "risk" in low or "风控" in blob:
+        return "risk_control"
+    if (code == "4100403" or "4100403" in low
+            or "登录态过期" in blob or "未登录" in blob):
+        return "auth"
+    return "http_error"
+
+
+def _reject_json_body(resp, body: dict, realm: str, account_id: int):
+    """流式请求拿到 `200 + application/json` 时，把它当**业务错误体**处理。
+
+    ## 为什么必须有这一步（照 loomy 的同款事故补的，2026-11-18）
+
+    loomy 那边 2026-11-13 线上「对话发不出去」的根因就是这个形态：账号被
+    停用时不回 SSE，而是 `200 application/json` 回一坨业务错误体。客户端
+    按 `data:` 行解析，这一整行 JSON 既不以 `data:` 开头也没有 `choices`，
+    于是被**静默丢弃** —— 生成器直接结束，客户端只看到
+    `Stream ended without finish_reason`，用户侧就是「发不出去」，面板上还
+    记成一次成功（0 token）。
+
+    Marvis 有一模一样的形态：`4100403 登录态过期` / `4100404 风控` /
+    `4100406 内容风控` 这几个码在**模型网关**上通常回 4xx，但凭证刚过期、
+    号刚被限流的那一下会以 200 回一个 JSON 体。此时 `_iter_upstream` 会把
+    这个 JSON 原样当 SSE 转给客户端 —— `_scan_stream` 也认不出（它只看
+    `data:` 行），客户端解析不出任何帧，也是空回复。
+
+    识别出来之后走 `_attempt` 既有的「换号 / 冷却 / 文案」路径，用户能拿到
+    一句能照做的话，而不是一条空流。
+
+    ## 边界的保守程度（宁可不拦，不可误拦）
+
+    只在**三个条件同时成立**时才拦：
+
+      1. 请求体里 `stream` 为真（非流式请求回 JSON 是正常的，不能拦）；
+      2. `content-type` 明确含 `application/json`（空 / `text/plain` /
+         其它未知形态一律放行，交给上层按流读 —— 有些网关会混着发）；
+      3. 读得出内容。
+
+    命中后 `resp` 已经被读完并关闭，因此**必须抛**；不能让调用方再读它。
+    """
+    if not isinstance(body, dict) or not body.get("stream"):
+        return resp
+    try:
+        ctype = str(resp.headers.get("content-type") or "").lower()
+    except Exception:  # noqa: BLE001 - 拿不到头就当不是 JSON
+        return resp
+    if "application/json" not in ctype:
+        return resp
+    payload = ""
+    try:
+        payload = resp.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        pass
+    close_stream(resp)
+    kind = _classify_json_body(payload)
+    note_sentinel(realm, account_id, kind, code=kind, status=200, detail=payload)
+    detail = payload.strip()[:400] or "（空响应体）"
+    raise UpstreamError(
+        "模型网关没有返回 SSE 流，而是回了一段 JSON（上游业务错误）：%s" % detail,
+        status=502 if kind in ("http_error", "upstream_business") else 200,
+        code=kind, kind=kind, detail=payload)
+
 
 def close_stream(resp) -> None:
     """关掉 SSE 连接。**绝不抛**（已经在 finally 里）。"""
@@ -455,43 +538,56 @@ def _classify(status: int, text: str) -> str:
 
     ## 业务码不能吞（2026-11-15 线上误判的直接根因）
 
-    上游 403 的真实报文是 `{"code":4100406,"msg":"非法请求"}` —— **有业务码**。
-    旧实现只看 HTTP 状态，403 一律 `signature_invalid`，于是：
+    上游 403 的真实报文是 {"code":4100406,"msg":"非法请求"} —— **有业务码**。
+    旧实现只看 HTTP 状态，403 一律 signature_invalid，于是：
 
       · 上层按「签名错」处理（同号重试 / 换号），但
-        `/v1/chat/completions` **根本不签名**（core/endpoints.py:15-19），
+        /v1/chat/completions **根本不签名**（core/endpoints.py:15-19），
         换号不可能修好；
-      · `signature_invalid` 在 sentinel 里是 RISK 级（sentinel.py:174），
+      · signature_invalid 在 sentinel 里是 RISK 级（sentinel.py:174），
         一次瞬时 403 就能把一个好平台推进熔断；
       · 下游（DSH）把 403 渲染成「API key is invalid」，用户去翻 key，
         而真实原因是请求被上游业务层拒绝。
 
-    现在：解析业务码 —— 命中已知鉴权码才归 `auth`，其余一律
-    `upstream_business`（已在 SENTINEL_KINDS 里，按 throttle 记录，不熔断、
+    现在：解析业务码 —— 命中已知鉴权码才归 auth，其余一律
+    upstream_business（已在 SENTINEL_KINDS 里，按 throttle 记录，不熔断、
     不冷却、不重试）。
 
     ⚠ 风控（4100404）与登录失效（401）仍必须分开：前者是**设备/IP** 的问题，
     换号没用还会把好号一起打挂；后者才是账号问题。
+
+    ## 本次合并的分工（两侧口径都要保住，别改回单边）
+
+      · 403 + 4100406 -> upstream_business（同号可重试一次），
+        见 tests/test_marvis_platform.py / test_marvis_risk_backoff.py；
+      · 200 + application/json 里的 4100406 才是内容风控 content_block，
+        由 _classify_json_body() 产出（上游 PR #55 / keepalive 测试口径）；
+      · signer_unavailable：签名器不可用（本端故障），网关据此 fail-closed、
+        不 note_failure —— 上游 8aba19a 新增，必须能从这里产出。
     """
     blob = str(text or "")
     low = blob.lower()
     code = _biz_code_of(blob)
+    # 签名器不可用：本端故障，与账号 / 风控无关，必须在 403 / risk 判定之前。
+    if (code == "signer_unavailable" or "signer_unavailable" in low
+            or "签名不可用" in blob or "beacon 未就绪" in blob):
+        return "signer_unavailable"
     if code == "4100404" or "4100404" in low or "risk" in low or "风控" in blob:
         return "risk_control"
-    # 额度耗尽必须在 `auth` 之前判：402 + 3000001 与凭证无关，
+    # 额度耗尽必须在 auth 之前判：402 + 3000001 与凭证无关，
     # 归错就会变成「永不隔离的号永远排第一，每次请求先白撞一次」。
     if code in BIZ_QUOTA_CODES:
         return "quota_exceeded"
     # 输入 + max_tokens 超预算：**必须在 auth / upstream_business 之前判**。
-    # 归成 upstream_business 的话，上层只会「不重试、不冷却、原样抛」，
-    # 客户端拿到的是一句看不出原因的「max input token error」，
-    # 也就永远走不到「把 max_tokens 降到 32768 再试一次」这条修法。
     if code in BIZ_MAX_INPUT_CODES:
         return "max_input_tokens"
-    # 上游内部错误：与账号无关，必须在 auth(401) 判定之前拦下 ——
-    # 否则一个 5100007 会被当成「这个号不行」，进而换号把整池打一遍。
+    # 上游内部错误：与账号无关，必须在 auth(401) 判定之前拦下。
     if code in BIZ_INTERNAL_CODES:
         return "upstream_internal"
+    # 登录态过期（4100403）：模型网关通常回 401，凭证刚过期时会 200+JSON。
+    if (code == "4100403" or "4100403" in low
+            or "登录态过期" in blob or "未登录" in blob):
+        return "auth"
     if status == 401:
         return "auth"
     if code:
