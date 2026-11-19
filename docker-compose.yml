@@ -14,6 +14,11 @@ services:
       - "${ADMIN_PORT:-8790}:8790"
     volumes:
       - admin_data:/data
+      # qimei 真值表 / 台账用单文件挂载进容器：以后改表不用 rebuild。
+      # 写入走 qimei_assign._dump_json 的「就地写同一 inode」分支
+      # （单文件挂载点上 rename 会 EBUSY），宿主与容器永远看到同一份。
+      - ./admin/platform/marvis/core/qimei_table.json:/app/admin/platform/marvis/core/qimei_table.json
+      - ./admin/platform/marvis/core/qimei_pool.json:/app/admin/platform/marvis/core/qimei_pool.json
     environment:
       ADMIN_HOST: 0.0.0.0
       ADMIN_PORT: 8790
@@ -27,10 +32,43 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env.docker}
       ADMIN_JWT_SECRET: ${ADMIN_JWT_SECRET:?Set ADMIN_JWT_SECRET in .env.docker}
       TZ: Asia/Shanghai
+      # 强制走 uskey 侧车（Wine + 真 qimei.dll + 真 beacon_napi）
+      MARVIS_USKEY_FORCE_SIDECAR: "0"
+      MARVIS_USKEY_SIDECAR: http://172.20.0.1:8791/uskey
+      # 侧车会按 bus_info 产 264 或 360 字节两种形态，两者上游都收；
+      # 376 只适用于本地 mint 的新模板，走侧车时必须放回 240。
+      MARVIS_USKEY_MIN_BYTES: "376"
+      # 上游对请求体大小有硬上限：实测 5.34 MB 能过、12.8 MB 直接
+      # 500 5100007 / 400 3000101。设 6 MB 让超限请求在网关就地 413，
+      # 不打上游、也不烧风控预算。要放宽改这个值即可。
+      # 容器里没有 Wine/netns：新号要生成真 qimei36 时打宿主生成服务
+      # （deploy/qimei-gen/qimei-gen.service，172.17.0.1:8792）。
+      QIMEI_GEN_URL: http://172.17.0.1:8792/qimei
+      QIMEI_GEN_TIMEOUT: "30"
+      MIRAIHUB_MARVIS_MAX_BODY_BYTES: "6291456"
+      # 流式请求的「真实状态码」宽限期（秒）—— 见 gateway._stream_status_grace()。
+      # 语义：流式请求先派发上游，且等这么久看能不能拿到最终状态；
+      #   · 窗口内失败 -> 还没写字节，回真实状态码（401/429/400…）；
+      #   · 超窗口 -> 先发 chatcmpl-keepalive 定住响应头，此后失败只能 200 + 错误帧。
+      # 取值依据（2026-11-19 本机实测，同 key / main-auto）：
+      #   · 坏 Key / 额度耗尽 / 参数错等「真快失败」: 21~27ms，1.5s 覆盖绰绰有余；
+      #   · developer 角色 400（4.0~5.0s）：角色归一化上线后（developer -> system）
+      #     这条慢失败路径已消失，不再需要为它留宽限；
+      #   · 内容触发风控 403: 43~57s，任何合理宽限都盖不住，只能靠错误帧里的
+      #     http_status 兜底（这条与 GRACE 取值无关）。
+      # 原值 6.0 把成功请求的首字节一起拖到 6s（实测上游出头部就有 3.6s 的慢样本），
+      # 1.5s = 真正快失败的 21ms 的 70 倍余量，同时把 TTFB 钉在 1.5s 以内。
+      MIRAIHUB_MARVIS_STREAM_STATUS_GRACE: "1.5"
     command: ["python3", "-m", "uvicorn", "admin.server:app", "--host", "0.0.0.0", "--port", "8790"]
     restart: unless-stopped
     init: true
-    stop_grace_period: 30s
+    # 停机预算：这是**部署停机时长**的主要来源。
+    # 实测 compose up -d 的重建缺口 = stop + start；本服务在真实负载下
+    # （并发 SSE 长连接）uvicorn 的 graceful shutdown 会等活跃请求收尾，
+    # 30s 全部吃满 -> 单次部署停机 32s（2026-11-19 13:30Z 实测）。
+    # 5s 只够收尾本地落库，超时的长连接交给新容器重连；
+    # 目标是把「停机」压到 10s 以内，20s 是硬上限。
+    stop_grace_period: 5s
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/api/app/version', timeout=3)"]
       interval: 30s

@@ -1,0 +1,22 @@
+[Unit]
+Description=MiraiHub qimei generator (Wine + netns)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/MiraiHub
+Environment=QIMEI_GEN_CMD=/opt/marvis-wine/gen_qimei_for_mac.sh
+Environment=QIMEI_GEN_TIMEOUT=30
+Environment=QIMEI_STATE_DIR=/home/admin/MiraiHub/admin/platform/marvis/core
+# 宿主没有 sqlalchemy，直接按文件路径跑；这个模块只依赖标准库。
+ExecStart=/usr/bin/python3 /home/admin/MiraiHub/admin/platform/marvis/core/qimei_assign.py --serve-generator --host 172.17.0.1 --port 8792
+Restart=always
+RestartSec=3
+# 生成脚本自己要 sudo ip/netns，不能加 NoNewPrivileges=yes。
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
