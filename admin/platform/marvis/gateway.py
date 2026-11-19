@@ -2469,6 +2469,58 @@ def _acquire(request, body: dict, realm: str, *, stream: bool):
 
 _STREAM_CHUNK = 65536
 
+#: SSE 帧分隔符：一个空行。一帧由若干字段行 + 一个空行收尾。
+_FRAME_SEP = b"\n\n"
+
+#: 攒到这么多字节还没见到空行就原样放行。
+#:
+#: 防守用：上游如果根本不是 SSE（或迟迟不发空行），缓冲会一直长，「按帧
+#: 对齐」就变成「攒到 EOF 才吐」—— 那比撕裂更糟。宁可失去对齐，也不能
+#: 把流卡死。
+_FRAME_MAX = 262144
+
+#: 一条 SSE 字段行的前缀（data / event / id / retry / 注释）。
+_SSE_FIELD_PREFIXES = (b"data:", b"event:", b"id:", b"retry:", b":")
+
+
+def _flush_tail(tail: bytes) -> bytes:
+    """给 EOF 前没等到空行的**半个帧**补上分隔符；非 SSE 尾巴原样返回。
+
+    ## 为什么必须补
+
+    上游最后一段常常是裸的 `data: [DONE]` —— **连一个换行都没有**，这正是
+    「`data: [DONE]` 与终止帧粘连」的精确触发条件（有换行、但没有空行时
+    **不**触发：`_scan_stream` 按换行切行，那一行已经能判读）。不补的话
+    紧随其后的帧（心跳 / `_terminal_frame`）会直接粘在这一行后面：
+
+        data: [DONE]data: {"id":"chatcmpl-gateway", ...}
+
+    一行两帧，客户端按行 `json.loads` 必炸。
+
+    ## 为什么带守卫
+
+    这条路径同时承担**原样透传**（上游 200 + JSON 错误体、非 SSE 的响应
+    对象）：尾巴不是 SSE 字段行时一个字节都不能改，否则「转发不改字节」
+    这条承诺就破了。
+    """
+    if not tail:
+        return tail
+    if not any(line.startswith(_SSE_FIELD_PREFIXES)
+               for line in tail.split(b"\n")):
+        return tail
+    return tail + b"\n" if tail.endswith(b"\n") else tail + _FRAME_SEP
+
+
+def _open_frame(chunk: bytes) -> bool:
+    """块是不是停在**半个帧**里（还没等到帧分隔符）。
+
+    判据宁窄勿宽：去掉前导缩进后，以 SSE 字段行（data / event / id / retry /
+    注释）或 JSON 片段（{ / [）起头，才算半帧。非 SSE 的普通字节（测试桩、
+    纯文本透传）一律返回 False —— 心跳照发，行为与加守卫之前完全一致。
+    """
+    head = chunk.lstrip()
+    return head.startswith(_SSE_FIELD_PREFIXES) or head[:1] in (b"{", b"[")
+
 
 async def _iter_upstream(resp):
     """逐块读上游 SSE —— **每一块都在工作线程里读**，事件循环上不留阻塞调用。
@@ -2492,44 +2544,27 @@ async def _iter_upstream(resp):
     #
     # 兜底：极老的 Python 或自定义 resp 没有 read1 时退回 read，行为与以前一致。
     read = getattr(resp, "read1", None) or resp.read
-    # WARN: must align to b"\n\n" frame boundaries BEFORE handing bytes up.
-    #
-    # read1() only promises one underlying recv: it splits at arbitrary byte
-    # offsets - cutting through data: {"choices":[{"index":0,"delta":{"content":"hel
-    # is normal (2026-11-19 measured: CH[5] tail 'data: {"code', CH[6] head ':0,"id":...').
-    # _with_keepalive injects idle heartbeats PER CHUNK: if a chunk stops mid-JSON and
-    # upstream then goes quiet for >PING_INTERVAL_S, the keepalive frame lands INSIDE
-    # that JSON and the client json.loads blows up (malformed server-sent event JSON).
-    # Emit only whole frames here and keep the partial tail buffered, so a heartbeat can
-    # only ever land between two frames. read1 low latency is preserved: frames are
-    # small, so they leave as soon as their trailing blank line arrives.
     buf = b""
     while True:
         chunk = await asyncio.to_thread(read, _STREAM_CHUNK)
         if not chunk:
             break
         buf += chunk
-        idx = buf.rfind(b"\n\n")
-        if idx < 0:
-            if len(buf) > 1_048_576:
-                if not buf.endswith(b"\n\n"):
-                    buf += b"\n\n"
-                yield buf
-                buf = b""
-            continue
-        yield buf[:idx + 2]
-        buf = buf[idx + 2:]
+        # 只把**已完整**的帧交出去（见 docstring 末段）：半帧留在 buf 里，
+        # 等下一块拼齐。read1() 的块边界与 SSE 帧边界无关，直接透传就会
+        # 让下游的空闲心跳插在半帧中间。
+        frames = buf.split(_FRAME_SEP)
+        buf = frames.pop()
+        for frame in frames:
+            yield frame + _FRAME_SEP
+        if len(buf) > _FRAME_MAX:
+            # 上游不是 SSE（或迟迟不发空行）：宁可失去对齐，也不能卡死
+            yield buf
+            buf = b""
+    # EOF：尾巴是半帧就补齐分隔符。不补的话紧随其后的帧会粘在这一行后面
+    # —— 客户端看到 `data: [DONE]data: {...}`，一行两帧。
     if buf:
-        # Upstream occasionally ends the stream with a bare data: [DONE] and NO
-        # trailing blank line (measured 2026-11-19: 1 in 8 shots). Yielding that
-        # tail as-is makes the terminal frame we append glue onto it:
-        #     data: [DONE]data: {"id": "chatcmpl-gateway"...
-        # which is exactly another malformed-SSE shape. SSE events end with a blank
-        # line, so close the tail here: _scan_stream then actually sees [DONE]
-        # (no terminal frame appended) and any appended frame lands on a boundary.
-        if not buf.endswith(b"\n\n"):
-            buf += b"\n\n"
-        yield buf
+        yield _flush_tail(buf)
 
 
 def _usage_of(result: dict) -> dict:
@@ -2727,20 +2762,18 @@ async def _with_keepalive(source, *, interval: float, ping: bytes):
     """
     iterator = source.__aiter__()
     pending: "asyncio.Future | None" = None
-    # Trailing bytes of what we last handed out: a heartbeat is only legal on a
-    # frame boundary (blank line). A half JSON followed by
-    # data: {"id":"chatcmpl-keepalive"... is exactly the 2026-11-19 malformed-SSE
-    # shape - better to skip one keepalive than to tear a frame apart.
-    tail = b""
+    framed = False   # 见过空行 → 确认这是按帧分隔的 SSE
+    tail = b""       # 上一块的末尾，用来判断它停在不在帧边界上
     try:
         while True:
             if pending is None:
                 pending = asyncio.ensure_future(iterator.__anext__())
             done, _ = await asyncio.wait({pending}, timeout=interval)
             if not done:
-                # empty tail = nothing written yet (stream head), safe to ping
-                if not tail or tail.endswith(b"\n\n"):
-                    yield ping
+                if not tail.endswith(_FRAME_SEP) and (framed or _open_frame(tail)):
+                    # 停在半帧中间：这一轮不插心跳，接着等同一块
+                    continue
+                yield ping
                 continue
             try:
                 chunk = pending.result()
@@ -2748,8 +2781,10 @@ async def _with_keepalive(source, *, interval: float, ping: bytes):
                 return
             finally:
                 pending = None
+            if chunk:
+                framed = framed or _FRAME_SEP in chunk
+                tail = chunk
             yield chunk
-            tail = (tail + chunk)[-4:] if isinstance(chunk, (bytes, bytearray)) else b""
     finally:
         # 客户端断开 / 上层取消：把还挂着的读任务收掉，别让它悬着
         if pending is not None and not pending.done():
@@ -2955,6 +2990,11 @@ async def chat_completions(request: Request):
                 # 只读旁路：解析 usage / finish_reason / 流内错误。
                 # **转发的字节一个都不改**，只记账与收尾需要这些信息。
                 pending = _scan_stream(pending, chunk, state)
+            # EOF：最后一段可能没带换行（裸 `data: [DONE]`），`_scan_stream`
+            # 只缓存不成行的尾巴、不判读 —— 补一个分隔符再扫一遍，否则 `done`
+            # 认不出来：白白多补一帧终止帧，还会和 `[DONE]` 粘成一行。
+            if pending:
+                _scan_stream(pending, _FRAME_SEP, state)
             usage = state["usage"] if isinstance(state.get("usage"), dict) else {}
             if state.get("error"):
                 # HTTP 200 + 流内错误帧：状态码已经发出去了，补一帧 error 把原因

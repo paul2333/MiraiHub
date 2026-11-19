@@ -239,6 +239,8 @@ TICKET_workbuddy_logout_p0.md
 !tests/test_marvis_oauth_exchange.py
 !tests/test_marvis_no_redirect.py
 !tests/test_marvis_input_cleared.py
+# SSE 帧对齐回归（心跳不得撕开半帧）：见 gateway._iter_upstream
+!tests/test_marvis_stream_framing.py
 
 !tests/test_async_sync_consistency.py
 !tests/test_marvis_risk_backoff.py
