@@ -13,11 +13,10 @@
 from __future__ import annotations
 
 import contextvars
+import threading
 import json
 import logging
-import os
 import re
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -125,21 +124,13 @@ def _no_redirect_opener():
 
 class UpstreamError(Exception):
     def __init__(self, message: str, *, status: int = 0, code: str = "",
-                 kind: str = "http_error", detail: str = "",
-                 cool_seconds: int = 0, local: bool = False):
+                 kind: str = "http_error", detail: str = ""):
         super().__init__(message)
         self.message = message
         self.status = status
         self.code = code
         self.kind = kind
         self.detail = detail
-        #: 本端判定「这个号该歇多久」的秒数（0 = 不打冷却）。
-        #: 上层 gateway._cool_seconds() 读它去写 Account.cool_until ——
-        #: 判定留在撞墙的那一层（这里有真实的业务码），写库留在有 Session 的那层。
-        self.cool_seconds = int(cool_seconds or 0)
-        #: True = 这条失败是**本端**拦下的（冷却期内没打上游）。
-        #: 上层据此不再累加「连续 4100404」计数 —— 没打上游就不算命中。
-        self.local = bool(local)
 
     def retryable(self) -> bool:
         return self.status in (408, 429) or self.status >= 500
@@ -299,96 +290,8 @@ def fetch_wallet(credential: dict, realm: str = "cn", *, account_id: int = 0) ->
 #: 就整组换新重试，复用只会继续撞同一个判定、把风控计数刷上去。
 RISK_CONTROL_CODE = "4100404"
 
-#: 模型网关每次调用最多试几次。**1 = 只发一次，撞墙就失败**。
-#:
-#: ## 2026-11-18：2 → 1（这条改动本身就是为了救号）
-#:
-#: 旧值 2 = 「1 次首发 + 1 次整组轮换重试」。上线后的实测时间线：
-#:
-#:   18:19:11  acc=192 → 4100404
-#:   18:19:13  acc=192 → 4100404   ← 整组轮换重试，同一份 body 隔 2 秒又打一遍
-#:   18:23:xx  acc=192 → 401 4100403 ← 同一个 token 变成「登录态过期」
-#:
-#: 结论：4100404 是**设备簇/IP 级**判定，换 cid/rid/nonce/uskey 不改变判定；
-#: 2 秒内重放同一份 body 反而把上游的风控计数推上去，最终把登录态打死
-#: （4100404 → 4100403 是不可逆的，得重新扫码）。所以重试在这里**没有任何
-#: 收益，只有代价**：它消耗第二次上游配额，并把「一次可恢复的风控」升级成
-#: 「号废了」。
-#:
-#: 保留这个常量（而不是删掉循环）是为了让「单发」成为**显式配置**：
-#: 以后谁想加回重试，必须先解释上面这三行日志怎么才不会再发生。
-CHAT_ATTEMPTS = 1
-
-#: 命中 4100404 后，「撞墙的那个号」本端冷却多少秒（默认 300）。
-#:
-#: 300 秒的依据：4100404 后的实测恢复窗口是分钟级（10–15 分钟完全退避），
-#: 单号 300 秒足够让「连撞同一个号」变成「换个号试一次」而不是「把号打死」。
-#: 可用 MIRAIHUB_MARVIS_RISK_ACCOUNT_COOLDOWN_SECONDS 覆盖。
-RISK_ACCOUNT_COOLDOWN_ENV = "MIRAIHUB_MARVIS_RISK_ACCOUNT_COOLDOWN_SECONDS"
-RISK_ACCOUNT_COOLDOWN_SECONDS = 300
-
-#: 进程内的「风控冷却」登记表：account_id → monotonic 截止时间。
-#:
-#: 为什么在这里（而不是直接写 Account.cool_until）：
-#:   · 这一层没有 SQLAlchemy Session，也不该有 —— 它跑在 urllib 的调用点上；
-#:   · 但「这个号刚撞过 4100404」这个事实必须在**下一次**调用前生效，
-#:     否则重试/并发请求会继续往同一个号上怼；
-#:   · 用 monotonic 而不是 wall clock：NTP 跳变、容器时区都不该影响冷却。
-#: 真正落库（Account.cool_until）由网关层 note_failure(cool_seconds=...) 完成，
-#: 这里只是同进程的**立即生效**兜底（也是唯一能在 client 单测里断言的东西）。
-_RISK_ACCOUNT_LOCK = threading.Lock()
-_RISK_ACCOUNT_DEADLINES: dict[int, float] = {}
-
-
-def risk_account_cooldown_seconds() -> int:
-    """单号风控冷却秒数（env 可覆盖；非法/非正值退回 300）。"""
-    raw = str(os.environ.get(RISK_ACCOUNT_COOLDOWN_ENV) or "").strip()
-    if not raw:
-        return RISK_ACCOUNT_COOLDOWN_SECONDS
-    try:
-        value = int(float(raw))
-    except (TypeError, ValueError):
-        return RISK_ACCOUNT_COOLDOWN_SECONDS
-    return value if value > 0 else RISK_ACCOUNT_COOLDOWN_SECONDS
-
-
-def note_account_risk_cooldown(account_id: int, seconds: int = 0) -> int:
-    """给这个号记一次风控冷却，返回实际秒数。**绝不抛。**
-
-    account_id 为 0（没传号）时只返回秒数、不登记 —— 匿名冷却会把
-    「不知道是哪个号」变成「所有号都歇着」。
-    """
-    total = int(seconds or 0) or risk_account_cooldown_seconds()
-    key = int(account_id or 0)
-    if key <= 0:
-        return total
-    with _RISK_ACCOUNT_LOCK:
-        _RISK_ACCOUNT_DEADLINES[key] = time.monotonic() + total
-    return total
-
-
-def account_risk_cooldown_remaining(account_id: int) -> float:
-    """这个号还剩多少秒冷却（0 = 可以打）。**绝不抛。**"""
-    key = int(account_id or 0)
-    if key <= 0:
-        return 0.0
-    now = time.monotonic()
-    with _RISK_ACCOUNT_LOCK:
-        deadline = _RISK_ACCOUNT_DEADLINES.get(key, 0.0)
-        if deadline <= now:
-            _RISK_ACCOUNT_DEADLINES.pop(key, None)
-            return 0.0
-        return deadline - now
-
-
-def clear_account_risk_cooldown(account_id: int = 0) -> None:
-    """清掉冷却（0 = 全清）。人工解冻 / 单测复位用。"""
-    key = int(account_id or 0)
-    with _RISK_ACCOUNT_LOCK:
-        if key > 0:
-            _RISK_ACCOUNT_DEADLINES.pop(key, None)
-        else:
-            _RISK_ACCOUNT_DEADLINES.clear()
+#: 模型网关每次调用最多试几次：1 次首发 + 1 次整组轮换重试。
+CHAT_ATTEMPTS = 2
 
 
 def open_chat_stream(credential: dict, realm: str, body: dict, *,
@@ -398,11 +301,8 @@ def open_chat_stream(credential: dict, realm: str, body: dict, *,
     ⚠ 不要在这里读流：读干了上层就没东西可转发（插件侧踩过的同一个坑）。
     上层负责 finally 调 `close_stream()`。
 
-    ⚠ 撞 `4100404` **不重试**（2026-11-18 起，见 CHAT_ATTEMPTS 的注释）：
-    整组轮换 cid/rid/nonce/uskey 改不了「设备簇 / 出口 IP 级」判定，2 秒内重放
-    同一份 body 只会把风控计数推上去，最终把登录态打死（4100404 → 4100403，
-    不可逆，需要重新扫码）。现在的处置是：给撞墙的这个号打 300 秒本地冷却 +
-    抛 `risk_control`，让上层**换个号**，而不是让同一个号再撞一次。
+    ⚠ 撞 `4100404` 时**整组轮换**（新的 cid / rid / nonce / uskey）再试一次；
+    每次 `llm_headers()` 都会现签，所以重试天然就是换新的一组。
     """
     acct = _acct(credential)
     url = endpoints.chat_url(realm)
@@ -410,61 +310,38 @@ def open_chat_stream(credential: dict, realm: str, body: dict, *,
     # bus_info 的 `model=` 段必须是**请求体原文**（不是显示名、不是别名），
     # 所以从这里透传下去，别让 endpoints 用自己的默认值。
     model = str((body or {}).get("model") or endpoints.EXT_MODEL)
-    # 冷却期内的号**本端直接拒**：一个字节都不打上游。
-    # 上层（gateway._attempt）也会按 Account.cool_until 过滤，这里是最后一道闸 ——
-    # 并发请求可能已经持有同一个号的租约，DB 里刚写的 cool_until 拦不住它们。
-    remaining = account_risk_cooldown_remaining(account_id)
-    if remaining > 0:
-        note_sentinel(realm, account_id, "risk_control",
-                      code=RISK_CONTROL_CODE, status=429,
-                      detail="local risk cooldown %.0fs" % remaining)
-        raise UpstreamError(
-            "Marvis 风控冷却中（该号还剩 %d 秒）：本次不上上游"
-            % (int(remaining) + 1),
-            status=429, code=RISK_CONTROL_CODE, kind="risk_control",
-            cool_seconds=int(remaining) + 1, local=True)
-    req = urllib.request.Request(url, data=data, method="POST")
-    for key, value in endpoints.llm_headers(acct, model=model).items():
-        req.add_header(str(key), str(value))
-    try:
-        return _opener().open(req, timeout=STREAM_TIMEOUT)
-    except urllib.error.HTTPError as exc:
-        payload = ""
+    for attempt in range(CHAT_ATTEMPTS):
+        req = urllib.request.Request(url, data=data, method="POST")
+        for key, value in endpoints.llm_headers(acct, model=model).items():
+            req.add_header(str(key), str(value))
         try:
-            payload = exc.read().decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001
-            pass
-        if _biz_code_of(payload) == RISK_CONTROL_CODE:
-            # 风控：给这个号打冷却 + 直接抛，**绝不发第二次**。
-            # exc.close() 放在这里而不是 finally：上层拿到的是异常，
-            # 这条连接不会有人再读。
+            return _opener().open(req, timeout=STREAM_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            payload = ""
             try:
-                exc.close()
+                payload = exc.read().decode("utf-8", "replace")
             except Exception:  # noqa: BLE001
                 pass
-            seconds = note_account_risk_cooldown(account_id)
-            note_sentinel(realm, account_id, "risk_control",
-                          code=RISK_CONTROL_CODE, status=exc.code,
-                          detail=payload)
-            logger.warning(
-                "Marvis 模型网关 4100404（account=%s）：该号冷却 %d 秒，"
-                "不重试（旧实现在这里整组轮换重发，会打死登录态）",
-                account_id, seconds)
-            raise UpstreamError(
-                "Marvis 上游风控（4100404）：该号已冷却 %d 秒，本次不重试"
-                % seconds,
-                status=exc.code, code=RISK_CONTROL_CODE, kind="risk_control",
-                detail=payload, cool_seconds=seconds) from exc
-        kind = _classify(exc.code, payload)
-        note_sentinel(realm, account_id, kind, code=str(exc.code),
-                      status=exc.code, detail=payload)
-        raise UpstreamError("模型网关失败（HTTP %d）" % exc.code,
-                            status=exc.code, code=str(exc.code), kind=kind,
-                            detail=payload) from exc
-    except Exception as exc:  # noqa: BLE001
-        note_sentinel(realm, account_id, "network", detail=str(exc)[:200])
-        raise UpstreamError("模型网关网络失败", status=0, kind="network",
-                            detail=str(exc)[:200]) from exc
+            risk = _biz_code_of(payload) == RISK_CONTROL_CODE
+            if risk and attempt + 1 < CHAT_ATTEMPTS:
+                logger.warning(
+                    "Marvis 模型网关 4100404（account=%s），整组轮换 "
+                    "cid/rid/nonce/uskey 后重试", account_id)
+                try:
+                    exc.close()   # 别把上一发的连接晾着
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            kind = _classify(exc.code, payload)
+            note_sentinel(realm, account_id, kind, code=str(exc.code),
+                          status=exc.code, detail=payload)
+            raise UpstreamError("模型网关失败（HTTP %d）" % exc.code,
+                                status=exc.code, code=str(exc.code), kind=kind,
+                                detail=payload) from exc
+        except Exception as exc:  # noqa: BLE001
+            note_sentinel(realm, account_id, "network", detail=str(exc)[:200])
+            raise UpstreamError("模型网关网络失败", status=0, kind="network",
+                                detail=str(exc)[:200]) from exc
 
 def close_stream(resp) -> None:
     """关掉 SSE 连接。**绝不抛**（已经在 finally 里）。"""
@@ -496,7 +373,42 @@ BIZ_AUTH_CODES = frozenset({"4100403"})
 #: 归到 `quota_exceeded` 之后走 `shared.note_failure(zero_balance=True)` 的
 #: **降级窗口**（degrade_until，QUOTA_DEGRADE_SECONDS = 1800 秒）：30 分钟内
 #: 它不再进候选集，窗口到期 + 下一次余额同步自动回到池子里（不需要人工解禁）。
-BIZ_QUOTA_CODES = frozenset({"3000001"})
+#:
+#: 1000007「积分余额不足」与 3000100 同源（都是「额度族」）：号没坏、Key 也没错，
+#: 只是这个号此刻拿不出这次请求要的额度。归到同一个 kind 才能走同一条
+#: 「换号」处置 —— 归成 upstream_business 只会原样抛错，用户看到的是一句
+#: 看不出原因的「请求失败」。gateway 侧再用 upstream_code 区分文案。
+BIZ_QUOTA_CODES = frozenset({"3000001", "1000007"})
+
+#: 上游「**输入 + max_tokens** 超出预算」：`3000100 max input token error`。
+#:
+#: 2026-11-19 线上样本：`bytes=24203 / msgs=2 / sys_chars=1058` —— 请求体只有
+#: 24 KB，却被拒；同一账号在实时窗口内又成功处理过 `bytes=527389 / msgs=98`
+#: 的更大形状 20 次 ⇒ **体积不是判据**（旧解释「输入 token + max_tokens 合计
+#: 一条预算」已被 25 发实测证伪）。
+#:
+#: 归因后剩下的唯一维度：`max_tokens` 与该号该模型**当次剩余可用预算**的对照。
+#: 网关仍然先做一次 max_tokens 降级（大多数情况能救回来）；降级后仍失败就
+#: 标 (账号×模型) 额度紧张并换号，只有池子用完才报给用户。
+#:
+#: 所以归成独立 kind `max_input_tokens`：网关据此识别「这是额度/预算问题」，
+#: 而不是「请求太大」—— 后者会把人引向拆消息，改了也没用。
+BIZ_MAX_INPUT_CODES = frozenset({"3000100"})
+
+#: 上游「**内部错误**」—— 与账号、凭证、请求形状都无关的那几个码。
+#:
+#: `5100007 服务端通用错误:服务端严重报错`。2026-11-19 线上 3 次失败的因果链：
+#: 一个 2 MB 的合成请求打在 acc=192 上，网关把它当普通 5xx，于是
+#: 「同号重试 → 换号 → 再换号」，192 → 191 → 194 **三个号各失败一次**，
+#: 最后报「已无更多可用账号」。三个号都被写了一次 err_count。
+#:
+#: 实测结论：这个码是**上游服务端**在同一份 body 上给出的确定性拒绝，
+#: 换任何一个号都会得到同一个答案。换号唯一的实际效果是污染整个池子的失败计数。
+#:
+#: ⇒ 归成 `upstream_internal`：同号重试一次（1–2 s 退避），仍失败就直接报错；
+#: 不换号、不计 err_count、不打冷却（见 gateway.`_attempt` 与
+#: shared.`note_failure(count_error=False)`）。
+BIZ_INTERNAL_CODES = frozenset({"5100007"})
 
 #: 从错误体里抠业务码：`{"code":4100406,...}` / `{"code":"4100403",...}`。
 _BIZ_CODE_RE = re.compile(r'"code"\s*:\s*"?(-?[A-Za-z0-9_.]+)"?')
@@ -570,6 +482,16 @@ def _classify(status: int, text: str) -> str:
     # 归错就会变成「永不隔离的号永远排第一，每次请求先白撞一次」。
     if code in BIZ_QUOTA_CODES:
         return "quota_exceeded"
+    # 输入 + max_tokens 超预算：**必须在 auth / upstream_business 之前判**。
+    # 归成 upstream_business 的话，上层只会「不重试、不冷却、原样抛」，
+    # 客户端拿到的是一句看不出原因的「max input token error」，
+    # 也就永远走不到「把 max_tokens 降到 32768 再试一次」这条修法。
+    if code in BIZ_MAX_INPUT_CODES:
+        return "max_input_tokens"
+    # 上游内部错误：与账号无关，必须在 auth(401) 判定之前拦下 ——
+    # 否则一个 5100007 会被当成「这个号不行」，进而换号把整池打一遍。
+    if code in BIZ_INTERNAL_CODES:
+        return "upstream_internal"
     if status == 401:
         return "auth"
     if code:
@@ -947,38 +869,15 @@ def _opener_for(proxy: str):
 
 
 def _opener():
-    """按当前请求绑定的**账号出口**取 opener；没绑出口时沿用**平台** opener。
-
-    ## 为什么要有这条分支（2026-11-19 合并 VPS egress 时踩到）
-
-    生产树里 egress 是**追加**式 monkey-patch，直接 `return _opener_for(_EGRESS_VAR.get())`
-    —— 于是 `MIRAIHUB_MARVIS_PROXY` 配了也永远走 `proxy=None` 的直连 opener，
-    平台级出口代理被静默废掉（`test_marvis_client_opener_uses_platform_proxy`
-    就是抓这个的）。两条通道必须并存：
-
-      · 账号出口（egress 池选中了某个代理）→ 用它，账号 = 固定出口；
-      · 没选中 / 池不可用 → 回到 `platform_opener()`，即 `MIRAIHUB_<平台>_PROXY`。
-    """
-    proxy = _EGRESS_VAR.get()
-    if proxy:
-        return _opener_for(proxy)
-    from admin.upstream_http import platform_opener
-    return platform_opener(endpoints.PLATFORM)
+    """覆盖原实现：按当前请求绑定的账号出口取 opener。"""
+    return _opener_for(_EGRESS_VAR.get())
 
 
 _inner_open_chat_stream = open_chat_stream
 
 
 def open_chat_stream(credential: dict, realm: str, body: dict, *, account_id: int = 0):
-    """按账号固定出口；**出口网络不通时回退直连**（出口不是单点故障）。
-
-    ## 只对 `network` 回退（2026-11-19 修）
-
-    原实现在 `except Exception` 里无条件重放直连 —— 上游返回 4100403 / 4100404 /
-    额度错误时也照做，等于把**同一份 body** 再打一遍上游：既多扣一次配额，
-    又正好踩中「同源短时重放」这条风控特征（见 CHAT_ATTEMPTS 的注释）。
-    出口只是个代理，它坏了换直连有意义；上游已经给了业务答复就没有重放的理由。
-    """
+    """按账号固定出口；**出口不通自动回退直连**（出口不是单点故障）。"""
     proxy = ""
     try:
         from . import egress as _egress
@@ -992,14 +891,13 @@ def open_chat_stream(credential: dict, realm: str, body: dict, *, account_id: in
         logger.warning("marvis 出口 | acc=%s proxy=%s", account_id, proxy)
         return _inner_open_chat_stream(credential, realm, body, account_id=account_id)
     except Exception as exc:  # noqa: BLE001
-        if getattr(exc, "kind", "") != "network":
-            # 上游已经答复（风控 / 登录态 / 额度 / 业务错）：换出口没有意义，且
-            # 重放会喂风控特征。原样抛给上层做换号 / 退避判定。
-            raise
-        logger.warning("出口 %s 网络失败，回退直连 | acc=%s err=%s", proxy, account_id, exc)
+        logger.warning("出口 %s 失败，回退直连 | acc=%s err=%s", proxy, account_id, exc)
         _EGRESS_VAR.reset(token)
         token = _EGRESS_VAR.set("")
-        return _inner_open_chat_stream(credential, realm, body, account_id=account_id)
+        try:
+            return _inner_open_chat_stream(credential, realm, body, account_id=account_id)
+        finally:
+            _EGRESS_VAR.reset(token)
     finally:
         try:
             _EGRESS_VAR.reset(token)
