@@ -303,3 +303,10 @@ tools/set_safe_context_limits.py
 
 # ===== 请求体上限（PR-09）：锁「默认 256MiB / 0 关闭 / 超限本地 413」 =====
 !tests/test_marvis_body_limit.py
+
+# ===== 出口池真值：部署数据，不进仓库 =====
+# egress.py 的 docstring 与 egress_pool.example.json 的 _comment 都把这条写死了
+# （「数据一律不进仓库」/「真值属部署数据，不要提交」）。文件留在部署机上当兜底
+# 是对的；进 git 就等于把内网出口地址随仓库发布出去。
+# tests/test_marvis_egress_pool.py 用 git ls-files --error-unmatch 无条件锁这一条。
+/admin/platform/marvis/core/egress_pool.json

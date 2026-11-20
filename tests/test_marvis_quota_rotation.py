@@ -257,20 +257,53 @@ class QuotaRotationTests(unittest.TestCase):
     def test_e_failure_profile_logs_max_tokens_and_degraded(self):
         self.accounts = [_Account(1), _Account(2)]
         self.behaviours = [_quota_error(), _quota_error(), _quota_error()]
+        # 形状列要带**真值**，不能只是「打印了三个 0」：给一条 system 消息 + 一个
+        # tool，锁 tools=1 / sys_chars=len(system)。4100406 的判据就是这两列
+        # （只在大请求上偶发），打印常数等于没有这一列。
+        system_text = "You are a helpful AI assistant. " * 4
+        body = {
+            "model": "main-auto",
+            "messages": [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": "hi"},
+            ],
+            "tools": [{"type": "function",
+                       "function": {"name": "noop", "parameters": {}}}],
+            "max_tokens": 128000,
+        }
 
         with self.assertLogs("admin.platform.marvis.gateway", level="WARNING") as logs:
             with self.assertRaises(client.UpstreamError):
-                self._run()
+                self._run(body)
 
         profiles = [line for line in logs.output if "失败画像" in line]
         self.assertEqual(len(profiles), 3)
         for line in profiles:
             self.assertIn("max_tokens=", line)
             self.assertIn("degraded=", line)
+            # 形状三列（与 INFO 请求画像同列）：4100406 的判据就是「请求形状 vs
+            # 成功/失败」，画像少了这三列就没法逐列比对（2026-11-20 补回）。
+            self.assertIn("tools=", line)
+            self.assertIn("sys_chars=", line)
+            self.assertIn("attempt=", line)
+        # 形状列是真值（不是占位 0）：tools=1，sys_chars 就是那条 system 的长度
+        for line in profiles:
+            self.assertIn("msgs=2 tools=1 sys_chars=%d" % len(system_text), line)
         # 第一次：原值、未降级；第二次：降级值、已降级；第三个号：请求已处于降级形态
         self.assertIn("max_tokens=128000 degraded=0", profiles[0])
         self.assertIn("max_tokens=32768 degraded=1", profiles[1])
         self.assertIn("max_tokens=32768 degraded=1", profiles[2])
+        # attempt=%d/%d 是「这一发是第几次」：同号重试最多 1 + 2 = 3 次。
+        #
+        # ⚠ 这一行是本批被删掉的断言，现在补回来（删断言不是对账）。它锁的是
+        # 「第 1 发用原值、第 2 发用降级值」这条处置链：没有 attempt，两发日志
+        # 只差一个 max_tokens，事后分不清是重试还是换号后的首发。
+        #   · profiles[0] = acc=1 的 index=1（首发，128000）
+        #   · profiles[1] = acc=1 的 index=2（降级后同号重试，32768）
+        #   · profiles[2] = 换到 acc=2 后的首发（body 已是降级形态）
+        self.assertIn("attempt=1/3", profiles[0])
+        self.assertIn("attempt=2/3", profiles[1])
+        self.assertIn("attempt=1/3", profiles[2])
 
 
 if __name__ == "__main__":

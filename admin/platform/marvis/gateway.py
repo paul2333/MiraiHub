@@ -240,7 +240,25 @@ def _fail_payload(exc: client.UpstreamError,
     # 上游 403 传到 Claude Code / Codex 会被渲染成「API 密钥无效」，用户去翻
     # Key / 重扫码 / 换号 —— 三个方向全是错的：是提示词命中黑名单。
     # 400 + content_filter 是 OpenAI 语义里「请求内容不被接受」的标准表达。
-    elif exc.kind == "content_block":
+    #
+    # ## 两个入口，同一张脸（2026-11-20）
+    #
+    # ① `kind == content_block` —— 200 + application/json 里的 4100406，
+    #    由 `client._classify_json_body()` 产出；
+    # ② `kind == upstream_business` 且业务码 4100406 —— 403 那条路。
+    #    403+4100406 按规定仍归 upstream_business（同号可重试一次，见
+    #    client._classify 的 docstring 与 tests/test_marvis_platform.py），
+    #    但**归类不动、呈现必须动**：以前这里没有任何分支认领 403，对外就是
+    #    `403 + type=upstream_business + code=403` —— 正是上面那段注释点名的
+    #    「被渲染成 API Key 无效」。同一个 4100406 换个 HTTP 状态（200/403）
+    #    不该换一张脸，所以判据取业务码、复用同一段文案。
+    #
+    # ⚠ 只改错误面，**不改重试语义**：`exc.kind` 仍是 upstream_business，
+    # `_call_upstream` 的「同号重试」判据（kind + RETRY_SAME_ACCOUNT_BIZ_CODES）
+    # 完全不受影响。
+    elif exc.kind == "content_block" or (
+            exc.kind == "upstream_business"
+            and "4100406" in str(exc.detail or "")):
         detail = (exc.detail or "").strip()
         status = 400
         code = "content_blocked"
@@ -1879,13 +1897,23 @@ def _dump_403_body(body: dict, *, status: int | None,
 
 def _log_failure_profile(account_id: int, exc: "client.UpstreamError", *,
                          model: str, stream: bool, body: dict,
-                         degraded: bool) -> None:
-    """上游失败画像 —— **必须带 max_tokens 与 degraded 两列**。
+                         degraded: bool, profile: dict | None = None,
+                         attempt: int = 0, attempts: int = 0) -> None:
+    """上游失败画像 —— **必须带 max_tokens / degraded / tools / sys_chars / attempt**。
 
-    为什么这两列是硬要求：3000100 的判据是「`max_tokens` 与该号该模型当次剩余
-    预算的对照」，没有 `max_tokens` 就看不出这次到底是原始值还是降级值撞的；
-    没有 `degraded` 就分不清「第一次命中」与「降级后仍命中」，而这两者的处置
-    完全相反（前者同号重试、后者换号）。缺任何一列，事后都无法复核这条链路。
+    为什么这几列是硬要求：
+
+      · `max_tokens` + `degraded`：3000100 的判据是「`max_tokens` 与该号该模型
+        当次剩余预算的对照」，没有 `max_tokens` 就看不出这次到底是原始值还是
+        降级值撞的；没有 `degraded` 就分不清「第一次命中」与「降级后仍命中」，
+        而这两者的处置完全相反（前者同号重试、后者换号）。
+      · `tools` + `sys_chars`：4100406 的判据是**请求形状**（见 `_call_upstream`
+        的 docstring：只在大请求上偶发、同一时刻小请求 200）。这两列必须能和
+        INFO 请求画像的同名列逐列对齐 —— 失败画像与成功画像不同列，
+        「形状 vs 成功/失败」就无从比对。
+      · `attempt=%d/%d`：同号重试最多 `1 + SAME_ACCOUNT_RETRIES` 次，`index+1`
+        就是「这一发是第几次」。缺了它，同一次请求内第 1 发（原值）与第 2 发
+        （降级值）在日志里只能靠 max_tokens 猜。
 
     其余字段只记**数字**：`detail` 是上游返回体（不含凭证），截断到 200 字符。
     """
@@ -1895,15 +1923,19 @@ def _log_failure_profile(account_id: int, exc: "client.UpstreamError", *,
         size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
     except Exception:  # noqa: BLE001 - 画像失败绝不能影响转发
         size = 0
+    shape = profile if isinstance(profile, dict) else _profile_of(body or {})
     detail = str(exc.detail or exc.message or "").replace("\n", " ")
     max_tokens = body.get("max_tokens", "-") if isinstance(body, dict) else "-"
     logger.warning(
         "Marvis 失败画像 kind=%s status=%s code=%s acc=%s model=%s stream=%s "
-        "bytes=%d msgs=%d max_tokens=%s degraded=%s detail=%s",
+        "bytes=%d msgs=%d tools=%d sys_chars=%d max_tokens=%s degraded=%s "
+        "attempt=%d/%d detail=%s",
         exc.kind, exc.status or "-", exc.code or "-",
         int(account_id or 0), model or "-",
-        "1" if stream else "0", size, msgs, max_tokens,
-        "1" if degraded else "0", detail[:200])
+        "1" if stream else "0", size, msgs,
+        int(shape.get("tools") or 0), int(shape.get("sys_chars") or 0),
+        max_tokens, "1" if degraded else "0",
+        int(attempt or 0), int(attempts or 0), detail[:200])
 
 
 def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
@@ -1998,7 +2030,13 @@ def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                 account_id, exc, model=str(body.get("model") or ""),
                 stream=stream, body=body,
                 degraded=(degrade_done
-                          or _max_tokens_of(body) == _DEGRADED_MARK))
+                          or _max_tokens_of(body) == _DEGRADED_MARK),
+                # 形状列必须与上面那条 INFO 请求画像**同一套数**（profile 就是
+                # 函数开头算的那一份）：失败画像的价值在于能和成功画像逐列比。
+                profile=profile,
+                # 这一发是第几次：同号重试最多 1 + SAME_ACCOUNT_RETRIES 次。
+                # 少了它，第 1 发（原值）与第 2 发（降级值）在日志里分不开。
+                attempt=index + 1, attempts=1 + SAME_ACCOUNT_RETRIES)
             # 403 时把「本次实际发出的 body」转储一份（仅当
             # MIRAIHUB_MARVIS_DUMP_403=1；默认关闭，连目录都不建）。
             # 3.5MB 的 gzip 要十几毫秒 —— 这里本来就在工作线程里，直接落盘。

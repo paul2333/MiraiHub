@@ -2,7 +2,8 @@
 
 判据（「空池也能独立跑通」这件事必须被证明，不是靠嘴说）：
 
-  1. 仓库里**只有** `egress_pool.example.json`，没有 `egress_pool.json`；
+  1. 真值 `egress_pool.json` **不被 git 跟踪**（数据一律不进仓库；
+     本地留着当部署兜底是允许的，但不能进版）；
   2. 空池 → `pick()` 返回 ""，`_opener()` 仍是平台级 opener，不抛异常；
   3. 同一账号永远同一出口（跨调用、跨 reload 都稳定）；
   4. `MARVIS_EGRESS_POOL`（内联 JSON / 逗号串）与
@@ -17,11 +18,13 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import urllib.request
 
-sys.path.insert(0, ".")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 from admin import upstream_http
@@ -71,17 +74,34 @@ def proxy_handler(opener):
 
 
 def main():
-    # ---- 1. 仓库里的出口池文件 ----
+    # ---- 1. 真值出口池不进仓库（无条件） ----
     #
-    # 上游版这里锁的是「仓库只带 example、不带真值」—— 那条前提在本 fork 不成立：
-    # 我们把部署用的出口池（内网出口）随仓库一起发布，部署侧没有 .env 覆盖时
-    # 就靠这个文件（见 .env.example 里 MARVIS_EGRESS_POOL / _FILE 的说明）。
-    # 文件一缺，egress.reload() 会静默退回直连 —— 出口 IP 一变就是 4100404，
-    # 而报错面完全看不出是「池丢了」。所以这里锁的是**文件本身可用**，
-    # 而不是「文件不存在」：example 必须在，真值池若在必须是合法形状。
+    # 判据是**「不被 git 跟踪」**，不是「文件不存在」：
+    #
+    #   · egress.py 的 docstring 写着「数据一律不进仓库」，example 的 _comment
+    #     同样写着「真值属部署数据，不要提交」—— 仓库该向这句声明看齐；
+    #   · 但部署机上**留着这个文件是对的**：没有环境变量覆盖时靠它兜底；
+    #     文件一缺，egress.reload() 静默退回直连，出口 IP 一变就是 4100404，
+    #     而报错面完全看不出是「池丢了」。
+    #
+    # ⇒ 这一条**无条件**必须过（文件在不在都要过）：只要它还被 git 跟踪，
+    #   内网出口地址就随仓库发布出去了。2026-11-20 本批一度把它改成「文件在
+    #   就合法即可」的条件断言，等于给一个 git 跟踪的真值池盖章 —— 那是拆护栏，
+    #   现在装回无条件断言，只把判据从「文件不存在」换成「未被跟踪」。
+    #
+    # 形状检查保留：文件在 → 必须是合法 {"exits": [str, ...]}；不在 → 允许
+    # （部署侧改用 MARVIS_EGRESS_POOL / _FILE，见 .env.example）。
     example = os.path.join(os.path.dirname(egress.DEFAULT_POOL_FILE),
                            "egress_pool.example.json")
     check("egress_pool.example.json 存在", os.path.exists(example))
+    # `--error-unmatch`：路径被跟踪时返回 0（并打印路径），未被跟踪返回非 0。
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch",
+         os.path.relpath(egress.DEFAULT_POOL_FILE, ROOT)],
+        capture_output=True, cwd=ROOT)
+    check("真值出口池不被 git 跟踪（数据一律不进仓库）",
+          tracked.returncode != 0,
+          tracked.stdout.decode("utf-8", "replace").strip())
     if os.path.exists(egress.DEFAULT_POOL_FILE):
         try:
             with open(egress.DEFAULT_POOL_FILE, encoding="utf-8") as fh:
@@ -96,14 +116,13 @@ def main():
               ok_shape, raw)
 
     # ---- 2. 空池：安全 ----
-    restore = env(MARVIS_EGRESS_POOL=None, MARVIS_EGRESS_POOL_FILE=None)
-    # 本 fork 的仓库自带部署用的 egress_pool.json（见第 1 节），所以「两个环境
-    # 变量都不设」时 exits() 会走文件兜底、并不是空池。要让这个 fixture 真的是
-    # 空池，只能把文件兜底临时指到不存在的路径（DEFAULT_POOL_FILE 是模块级常量）。
-    _saved_pool_file = egress.DEFAULT_POOL_FILE
-    egress.DEFAULT_POOL_FILE = os.path.join(tempfile.gettempdir(),
-                                           "mh-egress-absent.json")
-    egress.reload()
+    # `MARVIS_EGRESS_POOL="[]"` 就是**真空池**：`_load()` 见首字符是 `[` 就直接走
+    # `_parse_inline()`（egress.py:88-94）得到 []，**根本不读文件** —— 仓库里那个
+    # 真值池在不在都不影响这个 fixture。
+    # 以前这里把模块级常量 `DEFAULT_POOL_FILE` 临时指到 <tempdir>/mh-egress-absent.json
+    # 再 reload()：既污染了模块全局（一个测试替身写进生产常量），又要写死一个 temp
+    # 文件名。换环境变量手段即可，全局常量一个字都不用动。
+    restore = env(MARVIS_EGRESS_POOL="[]", MARVIS_EGRESS_POOL_FILE=None)
     try:
         picked = [egress.pick(i) for i in (0, 1, "acct-x", None)]
         check("空池 pick() 全返回空串", picked == ["", "", "", ""], picked)
@@ -117,8 +136,6 @@ def main():
               direct is opener, (id(direct), id(opener)))
     finally:
         restore()
-        egress.DEFAULT_POOL_FILE = _saved_pool_file
-        egress.reload()
 
     # ---- 3. / 4. 池来源 ----
     pool = ["http://egress-a.example:8080", "http://egress-b.example:8080"]
@@ -223,12 +240,9 @@ def main():
 
     client._open_chat_stream_direct = fake_direct
     try:
-        restore = env(MARVIS_EGRESS_POOL=None, MARVIS_EGRESS_POOL_FILE=None)
-        # 同第 2 节：仓库自带 egress_pool.json，文件兜底必须临时指空才是真空池。
-        _saved_pool_file2 = egress.DEFAULT_POOL_FILE
-        egress.DEFAULT_POOL_FILE = os.path.join(tempfile.gettempdir(),
-                                               "mh-egress-absent.json")
-        egress.reload()
+        # 同第 2 节：`"[]"` 让 `_load()` 走内联解析、直接得到空池，不读文件兜底，
+        # 也就不需要动 DEFAULT_POOL_FILE 这个模块全局。
+        restore = env(MARVIS_EGRESS_POOL="[]", MARVIS_EGRESS_POOL_FILE=None)
         try:
             seen.clear()
             check("空池：open_chat_stream 返回正常",
@@ -236,8 +250,6 @@ def main():
             check("空池：不绑出口（contextvar 为空）", seen == [""], seen)
         finally:
             restore()
-            egress.DEFAULT_POOL_FILE = _saved_pool_file2
-            egress.reload()
 
         restore = env(MARVIS_EGRESS_POOL='["http://egress-a.example:8080"]')
         try:

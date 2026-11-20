@@ -116,6 +116,30 @@ def test_classify_regressions() -> None:
         check(label, got == want, f"got={got} want={want}")
 
 
+def test_classify_json_body_content_block() -> None:
+    """200 + JSON 里的 4100406 → `content_block`（**唯一**的生产者）。
+
+    ## 为什么要单独锁（2026-11-20 补测）
+
+    403 + 4100406 按 fork 口径归 `upstream_business`（见上一节），于是
+    `content_block` 只剩 `_classify_json_body()` 这一条生产路径 —— 而
+    `_fail_payload()` 里那段「内容风控 → 400 `content_filter`」的文案全靠它
+    产出。没有这条断言，整条「真内容拦截」链路是**零测试**的：改坏了
+    `_classify_json_body` 或误删这条分支，测试面一声不响。
+    """
+    print("\n== _classify_json_body：content_block 的唯一生产者 ==")
+    got = client._classify_json_body('{"code":4100406,"msg":"非法请求"}')
+    check("200+4100406 → content_block", got == "content_block", got)
+    # 业务码写成字符串同样要认（上游两种写法都出现过）
+    got = client._classify_json_body('{"code":"4100406"}')
+    check("业务码为字符串时同样命中 content_block",
+          got == "content_block", got)
+    # 对照组：没有业务码的 200+JSON 不是内容风控
+    got = client._classify_json_body('{"error":"boom"}')
+    check("200+无业务码 → http_error（不误判成内容风控）",
+          got == "http_error", got)
+
+
 # ----------------------------------------------------------------------
 # 2. _error_payload：(status, code, family, upstream_code)
 # ----------------------------------------------------------------------
@@ -240,6 +264,64 @@ def test_fail_end_to_end() -> None:
           body["error"].get("upstream_account") is False, body)
 
 
+def test_fail_payload_content_blocked_by_biz_code() -> None:
+    """403 + 4100406 → 400 `content_blocked` / `content_filter`，**kind 不变**。
+
+    ## 这个缺口是什么（2026-11-20）
+
+    403+4100406 归 `upstream_business`（fork 口径，同号可重试一次），但
+    `_fail_payload()` 里没有任何分支认领它 ⇒ 对外是
+    `403 + type=upstream_business + code=403`，正是 `_fail_payload` 自己
+    注释点名的那个坑：被 Claude Code / Codex 渲染成「API Key 无效」，
+    用户去翻一个没问题的 Key、重扫码、换号 —— 三个方向全错。
+
+    ## 这里锁两件事
+
+      1. 错误面按业务码统一：400 + `content_blocked` + `content_filter`
+         （与 200 路径同一张脸，复用同一段文案）；
+      2. **归类与重试语义一个字没动**：`exc.kind` 仍是 `upstream_business`，
+         `_call_upstream` 的「同号重试」判据（kind +
+         `RETRY_SAME_ACCOUNT_BIZ_CODES`）照旧命中。
+    """
+    print("\n== 403+4100406 → 400 content_blocked（kind 不变） ==")
+    exc = _err(status=403, code="403", kind="upstream_business",
+               detail='{"code":4100406,"msg":"非法请求"}')
+    status, obj, _headers = gateway._fail_payload(exc)
+    check("状态码 400（不再透 403）", status == 400, status)
+    check("code=content_blocked",
+          obj.get("code") == "content_blocked", obj.get("code"))
+    check("type=content_filter",
+          obj.get("type") == "content_filter", obj.get("type"))
+    check("不引导换号（upstream_account=False）",
+          obj.get("upstream_account") is False, obj.get("upstream_account"))
+    check("upstream_code 保留上游 4100406",
+          obj.get("upstream_code") == "4100406", obj.get("upstream_code"))
+    check("文案说明与 Key / 账号无关",
+          "命中腾讯黑名单" in str(obj.get("message")),
+          str(obj.get("message"))[:80])
+    # ⚠ 关键：呈现改了，**归类没改** —— 重试仍走同号。
+    check("kind 未被改写（仍是 upstream_business）",
+          exc.kind == "upstream_business", exc.kind)
+    check("同号重试判据仍命中（kind + 业务码）",
+          exc.kind == "upstream_business"
+          and any(code in str(exc.detail or "")
+                  for code in gateway.RETRY_SAME_ACCOUNT_BIZ_CODES),
+          gateway.RETRY_SAME_ACCOUNT_BIZ_CODES)
+    # 端到端：_fail() 出去的就是 400，且不带 family
+    resp = gateway._fail(exc)
+    body = json.loads(resp.body)
+    check("_fail() 对外 400", resp.status_code == 400, resp.status_code)
+    check("_fail() 不带 family", "family" not in body["error"], body)
+
+    # 对照组：403 但业务码不是 4100406 → 原样透 403（不吃内容风控那张脸）
+    exc = _err(status=403, code="403", kind="upstream_business",
+               detail='{"code":4100399,"msg":"other"}')
+    status, obj, _ = gateway._fail_payload(exc)
+    check("非 4100406 的 403 保持原样", status == 403, status)
+    check("非 4100406 的 403 仍是 upstream_business",
+          obj.get("type") == "upstream_business", obj.get("type"))
+
+
 # ----------------------------------------------------------------------
 # 4. 池子余额全 0 → 402 quota_exhausted（不是「都在冷却」）
 # ----------------------------------------------------------------------
@@ -311,10 +393,12 @@ def test_pool_still_cooling_control() -> None:
 if __name__ == "__main__":
     test_classify_business_codes()
     test_classify_regressions()
+    test_classify_json_body_content_block()
     test_error_payload_quota_family()
     test_error_payload_upstream_internal()
     test_error_payload_untouched_kinds()
     test_fail_end_to_end()
+    test_fail_payload_content_blocked_by_biz_code()
     test_pool_exhausted_is_402()
     test_pool_still_cooling_control()
     print()

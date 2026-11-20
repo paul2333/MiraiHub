@@ -34,8 +34,25 @@ _OPENER = None
 #: 不跟随重定向的 opener 缓存（换登录态那次请求专用，见 `_no_redirect_opener()`）。
 _NO_REDIRECT_OPENER = None
 
+#: `note_sentinel()` 的 kind 白名单 —— 不在里面的失败**一个字节都不上报**。
+#:
+#: 2026-11-20 补齐三种「线上看得见才行」的失败（哨兵侧补可观测性，比恢复
+#: 账号级 note_failure 轻：这三种要么根本不该写 err_count，要么已经当场 break）：
+#:
+#:   · `content_block` —— 200 + JSON 的 4100406（真内容拦截）。它是**唯一**
+#:     不写账号 err_count 的失败（`_attempt` 里直接 break），不在白名单里
+#:     就等于「拦了但线上无声」。
+#:   · `upstream_internal`（5100007）—— 上游服务端故障，同样不写 err_count，
+#:     以前只剩一条 WARNING 画像。
+#:   · `max_input_tokens`（3000100）—— 额度族，隔离落在 (账号×模型) 级，
+#:     账号侧不留痕。
+#:
+#: 三者的 severity 都不在 `sentinel.KIND_SEVERITY` 里 ⇒ 落 INFO
+#: （`severity or SEVERITY_INFO`），**不参与熔断**（熔断只认 RISK）。
 SENTINEL_KINDS = frozenset({"auth", "quota_exceeded", "network",
-                             "signature_invalid", "upstream_business"})
+                             "signature_invalid", "upstream_business",
+                             "content_block", "upstream_internal",
+                             "max_input_tokens"})
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
