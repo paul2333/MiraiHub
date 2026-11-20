@@ -324,18 +324,128 @@ def test_protocol_relays_close_inner_iterator_on_client_disconnect():
     asyncio.run(exercise())
 
 
-def test_protocol_relays_close_inner_iterator_on_normal_eof():
-    chunks = frames(
-        {"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]},
-        "[DONE]",
-    )
-    for relay_factory in (bridge.anthropic_stream_relay,
-                          bridge.responses_stream_relay):
-        inner = FakeInner(chunks)
-        tracked = _CloseTrackingIterator(inner.body_iterator)
-        inner.body_iterator = tracked
-        collect(relay_factory(inner, "m"))
+def test_protocol_relays_close_marvis_stream_on_asgi_disconnect():
+    calls = {"success": [], "release": [], "bill": []}
+    current = {"upstream": None}
+    account = types.SimpleNamespace(id=7, uid="u7")
+
+    def acquire(_request, _body, _realm, *, stream):
+        assert stream
+        return types.SimpleNamespace(id=3), current["upstream"], account, time.perf_counter()
+
+    async def bill(*_args, **kwargs):
+        calls["bill"].append(kwargs)
+
+    async def exercise(relay_factory, content_event, terminal_event):
+        for values in calls.values():
+            values.clear()
+        current["upstream"] = _GatewayUpstream()
+        current["upstream"].chunks = [
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n']
+        response = await gateway.chat_completions(_GatewayRequest())
+        tracked = _CloseTrackingIterator(response.body_iterator)
+        response.body_iterator = tracked
+        relayed = relay_factory(types.SimpleNamespace(body_iterator=tracked), "m")
+        messages = []
+        content_sent = asyncio.Event()
+        receive_calls = 0
+        disconnected = False
+
+        async def receive():
+            nonlocal receive_calls, disconnected
+            receive_calls += 1
+            if receive_calls == 1:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await content_sent.wait()
+            disconnected = True
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+            if (message["type"] == "http.response.body"
+                    and content_event in message.get("body", b"")):
+                content_sent.set()
+                await asyncio.sleep(0)
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1", "method": "GET", "scheme": "http",
+            "path": "/", "raw_path": b"/", "query_string": b"", "headers": [],
+            "client": ("127.0.0.1", 1), "server": ("localhost", 80),
+        }
+        await relayed(scope, receive, send)
+
+        assert any(message["type"] == "http.response.start" for message in messages)
+        assert content_sent.is_set(), "disconnect must follow a normal relay content event"
+        assert disconnected, "ASGI receive must report client disconnect"
+        assert not any(terminal_event in message.get("body", b"")
+                       for message in messages), messages
         assert tracked.close_count == 1
+        assert current["upstream"].closed
+        assert calls["success"] == [account]
+        assert calls["release"] == [account]
+        assert len(calls["bill"]) == 1
+
+    async def run():
+        await exercise(bridge.anthropic_stream_relay,
+                       b"event: content_block_delta", b"event: message_stop")
+        await exercise(bridge.responses_stream_relay,
+                       b"event: response.output_text.delta",
+                       b"event: response.completed")
+
+    with mock.patch.dict(os.environ, {gateway._KEEPALIVE_ENV: "1"}), \
+            mock.patch.object(gateway, "_validate_model", return_value="main-auto"), \
+            mock.patch.object(gateway, "_prepare_body",
+                              side_effect=lambda body, _slot: dict(body)), \
+            mock.patch.object(gateway, "_acquire", side_effect=acquire), \
+            mock.patch.object(gateway, "_bill_async", new=bill), \
+            mock.patch.object(gateway.shared, "note_success",
+                              side_effect=lambda value: calls["success"].append(value)), \
+            mock.patch.object(gateway.shared, "release",
+                              side_effect=lambda value: calls["release"].append(value)), \
+            mock.patch.object(gateway.client, "note_sentinel"):
+        asyncio.run(run())
+
+
+def test_protocol_relays_close_inner_iterator_on_normal_eof_and_error():
+    cases = [
+        (frames(
+            {"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]},
+            "[DONE]",
+        ), None),
+        (frames({"error": {"message": "relay failed", "type": "test"}},
+                "[DONE]"), b"relay failed"),
+    ]
+    async def exercise():
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1", "method": "GET", "scheme": "http",
+            "path": "/", "raw_path": b"/", "query_string": b"", "headers": [],
+            "client": ("127.0.0.1", 1), "server": ("localhost", 80),
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message):
+            messages.append(_message)
+
+        for relay_factory, error_event in (
+                (bridge.anthropic_stream_relay, b"event: error"),
+                (bridge.responses_stream_relay, b"event: response.failed")):
+            for chunks, error_text in cases:
+                inner = FakeInner(chunks)
+                tracked = _CloseTrackingIterator(inner.body_iterator)
+                inner.body_iterator = tracked
+                messages = []
+                await relay_factory(inner, "m")(scope, receive, send)
+                assert tracked.close_count == 1
+                if error_text:
+                    body = b"".join(message.get("body", b"") for message in messages)
+                    assert error_event in body
+                    assert error_text in body
+
+    asyncio.run(exercise())
 
 
 if __name__ == "__main__":
