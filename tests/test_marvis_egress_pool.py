@@ -15,6 +15,7 @@
 跑法：`python tests/test_marvis_egress_pool.py`（仓库现有测试都是这个形态）。
 """
 import io
+import json
 import os
 import sys
 import tempfile
@@ -70,16 +71,39 @@ def proxy_handler(opener):
 
 
 def main():
-    # ---- 1. 仓库里不带真值文件 ----
-    check("仓库只带 egress_pool.example.json（不带 egress_pool.json）",
-          not os.path.exists(egress.DEFAULT_POOL_FILE),
-          egress.DEFAULT_POOL_FILE)
+    # ---- 1. 仓库里的出口池文件 ----
+    #
+    # 上游版这里锁的是「仓库只带 example、不带真值」—— 那条前提在本 fork 不成立：
+    # 我们把部署用的出口池（内网出口）随仓库一起发布，部署侧没有 .env 覆盖时
+    # 就靠这个文件（见 .env.example 里 MARVIS_EGRESS_POOL / _FILE 的说明）。
+    # 文件一缺，egress.reload() 会静默退回直连 —— 出口 IP 一变就是 4100404，
+    # 而报错面完全看不出是「池丢了」。所以这里锁的是**文件本身可用**，
+    # 而不是「文件不存在」：example 必须在，真值池若在必须是合法形状。
     example = os.path.join(os.path.dirname(egress.DEFAULT_POOL_FILE),
                            "egress_pool.example.json")
     check("egress_pool.example.json 存在", os.path.exists(example))
+    if os.path.exists(egress.DEFAULT_POOL_FILE):
+        try:
+            with open(egress.DEFAULT_POOL_FILE, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            exits = raw.get("exits") if isinstance(raw, dict) else None
+            ok_shape = (isinstance(exits, list)
+                        and all(isinstance(x, str) and x for x in exits))
+        except Exception as exc:  # noqa: BLE001 - 写坏的文件就是这里要抓的
+            ok_shape = False
+            raw = repr(exc)
+        check("egress_pool.json 是合法出口池（exits 为字符串列表）",
+              ok_shape, raw)
 
     # ---- 2. 空池：安全 ----
     restore = env(MARVIS_EGRESS_POOL=None, MARVIS_EGRESS_POOL_FILE=None)
+    # 本 fork 的仓库自带部署用的 egress_pool.json（见第 1 节），所以「两个环境
+    # 变量都不设」时 exits() 会走文件兜底、并不是空池。要让这个 fixture 真的是
+    # 空池，只能把文件兜底临时指到不存在的路径（DEFAULT_POOL_FILE 是模块级常量）。
+    _saved_pool_file = egress.DEFAULT_POOL_FILE
+    egress.DEFAULT_POOL_FILE = os.path.join(tempfile.gettempdir(),
+                                           "mh-egress-absent.json")
+    egress.reload()
     try:
         picked = [egress.pick(i) for i in (0, 1, "acct-x", None)]
         check("空池 pick() 全返回空串", picked == ["", "", "", ""], picked)
@@ -93,6 +117,8 @@ def main():
               direct is opener, (id(direct), id(opener)))
     finally:
         restore()
+        egress.DEFAULT_POOL_FILE = _saved_pool_file
+        egress.reload()
 
     # ---- 3. / 4. 池来源 ----
     pool = ["http://egress-a.example:8080", "http://egress-b.example:8080"]
@@ -198,6 +224,11 @@ def main():
     client._open_chat_stream_direct = fake_direct
     try:
         restore = env(MARVIS_EGRESS_POOL=None, MARVIS_EGRESS_POOL_FILE=None)
+        # 同第 2 节：仓库自带 egress_pool.json，文件兜底必须临时指空才是真空池。
+        _saved_pool_file2 = egress.DEFAULT_POOL_FILE
+        egress.DEFAULT_POOL_FILE = os.path.join(tempfile.gettempdir(),
+                                               "mh-egress-absent.json")
+        egress.reload()
         try:
             seen.clear()
             check("空池：open_chat_stream 返回正常",
@@ -205,6 +236,8 @@ def main():
             check("空池：不绑出口（contextvar 为空）", seen == [""], seen)
         finally:
             restore()
+            egress.DEFAULT_POOL_FILE = _saved_pool_file2
+            egress.reload()
 
         restore = env(MARVIS_EGRESS_POOL='["http://egress-a.example:8080"]')
         try:

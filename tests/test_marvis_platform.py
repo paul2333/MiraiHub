@@ -1162,9 +1162,15 @@ class QuotaExhaustedTests(unittest.IsolatedAsyncioTestCase):
         return rows
 
     async def test_all_zero_balance_raises_402_quota_exhausted(self):
-        """alive 全 avail=0 ⇒ 402 quota_exhausted（不是 503 accounts_cooling）。"""
+        """alive 全 avail=0 ⇒ 402 quota_exhausted（不是 503 accounts_cooling）。
+
+        2026-11-20（PR-01 合入）起这里抛的是 client.UpstreamError 而不是
+        PlatformRejected：只有前者会经过 _fail() / _error_payload()，错误体才能带上
+        family / upstream_code 两个字段（PlatformRejected.openai() 只出
+        type/message/code）。对外的 402 语义不变，见下面那段 _fail() 断言。
+        """
         self._pool(0, 0, 0)
-        with self.assertRaises(self.shared.PlatformRejected) as caught:
+        with self.assertRaises(client.UpstreamError) as caught:
             self.gateway._attempt(None, None, None, {"model": "main-auto"},
                                   "cn", stream=False)
         exc = caught.exception
@@ -1172,8 +1178,13 @@ class QuotaExhaustedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exc.code, "quota_exhausted")
         self.assertEqual(exc.kind, "quota_exceeded")
         self.assertIn("额度已耗尽", exc.message)
-        self.assertIn("10,000,000", exc.message, "文案要给出重置口径")
-        self.assertEqual(exc.headers.get("Retry-After"), "3600")
+        self.assertIn("00:00(+08)", exc.message, "文案要给出重置口径")
+        resp = self.gateway._fail(exc)
+        body = json.loads(resp.body)["error"]
+        self.assertEqual(resp.status_code, 402)
+        self.assertEqual(body.get("family"), "quota")
+        self.assertEqual(body.get("upstream_code"), "3000001")
+        self.assertEqual(resp.headers.get("retry-after"), "3600")
 
     async def test_unknown_balance_is_not_reported_as_exhausted(self):
         """余额 NULL（从没同步过）= 未知，不等于耗尽：仍按冷却 503 重试。"""

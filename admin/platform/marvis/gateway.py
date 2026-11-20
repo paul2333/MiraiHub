@@ -173,8 +173,8 @@ def _quota_tight_message(upstream_code: str, notes: dict | None = None) -> str:
         % (upstream_code or "3000100", action))
 
 
-def _error_payload(exc: client.UpstreamError,
-                   notes: dict | None = None) -> tuple[int, dict, dict]:
+def _fail_payload(exc: client.UpstreamError,
+                  notes: dict | None = None) -> tuple[int, dict, dict]:
     """把**上游账号侧**的失败翻译成「状态码 + 错误体 + 响应头」。
 
     返回 `(status, error_obj, headers)` —— 由 `_fail()` 决定包成什么形状：
@@ -262,23 +262,16 @@ def _error_payload(exc: client.UpstreamError,
         #   · 单次命中（平台没退避）→ 只能说「这一条请求被拦」，并指向真因：
         #     请求内容里的 system 提示词撞了上游内容黑名单（见
         #     _TENCENT_FINGERPRINT_RULES），改 Key / 换账号都不会变。
-        status = 503
-        remaining_backoff = risk_backoff_remaining()
-        if remaining_backoff > 0:
-            message = (
-                "Marvis 上游风控（4100404）：平台连续命中 %d 次后进入退避，"
-                "约 %d 秒后自动恢复。这与你的 API Key、账号余额都无关，"
-                "不需要换 Key。原始信息：%s"
-                % (risk_hits(), int(remaining_backoff) + 1, message))
-            headers["Retry-After"] = str(max(1, int(remaining_backoff) + 1))
-        else:
-            message = (
-                "Marvis 上游内容风控（4100404）：**这一条请求**被拦（连续命中 "
-                "%d/%d 次，未触发平台退避）。与你的 API Key、账号余额都无关，"
-                "换 Key / 换账号都不会改变结果 —— 触发源通常是 system 提示词里的"
-                "固定开场白撞了上游内容黑名单，需要在网关侧补指纹规则改写。"
-                "原始信息：%s" % (risk_hits(), _risk_backoff_threshold(), message))
-            headers["Retry-After"] = "1"
+        # 2026-11-20（PR #67）：错误面统一收进 _risk_control_rejected() ——
+        # 503 + code=risk_control_backoff / risk_control_request + Retry-After 1~11，
+        # 两档文案由它按平台此刻是否在退避自己选。type 仍是 risk_control。
+        reject = _risk_control_rejected(exc.detail or exc.message)
+        status = reject.status
+        code = reject.code
+        message = reject.message
+        # 平台侧问题，但不是换个号就好的那种账号问题
+        upstream_account = False
+        headers.update(dict(reject.headers or {}))
     if status == 401 or exc.kind == "auth" or code == "credential_expired":
         status = 503
         if "重新扫码" not in message and "授权登录" not in message:
@@ -359,6 +352,79 @@ def _error_payload(exc: client.UpstreamError,
     return status, error_obj, headers
 
 
+def _error_payload(exc: client.UpstreamError,
+                   notes: dict | None = None) -> tuple[int, dict, dict] | None:
+    """额度族 / 上游内部错误 → `(status, error_obj, headers)`；其余返回 `None`。
+
+    **只处理本 PR 新增的三种 kind**，其余（signer_unavailable / content_block /
+    risk_control / auth / 参数 400）一律返回 `None` 交回 `_fail()` 的既有分支 ——
+    这样那几条已在 origin/main 上稳定的分类一个字都不用动。
+
+    ## 为什么要独立出来
+
+    这几种失败以前全都落进 `upstream_business`：网关「不重试、不冷却、原样抛」，
+    客户端只拿到 `HTTP 402` / `HTTP 500`，语义上等于「你的请求写错了」，
+    用户于是去改一个根本没写错的请求体。业务码才是判据，所以：
+
+      · `3000100` → 400 `max_input_tokens_exceeded`（额度族，可操作文案）；
+      · `1000007` → 400 `insufficient_quota`；
+      · `3000001` → 402 `quota_exhausted`（账号级总额度，等每日重置 / 加号）；
+      · `5100007` → 502 `upstream_internal_error`（上游侧故障，与号池无关）。
+
+    `family` 是给下游聚合用的族标记（目前只有 `quota`），具体原因看
+    `upstream_code` —— 后者保留上游业务码，便于排障时与上游工单对齐。
+    """
+    upstream_code = client._biz_code_of(exc.detail or "").strip()
+    headers: dict[str, str] = {}
+    family = ""
+    if exc.kind == "max_input_tokens" or upstream_code == "1000007":
+        # 额度族（3000100 / 1000007）：判据是「该号该模型当次可用额度」不够。
+        status = 400
+        code = ("max_input_tokens_exceeded"
+                if exc.kind == "max_input_tokens" else "insufficient_quota")
+        err_type = exc.kind or "quota_exceeded"
+        shown_code = upstream_code
+        if shown_code in ("", "400", "401", "402", "403", "404", "422",
+                          "429", "500", "502", "503"):
+            # detail 抠不出业务码时，exc.code 只是 HTTP 状态 —— 文案里要写上游码。
+            shown_code = ("3000100" if exc.kind == "max_input_tokens"
+                          else "1000007")
+        message = _quota_tight_message(shown_code, notes)
+        family = "quota"
+    elif exc.kind == "upstream_internal":
+        # 上游服务端内部错误：换号只会把整池的 err_count 写满，与账号无关。
+        status = 502
+        code = "upstream_internal_error"
+        err_type = "upstream_internal"
+        message = (
+            "Marvis 上游服务端内部错误（上游 %s）：与你的 API Key、账号、额度都"
+            "无关，这是上游侧故障，换账号不会改变结果。稍后重试即可。"
+            "原始信息：%s" % (upstream_code or "5100007", exc.message))
+    elif exc.kind == "quota_exceeded":
+        # 账号级总额度（3000001 用户名下 token 不足）：等的是上游每日
+        # 00:00(+08) 的配额重置，不是「冷却到期」—— 两种结局完全不同。
+        status = 402
+        code = "quota_exhausted"
+        err_type = "quota_exceeded"
+        family = "quota"
+        headers["Retry-After"] = "3600"
+        message = (
+            "Marvis 账号额度已耗尽（上游 %s）：这是账号级总额度用光，"
+            "不是你的 API Key 无效，也不是网关在冷却。上游每日 00:00(+08)"
+            "为各账号重置额度，请等待重置或在控制台加号。原始信息：%s"
+            % (upstream_code or "3000001", exc.message))
+    else:
+        return None
+    error_obj = {"type": err_type, "code": code, "message": message,
+                 # 这几种都不是「换个号就好」的登录态问题
+                 "upstream_account": False}
+    if family:
+        error_obj["family"] = family
+    if upstream_code:
+        error_obj["upstream_code"] = upstream_code
+    return status, error_obj, headers
+
+
 def _fail(exc: client.UpstreamError, *, notes: dict | None = None,
           stream: bool = False):
     """把上游失败包成响应。
@@ -369,7 +435,21 @@ def _fail(exc: client.UpstreamError, *, notes: dict | None = None,
     """
     if notes is None:
         notes = _notes()
-    status, error_obj, headers = _error_payload(exc, notes)
+    # 额度族 / 上游内部错误 → 统一由 _error_payload() 出（返回 Optional）：
+    # 它只接管 b8a01fe 新增的那几种 kind，其余返回 None 交回 _fail_payload()
+    # 的既有分类 —— 那几条已在线上稳定的分支一个字都不用动。
+    quota = _error_payload(exc, notes)
+    if quota is not None:
+        q_status, q_obj, q_headers = quota
+        if stream:
+            return _stream_error_response(
+                q_status, q_obj,
+                extra_headers=_degraded_headers(notes) or dict(q_headers or {}))
+        q_headers = dict(q_headers or {})
+        q_headers.update(_degraded_headers(notes))
+        return JSONResponse({"error": q_obj}, status_code=q_status,
+                            headers=q_headers or None)
+    status, error_obj, headers = _fail_payload(exc, notes)
     if stream:
         return _stream_error_response(
             status, error_obj, extra_headers=_degraded_headers(notes)
@@ -541,6 +621,43 @@ async def _bill_async(*args, **kwargs) -> None:
         raise
     except Exception:  # noqa: BLE001 - 记账失败绝不影响响应
         logger.exception("Marvis 记账线程异常")
+
+
+def _billing_model(slot: str) -> str:
+    """记账用的模型名：上游槽位 → **对外可读名**。
+
+    ## 为什么这一列不能存槽位名（2026-11-17 用户实测反馈）
+
+    控制台的「使用记录 / 用量统计 / 模型下拉筛选」都是拿 `usage_logs.model`
+    去 `model_configs.model_id` 里查展示名的。而 Marvis 侧：
+
+        model_configs 登记的 model_id   → deepseek-v4.1-flash
+        usage_logs      记的 model      → main-auto（上游槽位）
+
+    两列永远对不上，前端查不到展示名就退回原样输出，于是整张表显示
+    `main-auto`、下面还挂一行「思考：默认 / 未记录」—— 用户看到的既不是
+    自己请求的 `deepseek-v4.1-flash-marvis`，也认不出这到底是什么模型。
+
+    ## 为什么不改 model_configs 去存槽位名
+
+    反过来更糟：`model_configs` 是模型目录的**对外身份**，槽位名是上游实现
+    细节。改成 `main-auto` 会让 `/v1/models` 重新暴露槽位名、dispatch 的
+    跨平台归一也要跟着改（`readable_model_id` 存在的全部理由就是这件事）。
+
+    ## 所以：落库时就写可读名
+
+    `endpoints.readable_model_id()` 查不到时原样返回，对没有槽位映射的平台
+    是恒等变换，不会误伤。
+
+    不写平台后缀（`-marvis`）：`usage_logs.platform` 已经单列了平台，
+    再拼进 model 会让同一模型在统计里裂成两条，也会让筛选下拉出现
+    `deepseek-v4.1-flash` 与 `deepseek-v4.1-flash-marvis` 两个选项。
+    """
+    try:
+        readable = endpoints.readable_model_id(slot)
+    except Exception:  # noqa: BLE001 - 映射失败就记原始值，不能挡住记账
+        return str(slot or "")
+    return str(readable or slot or "")
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +876,79 @@ _TENCENT_FINGERPRINT_RULES = (
 )
 
 
+#: 首行身份句：`<缩进>You are<空白>...`，大小写不敏感。
+#:
+#: 只锚 `^`＋缩进，**不锚整句** —— 上游拦的是「`You are` + 产品名」这个宽形态，
+#: 不是某一句原文。锚整句的后果就是客户端一改措辞（Claude Code 从
+#: `Anthropic's official CLI for Claude` 改成 `Claude Agent SDK`）就失效。
+_IDENTITY_LINE = re.compile(r"^([ \t]*)you([ \t]+)are([ \t]+)", re.I)
+
+#: 规则表**改写后**的形态：凡是替换值本身以 `You are` / `You're` 开头的规则，
+#: 取它的**前 4 个词**作为「已 sanitize」的指纹前缀。兜底看到这些前缀就放行 ——
+#: 否则再换一遍会把 `You are a capable ...` 改成 `You're a capable ...`：同一段
+#: 文字两次处理结果不同（幂等性被打破），rules_hit 也不再是「一条规则命中一次」。
+#: 取前 4 个词而不是整句：规则 4 的替换值有 13 个词，而实际文本常常只到
+#: 「You are a capable AI coding assistant.」就结束 —— 整句比对会漏。
+_IDENTITY_SAFE_PREFIXES = tuple(sorted({
+    " ".join(str(_repl).strip().lower().split()[:4])
+    for _pat, _repl in _TENCENT_FINGERPRINT_RULES
+    if str(_repl).strip().lower().startswith(("you are ", "you're "))}))
+
+#: `You are the <role>`：对**角色 / 辅助提示词**的描述，不是产品身份句。
+#: 上游对它的判定是 32 字符前缀锚定（规则 8），兜底不该抢 —— 抢了就会去改
+#: 「You are the memory curation assistant.」这类本来放行的正文。
+_IDENTITY_ROLE_LINE = re.compile(r"^[ \t]*you[ \t]+are[ \t]+the[ \t]+", re.I)
+
+
+def _youre(match: re.Match) -> str:
+    """把命中的 `You are ` 换成 `You're `，保留缩进、空白与大小写形态。
+
+    大小写要**跟着原样走**：全大写句子里混一个 `You're` 会让模型读到风格
+    突变的提示词；`YOU ARE` 要变 `YOU'RE`，`you are` 要变 `you're`。
+    """
+    lead, gap, tail = match.group(1), match.group(2), match.group(3)
+    word = match.group(0)[len(lead):len(lead) + 3]      # 原句里的 "You"
+    if word.isupper():
+        replacement = "YOU'RE"
+    elif word[:1].isupper():
+        replacement = "You're"
+    else:
+        replacement = "you're"
+    return lead + replacement + tail
+
+
+def _rewrite_identity_line(text: str) -> tuple[str, int]:
+    """改写**第一条非空行**开头的 `You are `，返回 `(文本, 是否命中)`。
+
+    ## 为什么只改第一行
+
+    上游只检查第一条非空行（实测见上方规则表的对照数据）：
+    `Preamble.\\nYou are Claude Code.` 是 200，而同样的句子放在第一行就是 403。
+    改第一行就够，改更多行只会无谓地动到用户的提示词正文。
+
+    ## 为什么前导空行要跳过
+
+    `"\\nYou are Claude Code."` 实测仍是 403 —— 上游会跳过前导空白再匹配。
+    只认 `text.startswith("You are")` 会漏掉这种形态。
+    """
+    if not text:
+        return text, 0
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue                     # 前导空行：上游也会跳过，继续往下找
+        if _IDENTITY_LINE.match(line) is None:
+            return text, 0               # 首条非空行不是身份句 → 整段不动
+        low = line.strip().lower()
+        if (low.startswith(_IDENTITY_SAFE_PREFIXES)
+                or _IDENTITY_ROLE_LINE.match(line) is not None):
+            # 已经 sanitize 过的形态 / 角色描述句：兜底放行（见上面两条常量）。
+            return text, 0
+        lines[index] = _IDENTITY_LINE.sub(_youre, line, count=1)
+        return "\n".join(lines), 1
+    return text, 0
+
+
 def rewrite_tencent_fingerprints(text: str) -> tuple[str, int]:
     """按上表做窄改写，返回 `(改写后的文本, 命中的规则条数)`。
 
@@ -776,6 +966,16 @@ def rewrite_tencent_fingerprints(text: str) -> tuple[str, int]:
             continue
         out = pattern.sub(replacement, out)
         hits += 1
+    # 兜底：首行身份句（D2「方案 B」）。**只在规则表零命中时**才动。
+    #
+    # 为什么不无条件追加：规则 10 命中一次之后，改写出来的
+    # You are a capable assistant 仍以 You are 开头 —— 无条件再跑一遍兜底
+    # 会把 rules_hit 从 1 记成 2，同一条规则在日志里数成两次，规则表与命中数
+    # 从此对不上账。零命中时才轮到兜底：它覆盖规则表没登记的新客户端身份句
+    # （You are Codex. 之类），命中即 1，与规则表互不重叠。
+    if hits == 0:
+        out, identity_hits = _rewrite_identity_line(out)
+        return out, identity_hits
     return out, hits
 
 
@@ -1207,6 +1407,16 @@ _MB = 1048576.0
 #: dict 对象，所以工作线程里的写入在主上下文同样可见。
 #: 每个请求是独立 task、独立 context，不需要手工 reset。
 _REQUEST_NOTES: ContextVar = ContextVar("marvis_request_notes", default=None)
+#: 本请求的 max_tokens 是否已被额度族降级过（跨账号、跨 _call_upstream 调用）。
+#: 降级值就地写进 body，换号后仍然生效 —— 失败画像的 degraded 列必须反映
+#: 整条请求的状态，否则第二个号会同时打出 32768 和 degraded=0，事后读不出
+#: 它到底是不是降级后的那一发。用 ContextVar 而不是函数参数：调用链上
+#: _call_upstream 被测试整体替换过（签名固定），不能加位置参数。
+#: 降级目标值本身即「已降级」的判据（见 _call_upstream 的失败画像）：降级是就地
+#: 改 body 的，所以 body 里的 max_tokens == 降级目标值 就说明这一发是降级形态。
+#: 用它而不是 ContextVar：ContextVar 在「同线程连续跑多个 _attempt」的测试里会
+#: 跨请求泄漏，把下一次的首次失败标成 degraded=1。
+_DEGRADED_MARK = MAX_TOKENS_DEGRADE_TARGET
 
 
 def _notes() -> dict:
@@ -1667,6 +1877,35 @@ def _dump_403_body(body: dict, *, status: int | None,
     return path
 
 
+def _log_failure_profile(account_id: int, exc: "client.UpstreamError", *,
+                         model: str, stream: bool, body: dict,
+                         degraded: bool) -> None:
+    """上游失败画像 —— **必须带 max_tokens 与 degraded 两列**。
+
+    为什么这两列是硬要求：3000100 的判据是「`max_tokens` 与该号该模型当次剩余
+    预算的对照」，没有 `max_tokens` 就看不出这次到底是原始值还是降级值撞的；
+    没有 `degraded` 就分不清「第一次命中」与「降级后仍命中」，而这两者的处置
+    完全相反（前者同号重试、后者换号）。缺任何一列，事后都无法复核这条链路。
+
+    其余字段只记**数字**：`detail` 是上游返回体（不含凭证），截断到 200 字符。
+    """
+    messages = body.get("messages") if isinstance(body, dict) else None
+    msgs = len(messages) if isinstance(messages, list) else 0
+    try:
+        size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    except Exception:  # noqa: BLE001 - 画像失败绝不能影响转发
+        size = 0
+    detail = str(exc.detail or exc.message or "").replace("\n", " ")
+    max_tokens = body.get("max_tokens", "-") if isinstance(body, dict) else "-"
+    logger.warning(
+        "Marvis 失败画像 kind=%s status=%s code=%s acc=%s model=%s stream=%s "
+        "bytes=%d msgs=%d max_tokens=%s degraded=%s detail=%s",
+        exc.kind, exc.status or "-", exc.code or "-",
+        int(account_id or 0), model or "-",
+        "1" if stream else "0", size, msgs, max_tokens,
+        "1" if degraded else "0", detail[:200])
+
+
 def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                    stream: bool, profile: dict | None = None):
     """调上游 —— **同步实现**，由 `_acquire` 所在的工作线程承载；只对「瞬时」失败同号重试。
@@ -1752,15 +1991,14 @@ def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
             # 失败画像：与「成功画像」同列，按 bytes/msgs/tools 直接对比；
             # 另带**原始** max_tokens 与「是否已降级」—— 3000100 的判据是
             # max_tokens 与该号该模型当次剩余预算的对照，缺这两列没法事后判定。
-            logger.info(
-                "Marvis 失败画像 kind=%s status=%s code=%s acc=%s bytes=%d "
-                "msgs=%d tools=%d sys_chars=%d max_tokens=%s degraded=%s "
-                "attempt=%d/%d",
-                exc.kind, exc.status or "-", exc.code or "-", account_id,
-                profile["bytes"], profile["msgs"], profile["tools"],
-                profile["sys_chars"], profile["max_tokens"],
-                "1" if degrade_done else "0",
-                index + 1, 1 + SAME_ACCOUNT_RETRIES)
+            # 失败画像：**每一次**上游失败都留痕（WARNING），包括即将被降级重试的
+            # 第一次命中 —— 否则事后判定不出这一发是原值还是降级值。
+            # max_tokens 与 degraded 两列是判据，缺一列就无法复核 3000100 的处置链。
+            _log_failure_profile(
+                account_id, exc, model=str(body.get("model") or ""),
+                stream=stream, body=body,
+                degraded=(degrade_done
+                          or _max_tokens_of(body) == _DEGRADED_MARK))
             # 403 时把「本次实际发出的 body」转储一份（仅当
             # MIRAIHUB_MARVIS_DUMP_403=1；默认关闭，连目录都不建）。
             # 3.5MB 的 gzip 要十几毫秒 —— 这里本来就在工作线程里，直接落盘。
@@ -1770,7 +2008,7 @@ def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
             # ① 输入 + max_tokens 超上游预算：**不是**请求体积问题。
             # 把 max_tokens 降到上游收得下的值再打一次；降过还失败就直接报，
             # 不再消耗任何账号（用户侧只需要知道「要减上下文」）。
-            if exc.kind == "max_input_tokens":
+            if _is_quota_exhausted(exc):
                 want = _max_tokens_of(body)
                 if not degrade_done and want > MAX_TOKENS_DEGRADE_THRESHOLD:
                     # **就地**改（不要 body = dict(body)）：_attempt 传下来的是
@@ -1800,7 +2038,7 @@ def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
             # ② 上游内部错误（5100007）：与账号无关 -> 同号重试一次，
             # **绝不换号**（换号只会把同一份 body 在另一个号上再失败一次，并把
             # 那个号的 err_count 也打上去 —— 线上 192->191->194 即此）。
-            if exc.kind == "upstream_internal":
+            if _is_upstream_internal(exc):
                 if internal_retries >= INTERNAL_RETRIES:
                     raise
                 internal_retries += 1
@@ -1837,6 +2075,87 @@ def _call_upstream(data: dict, realm: str, body: dict, account_id: int, *,
                 index + 1, SAME_ACCOUNT_RETRIES, delay)
             # 退避是「本请求」的等待：工作线程里同步 sleep，事件循环照旧转。
             time.sleep(delay)
+
+
+#: 额度族的业务码。上游 HTTP 层只给状态码，业务码在响应体的 JSON 里。
+#: 3000100 以前被当上下文超限处理，结果在同一个号上反复重发；现在归属
+#: 额度族：先省输出预算（降 max_tokens）再换号。
+QUOTA_EXHAUSTED_CODES = ("3000100",)
+#: 上游服务端内部错误的业务码（与账号无关，换号只会把好号打脏）。
+UPSTREAM_INTERNAL_CODES = ("5100007",)
+
+
+def _biz_blob(exc: "client.UpstreamError") -> str:
+    """上游错误的可检索文本。
+
+    `detail` 是上游**原始响应体**（业务码在里面），`message` 是网关自己的话。
+    上游把 HTTP 状态塞进 `exc.code`，业务码从来不在那个字段里 —— 所以只能按
+    文本认，与既有的 `_is_param_error()` 同口径。
+    """
+    return "%s %s" % (exc.detail or "", exc.message or "")
+
+
+def _quota_code_of(exc: "client.UpstreamError") -> str:
+    """这条错误里的额度族业务码；不是额度族返回空串。"""
+    blob = _biz_blob(exc)
+    for code in QUOTA_EXHAUSTED_CODES:
+        if code in blob:
+            return code
+    return ""
+
+
+def _is_quota_exhausted(exc: "client.UpstreamError") -> bool:
+    """3000100：该号在该模型上的**当次可用额度不足**（不是请求太大）。"""
+    return bool(_quota_code_of(exc))
+
+
+def _is_upstream_internal(exc: "client.UpstreamError") -> bool:
+    """5100007：上游服务端内部错误（与账号无关，换号无意义）。"""
+    blob = _biz_blob(exc)
+    return any(code in blob for code in UPSTREAM_INTERNAL_CODES)
+
+
+def _risk_control_rejected(detail: str = "") -> shared.PlatformRejected:
+    """4100404 的客户端错误面：**两种文案**，取决于平台此刻是否在退避。
+
+    ## 为什么必须分两档说
+
+    对用户说假话的代价比报错本身大得多：
+
+      · 平台**在退避**（连续命中撞满阈值）→ 说「平台在退避，约 X 秒恢复」，
+        让他等；
+      · **单次命中**（平台没退避，下一轮可能就通）→ 只能说「这一条请求被拦」，
+        并指向真因：请求里的 system 正文撞了上游内容黑名单 —— 这条路径上换 Key /
+        换号 / 重扫码都不会改变结果。
+
+    状态码取 **503**（不是上游那个 403）：403 在所有 OpenAI 兼容客户端里都会被渲染成
+    「API 密钥无效」，用户于是去翻一个根本没问题的 Key。503 + `Retry-After` 才是
+    「先别急着重试」的中性表达。
+    """
+    hits = risk_hits()
+    remaining = risk_backoff_remaining()
+    detail = (detail or "").strip()
+    if remaining > 0:
+        message = (
+            "Marvis 上游风控（4100404）：平台连续命中 %d 次后进入退避，约 %d 秒后"
+            "自动恢复。这与你的 API Key、账号余额都无关，不需要换 Key，"
+            "等窗口过去即可。" % (hits, int(remaining) + 1))
+        code = "risk_control_backoff"
+        retry_after = max(1, int(remaining) + 1)
+    else:
+        message = (
+            "Marvis 上游内容风控（4100404）：这一条请求被拦（连续命中 %d/%d 次，"
+            "未触发平台退避）。与你的 API Key、账号余额都无关，换 Key / 换号都不会"
+            "改变结果 —— 触发源通常是请求里的 system 正文撞了上游内容黑名单，"
+            "需要在网关侧补内容改写规则。"
+            % (hits, _risk_backoff_threshold()))
+        code = "risk_control_request"
+        retry_after = 1
+    if detail:
+        message = "%s上游原文：%s" % (message, detail[:200])
+    return shared.PlatformRejected(
+        503, message, kind="upstream_risk_control", code=code,
+        headers={"Retry-After": str(retry_after)})
 
 
 def _note_model_quota_tight(db, account, model: str, *,
@@ -2101,6 +2420,9 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     param_retries = 0
     ctx_retries = 0
     dropped: set[str] = set()
+    # 请求级「已降级」标记（跨账号）：降级值就地写进 body，换号后仍然生效。
+    degraded_max_tokens = False
+
     while attempts < MAX_ATTEMPTS:
         attempts += 1
         # `min_balance=0` = 只要余额 > 0 的号。
@@ -2156,17 +2478,23 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             # 「多大 -> 头部等多久」画成表。elapsed_ms 量的是
             # 「_attempt 开始 -> 上游把响应头吐出来」，与 request_metrics 的
             # headers_ms 同口径（read1 / 逐帧读取都在这之后，改不到它）。
+            # billed 列是**对外可读名**（`main-auto` -> `deepseek-v4.1-flash`）：
+            # 控制台的「使用记录 / 用量统计 / 模型筛选」全按这一列对 model_configs
+            # 查展示名，写槽位名会让整张表对不上（见 _billing_model 的说明）。
+            # 这里只用于日志；落库那一列仍由 _bill() 的调用方决定，不在这里改。
             logger.info(
-                "Marvis 成功画像 acc=%s model=%s bytes=%d msgs=%d tools=%d "
-                "sys_chars=%d elapsed_ms=%d headers_ms=%d mb=%.2f",
-                int(account.id or 0), model or "-", profile["bytes"],
-                profile["msgs"], profile["tools"], profile["sys_chars"],
-                elapsed_ms, elapsed_ms, profile["bytes"] / _MB)
+                "Marvis 成功画像 acc=%s model=%s billed=%s bytes=%d msgs=%d "
+                "tools=%d sys_chars=%d elapsed_ms=%d headers_ms=%d mb=%.2f",
+                int(account.id or 0), model or "-", _billing_model(model),
+                profile["bytes"], profile["msgs"], profile["tools"],
+                profile["sys_chars"], elapsed_ms, elapsed_ms,
+                profile["bytes"] / _MB)
             # 只有**成功**才写绑定：失败号不该被会话粘住（下个请求还要重试它）。
             _bind_sticky(sticky_key, account)
             return result, account, started
         except client.UpstreamError as exc:
             shared.release(account)
+            notes = _notes()
             # ------------------------------------------------------------------
             # 上游 PR #55 的四类「不记账号失败」处理（顺序有意：先判先停）
             # ------------------------------------------------------------------
@@ -2188,6 +2516,39 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
                 last_error = exc
                 logger.warning(
                     "Marvis 内容风控拦截（换号无效，不记账号失败）| acc=%s | %s",
+                    int(account.id or 0), (exc.detail or exc.message or "")[:200])
+                break
+            # ## 3000100（额度族）：同号降级已在 _call_upstream 用掉，仍失败
+            # ⇒ 该号在该模型上的**当次额度**不够，换号（不记账号失败）。
+            #
+            # 与 5100007 的分界（两者都不记账号失败，但处置相反）：
+            #   · 3000100 = 额度：换一个号就有预算 → 标 (账号 × 模型) 后换号；
+            #   · 5100007 = 上游内部错误：换号只会把好号也打脏 → 同号重试后停。
+            #
+            # 判据是**业务码**不是 kind：client 的旧版本 / 测试替身把 3000100 归成
+            # http_error 也照样要走进来（3000100 与 3000101 前缀相同，处置相反）。
+            quota_code = _quota_code_of(exc)
+            if quota_code:
+                last_error = exc
+                # 请求已处于降级形态：后面每个新号都直接用降级值。
+                degraded_max_tokens = True
+                _note_model_quota_tight(db, account, model, code=quota_code)
+                notes["quota_switch_accounts"] = (
+                    int(notes.get("quota_switch_accounts") or 0) + 1)
+                logger.warning(
+                    "Marvis 额度不足换号 | acc=%s | model=%s | code=%s | "
+                    "max_tokens=%s | 同号降级重试已用尽",
+                    int(account.id or 0), model or "-", quota_code,
+                    body.get("max_tokens", "-"))
+                exclude.add(account.id)
+                continue
+            # ## 5100007（上游服务端内部错误）：同号重试也在上面用掉了，
+            # 仍失败就如实报错 —— **不换号、不 note_failure、不进 exclude**。
+            if _is_upstream_internal(exc):
+                last_error = exc
+                logger.warning(
+                    "Marvis 上游内部错误，同号重试已用尽（不换号、不记账号失败）"
+                    " | acc=%s | %s",
                     int(account.id or 0), (exc.detail or exc.message or "")[:200])
                 break
             # ## 上下文超限（400/413 + 3000100）
@@ -2258,8 +2619,8 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             # ③ 额度族（3000100）同理：号本身是健康的，只是这个模型上的当次
             # 预算不够 —— 计 err_count 会把好号推去熔断，隔离改用 (账号×模型)
             # 级标记（见 _note_model_quota_tight）。
-            no_fault = exc.kind == "upstream_internal"
-            quota_soft = exc.kind == "max_input_tokens"
+            no_fault = _is_upstream_internal(exc)
+            quota_soft = _is_quota_exhausted(exc)
             shared.note_failure(
                 db, account, kind=exc.kind,
                 detail=exc.detail or exc.message, status=exc.status,
@@ -2311,23 +2672,6 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             # 同号换个小模型仍然可用。只有池子用完（本函数末尾 last_error）
             # 才把 3000100 报给用户。
             # 与 5100007 的分界：那个是上游内部错误，换号只会污染整池。
-            if exc.kind == "max_input_tokens":
-                notes = _notes()
-                # exc.code 在生产路径上是 HTTP 状态（400）；真正的 3000100
-                # 在 detail 的 JSON 里 —— 标记与日志都必须记那个码。
-                biz_code = (client._biz_code_of(exc.detail or "")
-                            or str(exc.code or "") or "3000100")
-                degraded = bool(notes.get("degraded_max_tokens"))
-                if degraded:
-                    _note_model_quota_tight(db, account, model,
-                                            code=biz_code)
-                notes["quota_switch_accounts"] = (
-                    int(notes.get("quota_switch_accounts") or 0) + 1)
-                logger.warning(
-                    "Marvis 额度不足换号 acc=%s model=%s code=%s degraded=%s "
-                    "（同号降级重试已用尽，改试下一个号）",
-                    int(account.id or 0), model or "-", biz_code,
-                    "true" if degraded else "false")
             last_error = exc
             exclude.add(account.id)
             # 参数类错误换号也没用，直接抛（不再浪费一次上游往返）。
@@ -2372,14 +2716,11 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
         alive = [r for r in rows if (getattr(r, "status", "") or "") == "active"]
         expired = [r for r in alive
                    if "过期" in str(getattr(r, "last_err_msg", "") or "")]
-        # 冷却中的号里，有多少是被**风控**挂起来的（cool_kind）。
-        # 两种「冷却」对用户含义相反：普通冷却等几十秒就好；风控冷却是出口
-        # 被平台拦了，等 3 秒没用，重试只会延长封禁（上游 PR #55）。
-        risk_cooling = [r for r in alive
-                        if str(getattr(r, "cool_kind", "") or "") == "risk_control"]
-        risk_ids = [r.id for r in risk_cooling]
+        # 风控冷却段已删除（上游 PR #67）：4100404 判的是这条请求 / 这个出口，
+        # 不是账号好坏。给命中账号打冷却会自我循环（命中 -> 锁 -> 到期 -> 再命中），
+        # 现在由平台级退避接管（见 note_risk_control）。
     except Exception:  # noqa: BLE001
-        alive, expired, risk_cooling, risk_ids = [], [], [], []
+        alive, expired = [], []
     # 「一个号都没选到」同样是网关失败，而且是最难从响应里看出原因的一种：
     # 响应里只有 503 + 一句人话，没有 kind / 没有上游。这里补一条 warn。
     logger.warning("Marvis 无可用账号 realm=%s model=%s active=%d expired=%d",
@@ -2404,16 +2745,6 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
     # 余额）不计入 —— 未知不等于耗尽，那种情况仍按冷却重试。
     # 全池都在**风控冷却**里 —— 这是 17:24 那次 503 的真实原因，而不是
     # 「排队中」。文案要能直接指到「出口风控」这个动作上（上游 PR #55）。
-    if risk_cooling and len(risk_cooling) == len(alive):
-        raise shared.PlatformRejected(
-            429,
-            "腾讯 Marvis 对当前出口做了风控拦截（4100404），全部 %d 个账号都在冷却中"
-            "（账号 id：%s）。这不是账号或 API Key 的问题：凭证钱包接口正常，"
-            "换号 / 重扫码 / 换 Key 都无效。请停止重试（重试会延长风控窗口），"
-            "等风控过去或换出口 IP 后再试。"
-            % (len(risk_cooling), "、".join(str(i) for i in risk_ids[:8])),
-            kind="upstream_risk_control", code="risk_control_cooling",
-            headers={"Retry-After": "600"})
     zero = [r for r in alive
             if getattr(r, "balance_remain", None) is not None
             and int(getattr(r, "balance_remain", 0) or 0) <= 0]
@@ -2422,11 +2753,18 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             "Marvis 额度已耗尽 realm=%s model=%s active=%d 余额全为 0"
             "（上游 3000001：等待 00:00+08 配额重置）",
             realm, model or "-", len(alive))
-        raise shared.PlatformRejected(
-            402, "Marvis 账号额度已耗尽（上游 3000001 用户名下token不足），"
-                 "上游每日 00:00(+08) 各号重置 10,000,000 token，请等待重置或加号",
-            kind="quota_exceeded", code="quota_exhausted",
-            headers={"Retry-After": "3600"})
+        # 走 client.UpstreamError 而不是 shared.PlatformRejected：只有前者会经过
+        # _fail() / _error_payload()，错误体才能带上 family / upstream_code 两个字段
+        # （PlatformRejected.openai() 只出 type/message/code）。
+        raise client.UpstreamError(
+            "Marvis 账号额度已耗尽（上游 3000001 用户名下token不足）："
+            "上游每日 00:00(+08) 为各账号重置额度，请等待重置或在控制台加号",
+            status=402, code="quota_exhausted", kind="quota_exceeded",
+            # detail 保持上游错误体的形状：_error_payload() 用 client._biz_code_of()
+            # 从这里抠业务码，抠不到 upstream_code 就丢了（而它正是排障时要与
+            # 上游工单对齐的那一列）。
+            detail="{\"code\":3000001,\"msg\":\"用户名下token不足；"
+                   "等待上游 00:00(+08) 配额重置\"}")
     if alive:
         raise shared.PlatformRejected(
             503, "Marvis 账号都在冷却或排队中，请稍后重试",

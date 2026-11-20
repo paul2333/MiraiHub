@@ -92,13 +92,23 @@ def test_classify_regressions() -> None:
     cases = [
         (403, '{"code":4100404,"msg":"客户端通用错误:请求被风控拦截"}',
          "risk_control", "4100404 仍是 risk_control"),
-        (403, '{"code":4100406,"msg":"非法请求"}', "content_block",
-         "4100406 仍是 content_block"),
+        # ⚠ 两条与上游口径**不同**，是本 fork 的既有契约（2026-11-20 合批时核对）：
+        #
+        #   · 403 + 4100406 -> upstream_business（不是 content_block）：
+        #     实测同号同分钟 200/403 交替，属上游**偶发**拒绝 —— 归成 content_block
+        #     会让 _attempt 直接 break（不重试、错误面变成 400 内容风控），
+        #     把一条本来重试一次就过的请求判死。该口径由 client.RETRY_SAME_ACCOUNT_BIZ_CODES
+        #     + tests/test_marvis_platform.py（ErrorClassifyTests）+
+        #     tests/test_marvis_risk_backoff.py 三处锁住，改动会同时打破那两套。
+        #   · 400 + 3000101 -> upstream_business（不是 http_error）：同一条
+        #     「业务码一律不落 HTTP 状态」的分工，_is_param_error() 仍按码处理降级。
+        (403, '{"code":4100406,"msg":"非法请求"}', "upstream_business",
+         "4100406 归 upstream_business（fork 口径：同号可重试一次）"),
         (401, "{}", "auth", "401 仍是 auth"),
         (200, '{"code":4100403,"msg":"登录态过期"}', "auth",
          "200+4100403 仍是 auth"),
-        (400, '{"code":3000101,"msg":"invalid parameter"}', "http_error",
-         "3000101 参数错仍落 http_error（本 PR 不接管）"),
+        (400, '{"code":3000101,"msg":"invalid parameter"}', "upstream_business",
+         "3000101 归 upstream_business（fork 口径：业务码不落 HTTP 状态）"),
         (503, "", "upstream_error", "无业务码的 5xx 仍是 upstream_error"),
     ]
     for status, body, want, label in cases:

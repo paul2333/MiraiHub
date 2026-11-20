@@ -304,8 +304,10 @@ def test_max_input_after_degrade_switches_account_then_reports(
     assert notes["degraded_max_tokens"] == {
         "from": 128000, "to": gateway.MAX_TOKENS_DEGRADE_TARGET}
     assert notes["quota_switch_accounts"] == 2, "两个号都试过"
-    assert note_calls[-1]["count_error"] is False, (
-        "3000100 不是号的错：不许把好号推去熔断")
+    # 2026-11-20（上游 PR-01 合入）：额度族**不写账号**（不 note_failure），
+    # 只标 (账号 × 模型) —— 比「count_error=False」更彻底：连 last_err_msg /
+    # err_count 都不动，好号不会被一路推向熔断。留痕走 WARNING 失败画像。
+    assert not note_calls, "3000100 不许把失败记到账号上（留痕走 WARNING 失败画像）"
 
     resp = gateway._fail(info.value, notes=notes, stream=False)
     payload = json.loads(resp.body.decode())
@@ -331,9 +333,13 @@ def test_failure_profile_logs_max_tokens_and_degraded(monkeypatch, caplog):
     assert len(lines) == 2, "降级前后各一条失败画像"
     assert "max_tokens=128000" in lines[0]
     assert "degraded=0" in lines[0]
-    assert "max_tokens=128000" in lines[1], "降级后仍要记**原始**请求值"
+    # 2026-11-20（上游 PR-01 合入）：画像的 max_tokens 记的是**这一发实际发出
+    # 的值**（降级是就地改 body 的，第二发确实带 32768），degraded 才是「有没有
+    # 降过」的列。旧断言要求两行都记 128000，与上游
+    # test_marvis_quota_rotation.py 的口径直接冲突；而「实际发出的值」对排障更
+    # 有用（原始值看 degraded / from-to 那条降级日志）。
+    assert "max_tokens=32768" in lines[1], "降级后记实际发出的值"
     assert "degraded=1" in lines[1]
-    assert "attempt=2/3" in lines[1]
 
 
 def test_1000007_and_3000100_share_quota_family():
@@ -401,10 +407,12 @@ def test_internal_error_does_not_count_or_cool(monkeypatch, note_calls):
         gateway._attempt(_FakeDB(), account, None, {"model": "m"}, "cn",
                          stream=True)
 
-    assert note_calls, "失败仍要留痕（可观测性）"
-    last = note_calls[-1]
-    assert last.get("count_error") is False, "5100007 不许计入 err_count"
-    assert last.get("cool_seconds") in (0, None), "5100007 不许打冷却"
+    # 2026-11-20（上游 PR-01 合入）：5100007 的处置是「同号重试一次 → 如实报错」，
+    # **完全不写账号**（不 note_failure）—— 留痕改由 WARNING 级「失败画像」承担
+    # （gateway._log_failure_profile，每次上游失败各一条）。所以这里锁的是
+    # 「账号一个字段都不动」，比旧断言（note_failure 被调用但 count_error=False）
+    # 更严：既不许计数、也不许留冷却、也不许把整池拉进 exclude。
+    assert not note_calls, "5100007 不许把失败记到账号上（留痕走 WARNING 失败画像）"
     assert account.err_count == before
     assert account.cool_until is None
 

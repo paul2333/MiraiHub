@@ -401,7 +401,8 @@ def uskey_status() -> dict:
 
 def uskey_identity(acct: dict, *, scene: str = "", agent_tag: str = "",
                    conversation_id: str = "", response_id: str = "",
-                   model: str = "", busiid: str = USKEY_BUSIID) -> dict:
+                   model: str = "", busiid: str = USKEY_BUSIID,
+                   signer=None) -> dict:
     """本次请求要用的**整组身份四件套** —— uskey / nonce / conv / rid。
 
     ## 为什么必须打包返回（2026-11-18 事故）
@@ -435,8 +436,9 @@ def uskey_identity(acct: dict, *, scene: str = "", agent_tag: str = "",
     #: 本次 mint 耗时（毫秒）。只用于日志埋点 —— 不放进返回值的 dict 里，
     #: 因为那份 dict 会被 `marvis_ext()` 序列化成请求头，多一个键就是脏头。
     began = time.perf_counter()
+    sign = signer or uskey.sign
     try:
-        sig = uskey.sign(
+        sig = sign(
             agent_tag=agent_tag or "main",
             conversation_id=cid,
             response_id=rid,
@@ -464,18 +466,28 @@ def uskey_identity(acct: dict, *, scene: str = "", agent_tag: str = "",
         # 只给探针/复现实验用 —— 随机 uskey 一定被上游拒。
         log.warning("uskey 签名不可用，按 MARVIS_USKEY_FAIL_CLOSED=0 退回随机填充"
                     "（上游会判 4100404，仅用于复现问题）")
+        try:
+            fallback_qimei = str(uskey.qimei36(uskey.account_key_of(acct)) or "")
+        except Exception:  # noqa: BLE001 - 派生失败就不带设备串，不阻断填写
+            fallback_qimei = ""
         return {"uskey": base64.b64encode(os.urandom(USKEY_BYTES)).decode("ascii"),
                 "nonce": non, "conversation_id": cid, "response_id": rid,
-                "client_version": version, "cached": False}
+                "client_version": version, "qimei36": fallback_qimei,
+                "cached": False}
 
     log.debug("uskey 真签成功 | model=%s | cost=%.2fms", sign_model,
               (time.perf_counter() - began) * 1000.0)
+    # qimei36 一并回传：它写进 uskey 的 TLV 两处，必须与请求头 MarvisExt
+    # 里那一串逐字符相同。调用方（llm_headers）不再自己算设备串，避免
+    # 「签的时候用 A、发头的时候用 B」这类只有上游 4100404 才暴露的错位。
     return {"uskey": sig["uskey"], "nonce": non,
             "conversation_id": cid, "response_id": rid,
-            "client_version": version, "cached": False}
+            "client_version": version,
+            "qimei36": str(sig.get("qimei36") or ""),
+            "cached": False}
 
-def marvis_ext(acct: dict, *, uskey_value: str, qimei36: str,
-               nonce: str) -> str:
+def marvis_ext(acct: dict, *, uskey_value: str = "", qimei36: str = "",
+               nonce: str = "", identity: dict | None = None) -> str:
     """`Ual-Access-MarvisExt` 的值 —— 紧凑 JSON，**不能有空格**（服务端按原文比对）。
 
     键序照客户端抓包：qimei36 → osVersion → guid → uskey → nonce →
@@ -486,8 +498,19 @@ def marvis_ext(acct: dict, *, uskey_value: str, qimei36: str,
     手工拼的 `magic + F(bus_info) + 随机尾` 100% 被拦成 4100404；`qimei36` 必须
     与签这块 uskey 时写进 TLV 的那串完全相同。
     """
-    payload = {
-        "qimei36": str(qimei36),
+    # identity=（uskey_identity() 的返回值）是整组身份四件套的入口：
+    # uskey / nonce 取自同一组，设备串优先用该组里那一串（与签 uskey 时写进
+    # TLV 的完全同源），没有才退回环境变量 MARVIS_QIMEI36。两者都没有时
+    # 不编一个值 —— 编出来的必然与 TLV 对不上，只会换来一个 4100404。
+    if identity is not None:
+        uskey_value = str(identity.get("uskey") or uskey_value or "")
+        nonce = str(identity.get("nonce") or nonce or "")
+        qimei36 = str(identity.get("qimei36") or qimei36
+                      or (os.environ.get("MARVIS_QIMEI36") or "").strip())
+    payload = {}
+    if str(qimei36 or ""):
+        payload["qimei36"] = str(qimei36)
+    payload.update({
         "osVersion": EXT_OS_VERSION,
         "guid": str(acct.get("guid") or ""),
         "uskey": str(uskey_value),
@@ -498,7 +521,7 @@ def marvis_ext(acct: dict, *, uskey_value: str, qimei36: str,
         "clientPlatform": EXT_CLIENT_PLATFORM,
         "clientPlatformVersion": EXT_CLIENT_PLATFORM_VERSION,
         "isIoa": False,
-    }
+    })
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -538,17 +561,15 @@ def llm_headers(acct: dict, *, scene: str = EXT_SCENE,
     `model` 必须是**请求体里的那个 model 原文** —— 它会同时进 bus_info 的
     `model=` 段，拼错一个字符 uskey 的 `F(bus_info)` 就对不上。
     """
-    ident = uskey.new_identity()
-    cid = str(conversation_id or _conversation_id_for(acct) or ident["conversation_id"])
-    rid = str(response_id or ident["response_id"])
+    # 身份四件套只有一个入口（uskey_identity()）：uskey 的 bus_info 里写的
+    # conv/rid 必须与请求头带的那两个完全同源，两边各自生成一次必然错位
+    # （2026-11-18 的事故形态，只有上游 4100404 才暴露）。
+    ident = uskey_identity(acct, scene=scene, agent_tag=agent_tag, model=model,
+                           conversation_id=conversation_id,
+                           response_id=response_id, signer=signer)
+    cid = str(ident["conversation_id"])
+    rid = str(ident["response_id"])
     non = str(nonce or ident["nonce"])
-    sign = signer or uskey.sign
-    # 设备串按账号派生（同一账号恒定、不同账号互不相同）：共享 qimei
-    # 会把多账号打成同一个设备簇，触发 4100404（见 core/uskey.py）。
-    sig = sign(agent_tag=agent_tag, conversation_id=cid, response_id=rid,
-               scene=scene, model=model, nonce=non,
-               openid=str(acct.get("openid") or ""),
-               account_key=uskey.account_key_of(acct))
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -575,8 +596,7 @@ def llm_headers(acct: dict, *, scene: str = EXT_SCENE,
         "Ual-Access-Requestid": rid,
         "Marvis-Protocol-Version": "1000",
         "X-Device-GUID": str(acct.get("guid") or ""),
-        "Ual-Access-MarvisExt": marvis_ext(
-            acct, uskey_value=sig["uskey"], qimei36=sig["qimei36"], nonce=non),
+        "Ual-Access-MarvisExt": marvis_ext(acct, identity=ident),
     }
     # 真客户端这两者恒等；且同一个 rid 已经进了 bus_info 的 marvisResponseID，
     # md5(bus_info) 一旦与 header 不同源，uskey 立刻失效。
