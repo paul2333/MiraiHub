@@ -395,18 +395,27 @@ def _error_payload(exc: client.UpstreamError,
     upstream_code = client._biz_code_of(exc.detail or "").strip()
     headers: dict[str, str] = {}
     family = ""
-    if exc.kind == "max_input_tokens" or upstream_code == "1000007":
+    # 业务码才是判据：3000100 有**两种**到达方式 ——
+    #   ① 400 直回，client._classify() 归 max_input_tokens；
+    #   ② 200 + application/json 业务错误体，client._classify_json_body()
+    #      只认 4100403 / 4100404 / 4100406 三个码，于是归 http_error。
+    # 只认 ① 会让 ② 掉出额度族、被下游说成「上游内部错误（HTTP 502）」——
+    # token 超限被判成上游故障，排障方向全错（2026-11-20 线上 3.32MB 请求
+    # 就是 ② 这个形态，日志里只剩一句 stream_broken）。
+    max_input = (exc.kind == "max_input_tokens"
+                 or upstream_code == "3000100")
+    if max_input or upstream_code == "1000007":
         # 额度族（3000100 / 1000007）：判据是「该号该模型当次可用额度」不够。
         status = 400
-        code = ("max_input_tokens_exceeded"
-                if exc.kind == "max_input_tokens" else "insufficient_quota")
-        err_type = exc.kind or "quota_exceeded"
+        code = ("max_input_tokens_exceeded" if max_input
+                else "insufficient_quota")
+        err_type = ("max_input_tokens" if max_input
+                    else (exc.kind or "quota_exceeded"))
         shown_code = upstream_code
         if shown_code in ("", "400", "401", "402", "403", "404", "422",
                           "429", "500", "502", "503"):
             # detail 抠不出业务码时，exc.code 只是 HTTP 状态 —— 文案里要写上游码。
-            shown_code = ("3000100" if exc.kind == "max_input_tokens"
-                          else "1000007")
+            shown_code = "3000100" if max_input else "1000007"
         message = _quota_tight_message(shown_code, notes)
         family = "quota"
     elif exc.kind == "upstream_internal":
@@ -441,6 +450,86 @@ def _error_payload(exc: client.UpstreamError,
     if upstream_code:
         error_obj["upstream_code"] = upstream_code
     return status, error_obj, headers
+
+
+def _biz_message_of(detail: str) -> str:
+    """从上游错误体里取一句能读的原因（msg / message / detail）。
+
+    取不到就返回空串 —— 调用方只在**有**业务码时才拼这句话，空串不该产出
+    「（上游业务码 3000100：）」这种半句话。
+    """
+    raw = str(detail or "").strip()
+    if not raw:
+        return ""
+    start = raw.find("{")
+    if start > 0:
+        raw = raw[start:]
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        for holder in (data, data.get("error")):
+            if not isinstance(holder, dict):
+                continue
+            for key in ("msg", "message", "detail", "error_msg"):
+                text = holder.get(key)
+                if isinstance(text, str) and text.strip():
+                    return text.strip()[:200]
+    return ""
+
+
+def _stream_business_error(exc: client.UpstreamError,
+                           notes: dict | None = None) -> dict:
+    """流已开始后的上游失败 -> 错误帧的 error 载荷（**必定带业务码**）。
+
+    ## 为什么不能直接解包 _error_payload()（2026-11-20 线上事故）
+
+    _error_payload() 的返回类型是 tuple | None：它只接管额度族 / 上游内部
+    错误那三种 kind，其余**刻意**返回 None（_fail() 里紧跟着 None 判定）。
+    流式分支曾经写成
+
+        status, error_obj, _hdr = _error_payload(exc, notes)
+
+    于是业务码 3000101（upstream_business）与「200 + application/json」形态的
+    3000100（http_error）都拿 None 去解包，当场抛
+
+        TypeError: cannot unpack non-iterable NoneType object
+
+    再被外层 except Exception 兜成 stream_broken：用户看到的是「上游断开」，
+    真实原因是 token 超限 / 参数被拒 —— 3.32 MB 那条请求的现场就是这条链
+    （日志 Marvis 流中断 acc=0，acc=0 是因为 account 还没被赋值）。
+
+    ## 口径（与 _fail() 同一条链，不另起一套文案）
+
+      1. 先走 _error_payload()：额度族 / 上游内部错误，带 family；
+      2. 返回 None 就交回 _fail_payload() 的既有分类 —— _fail() 本来也是
+         这两步，流式分支只是漏了第二步；
+      3. 帧里必须留业务码：upstream_code 有值时同时写进 message，否则客户端
+         只看到一句「HTTP 400/502」，与上游工单对不上号。
+    """
+    picked = _error_payload(exc, notes)
+    if picked is not None:
+        status, error_obj, _headers = picked
+    else:
+        status, error_obj, _headers = _fail_payload(exc, notes)
+    frame = dict(error_obj or {})
+    # 业务码与上游原话**两样都要**：码用来与上游工单对号（upstream_code），
+    # 原话用来解释「为什么被拒」（例如 max input token error）。额度族的既有
+    # 文案（_quota_tight_message）不动，只把上游原文缀在后面 —— 那句文案是
+    # 给用户的结论，原话才是它的依据。
+    code = client._biz_code_of(exc.detail or "").strip()
+    if code:
+        frame.setdefault("upstream_code", code)
+    reason = _biz_message_of(exc.detail or "")
+    shown = str(frame.get("message") or exc.message)
+    if reason and reason not in shown:
+        frame["message"] = "%s；上游原文（%s）：%s" % (
+            shown, code or "业务码未知", reason)
+    elif code and code not in shown:
+        frame["message"] = "%s（上游业务码 %s）" % (shown, code)
+    frame["http_status"] = int(status)
+    return frame
 
 
 def _fail(exc: client.UpstreamError, *, notes: dict | None = None,
@@ -3036,20 +3125,81 @@ def _inband_error(obj: dict) -> str:
     if obj.get("error_code") or obj.get("error_msg"):
         return ("%s %s" % (obj.get("error_code") or "",
                            obj.get("error_msg") or "")).strip()
+    # 裸业务错误体（**没有** error 信封，也**没有** choices）：
+    #
+    #     data: {"code":3000100,"msg":"max input token error"}
+    #
+    # 上游实测就发这个形状。以前这里一个字节都不认（既不是 error 也不是
+    # choices），于是这帧被当成「正常但没有内容」，整条流按成功收尾：
+    # 客户端看到 0 字符的干净结束，服务端记账记成功 —— 与「上游断开」
+    # 一样查不出原因。判定刻意收窄：**有 choices 就不算错误**（上面已返回），
+    # 且必须同时有 code 与可读文案。
+    code = obj.get("code")
+    text = obj.get("msg") or obj.get("message") or obj.get("detail")
+    if (code not in (None, "", 0) and not isinstance(code, (dict, list))
+            and isinstance(text, str) and text.strip()):
+        return ("%s %s" % (code, text.strip()))[:300]
     return ""
 
 
-#: 流读到一半上游断开（socket reset / read timeout）时补发的 error 帧。
-#:
-#: _terminal_frame() 只保证「流有结尾」，不说原因；断流时上游并没有发过任何
-#: 错误帧，客户端看到的就是一个干净的 stop —— 所以这里先补一帧 error 把原因
-#: 说清楚，再让调用方补终止帧。只出现在异常路径上，正常流一个字节都不改。
-_STREAM_BROKEN_FRAME = ("data: %s\n\n" % json.dumps(
-    {"error": {"type": "upstream_stream_broken",
-               "code": "stream_broken",
-               "message": "Marvis 上游流在中途断开（读超时或连接被重置），"
-                          "已收到的内容保持有效，请重试本轮"}},
-    ensure_ascii=False)).encode()
+def _inband_code(obj: dict) -> str:
+    """帧内的**业务码**原文（error 信封里的，或裸 code），取不到返回空串。
+
+    与 _inband_error() 分开是为了让错误帧能带 upstream_code：描述串适合给人
+    看，业务码适合与上游工单对齐、也适合下游按族聚合（见 _error_payload）。
+    """
+    if not isinstance(obj, dict):
+        return ""
+    err = obj.get("error")
+    holders = [err] if isinstance(err, dict) else []
+    holders.append(obj)
+    for holder in holders:
+        raw = holder.get("code")
+        if raw in (None, "", 0) or isinstance(raw, (dict, list, bool)):
+            continue
+        text = str(raw).strip()
+        if text:
+            return text
+    return ""
+
+
+def _stream_broken_frame(*, fault: BaseException | None = None,
+                         seen: bytes = b"") -> bytes:
+    """断流兜底帧：**只有真的解析不出错误**时才用（fallback 里的 fallback）。
+
+    _terminal_frame() 只保证「流有结尾」，不说原因；断流时上游并没有发过任何
+    错误帧，客户端看到的就是一个干净的 stop —— 所以这里先补一帧 error 把原因
+    说清楚，再让调用方补终止帧。只出现在异常路径上，正常流一个字节都不改。
+
+    ## 为什么要带原始片段（2026-11-20）
+
+    这一帧以前只有一句固定的「中途断开」。于是**任何**没被分类的异常（包括
+    上游业务失败被解包成 TypeError 那一类）在客户端侧都长成同一张脸：
+    「上游断开了」，0 正文字符 —— 用户只能无脑重试，维护者只能猜。
+    现在把本端异常类型与本端已经收到的最后 200 字节一起带上：能读出来的
+    业务码（如 3000100 / 3000101）当场可见，读不出来的也留下现场。
+
+    ⚠ 截断 200 字符是有意的：错误帧是给客户端解析的，不是日志转储。
+    """
+    message = ("Marvis 上游流在中途断开（读超时或连接被重置），"
+               "已收到的内容保持有效，请重试本轮")
+    if fault is not None:
+        message = "%s；本端异常：%s: %s" % (
+            message, type(fault).__name__, str(fault)[:120])
+    snippet = (seen or b"")[-200:]
+    text = snippet.decode("utf-8", "replace").strip()
+    if text:
+        message = "%s；最后一帧原文（截断 200 字符）：%s" % (message, text)
+    return ("data: %s\n\n" % json.dumps(
+        {"error": {"type": "upstream_stream_broken",
+                   "code": "stream_broken",
+                   "message": message,
+                   "http_status": 502}},
+        ensure_ascii=False)).encode()
+
+
+#: 兼容旧引用（其它模块 / 老测试直接取这一帧时拿到的就是无附加信息的形态）。
+_STREAM_BROKEN_FRAME = _stream_broken_frame()
 
 
 def _terminal_frame(model: str) -> bytes:
@@ -3112,7 +3262,10 @@ def _scan_stream(pending: bytes, chunk: bytes, state: dict) -> bytes:
                 if isinstance(item, dict) and item.get("finish_reason"):
                     state["finish"] = True
         elif not state.get("error"):
-            state["error"] = _inband_error(obj)
+            desc = _inband_error(obj)
+            if desc:
+                state["error"] = desc
+                state["error_code"] = _inband_code(obj)
     return pending
 
 
@@ -3295,6 +3448,9 @@ async def chat_completions(request: Request):
         key = resp = account = started = None
         buffer = b""
         pending = b""
+        # 只保留最后 ~1KB：真断流时兜底帧要能说清断在哪一帧（见
+        # _stream_broken_frame）。正常流一个字节都不会用到它。
+        seen = bytearray()
         # 只读旁路状态：usage / finish_reason / [DONE] / 流内错误（见 _scan_stream）。
         state = {"usage": {}, "finish": False, "done": False, "error": ""}
         reaped = [False]
@@ -3344,9 +3500,17 @@ async def chat_completions(request: Request):
                         "http_status": int(exc.status)})
                     return
                 except client.UpstreamError as exc:
-                    status, error_obj, _hdr = _error_payload(exc, notes)
-                    yield _sse_error_frame(dict(error_obj,
-                                                http_status=int(status)))
+                    # ⚠ 不许再解包 _error_payload()：它是 Optional，业务码
+                    # 3000101 / 「200+JSON」形态的 3000100 都返回 None，解包
+                    # 当场抛 TypeError 被下面的 except Exception 兜成
+                    # stream_broken（2026-11-20 线上 3.32MB 请求，acc=0）。
+                    # 错误面统一由 _stream_business_error() 出：业务码一定在帧里。
+                    logger.warning(
+                        "Marvis 流式上游失败 acc=%s kind=%s code=%s upstream=%s",
+                        int(getattr(account, "id", 0) or 0), exc.kind,
+                        exc.code or "-",
+                        client._biz_code_of(exc.detail or "") or "-")
+                    yield _sse_error_frame(_stream_business_error(exc, notes))
                     return
                 except Exception as exc:  # noqa: BLE001 - 流已开始，只能补帧
                     logger.warning("Marvis 流式建连异常: %s: %s",
@@ -3362,6 +3526,9 @@ async def chat_completions(request: Request):
                 if first_at is None:
                     first_at = time.perf_counter()
                     stats["ttfb_ms"] = int((first_at - started) * 1000)
+                seen += chunk
+                if len(seen) > 4096:
+                    del seen[:-1024]
                 yield chunk
                 # 只读旁路：解析 usage / finish_reason / 流内错误。
                 # **转发的字节一个都不改**，只记账与收尾需要这些信息。
@@ -3385,18 +3552,41 @@ async def chat_completions(request: Request):
                         "upstream_business", detail=str(state["error"])[:200])
                 except Exception:  # noqa: BLE001 - 哨兵坏了不能挡住收尾
                     pass
-                yield _sse_error_frame({
+                inband_frame = {
                     "type": "upstream", "code": "stream_inband_error",
                     "message": "Marvis 上游在流内返回错误：%s"
                                % str(state["error"])[:300],
                     "http_status": 200,
-                })
+                }
+                # 业务码单独成列：描述串给人看，码用来与上游工单对号。
+                inband_code = str(state.get("error_code") or "")
+                if inband_code:
+                    inband_frame["upstream_code"] = inband_code
+                yield _sse_error_frame(inband_frame)
                 # _sse_error_frame 自带 [DONE]，不再补终止帧。
                 state["done"] = True
             if not state.get("done"):
                 # 上游有头无尾（提前 EOF / 错误帧后直接断）：补终止帧，别让客户端
                 # 以为连接掉了、无脑重试。
                 yield _terminal_frame(str(upstream_body.get("model") or slot))
+        except client.UpstreamError as exc:
+            # 流内（读完之前）抛上来的上游失败：与 acquire 段**同一条口径**，
+            # 业务码必须跟着帧走 —— 不许落到下面那条「断流」兜底里，否则
+            # 又回到「token 超限被说成上游断开」的老问题上。
+            logger.warning("Marvis 流内上游失败 acc=%s kind=%s code=%s: %s",
+                           int(getattr(account, "id", 0) or 0), exc.kind,
+                           exc.code or "-", str(exc)[:200])
+            state["error"] = "upstream_business"
+            try:
+                from admin import request_metrics
+
+                request_metrics.mark_stream_error()
+                request_metrics.mark_request_error("stream_interrupted")
+            except Exception:  # noqa: BLE001
+                pass
+            # _sse_error_frame 自带 [DONE]，不再补终止帧。
+            yield _sse_error_frame(_stream_business_error(exc, notes))
+            return
         except Exception as exc:  # noqa: BLE001 - 流已开始，只能补帧收尾
             # ④ 上游流中途断开：状态码在 headers-first 时已经发出去了，改不了。
             # 不补这一帧，客户端看到的是「流突然断掉」，只会无脑重试。
@@ -3411,9 +3601,12 @@ async def chat_completions(request: Request):
                 request_metrics.mark_request_error("stream_interrupted")
             except Exception:  # noqa: BLE001
                 pass
-            # 先补一帧 stream_broken 说明原因（上游什么都没发），再补终止帧；
+            # 先补一帧 stream_broken 说明原因（上游什么都没发 / 本端读挂了），
+            # 再补终止帧。帧里带本端异常类型与最后 200 字节原文：连错误帧都
+            # 解析不出来的这种时候，原始片段是**唯一**的现场证据。
             # 两帧都是合法 data 行，客户端能正常收尾而不是无限重试。
-            yield _STREAM_BROKEN_FRAME
+            yield _stream_broken_frame(fault=exc,
+                                       seen=bytes(seen) or pending)
             yield _terminal_frame(str(upstream_body.get("model") or slot))
         finally:
             stats["total_ms"] = int((time.perf_counter() - began) * 1000)
