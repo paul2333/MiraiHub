@@ -244,6 +244,10 @@ TICKET_workbuddy_logout_p0.md
 !tests/test_async_sync_consistency.py
 !tests/test_marvis_risk_backoff.py
 
+# uskey 本地 mint：字节闸门 376/512/200 + 整组身份轮换 + 4100404 契约
+# （原 test_marvis_uskey_sidecar.py 的 8 条与侧车无关的断言，随侧车删除后重写）
+!tests/test_marvis_uskey.py
+
 # 逆向过程产物：抓包、内存镜像、反汇编清单，体积大且不可复现，不入库
 *.mitm
 *.pcap
