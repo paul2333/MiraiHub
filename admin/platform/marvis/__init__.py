@@ -70,8 +70,57 @@ def _validate_qimei_pool() -> None:
     qimei_assign.install_orm_hooks()
 
 
+def check_egress(strict: bool = False) -> bool:
+    """启动期出口池自检：空池**不许静默**（静默退回直连比直接报错更难查）。
+
+    为什么非要有这一条：`core/egress_pool.json` 不进 git（数据一律不进仓库，
+    见 .gitignore 与 `core/egress.py` 的 docstring），于是**从全新 clone 构建的
+    镜像天然没有这个文件** —— 池一空 `egress.pick()` 就返回 ""，请求退回平台
+    出口 / 直连；出口 IP 一变上游就回 4100404，而错误面**完全看不出是「池丢了」**。
+    5e4fb04 之后线上之所以还能跑，只是因为构建源 `rel2` 的工作副本里恰好还留着
+    这个未跟踪文件 —— 那个隐式依赖必须被打断（`MARVIS_EGRESS_POOL` 内联注入）。
+
+    三级判据：
+      · 池非空 → INFO（日志里看得见条数，排障时一眼确认池真接上了）；
+      · 池为空 → WARNING，**不 crash**：egress.py 的契约是「没有池照样跑」，
+        其它平台、本地开发、纯前端调试都不该被一个可选加速项拖死；
+      · 池为空且 `MARVIS_EGRESS_REQUIRED=1` 且 `strict=True`
+        → 抛 RuntimeError：部署侧明确要求「没池就别起」，这时静默降级才是事故。
+
+    `strict=True` 只由 FastAPI startup 用（`admin/server.py::_startup`）：
+    `install()` 里的异常会被 `admin.platform.loader` 逐项容错吞掉，装在
+    install() 里起不到「拒绝启动」的作用。
+
+    返回池是否非空（便于测试与调用方决定后续行为）。
+    """
+    import os as _os
+
+    from admin.platform.marvis.core import egress as _egress
+
+    pool = _egress.exits()
+    if pool:
+        logger.info("出口池已就绪：%d 个出口（按账号 sha256 固定映射）", len(pool))
+        return True
+
+    message = (
+        "出口池为空：egress.pick() 返回 \"\"，请求退回平台出口 / 直连。"
+        "core/egress_pool.json 不进 git（全新 clone 默认没有这个文件），"
+        "请用 MARVIS_EGRESS_POOL（内联 JSON 数组或逗号串）或 "
+        "MARVIS_EGRESS_POOL_FILE（文件路径）注入；"
+        "否则出口 IP 一变上游就回 4100404，且错误面看不出是池丢了。"
+    )
+    if strict and (_os.environ.get("MARVIS_EGRESS_REQUIRED") or "").strip() == "1":
+        raise RuntimeError(
+            message + "（MARVIS_EGRESS_REQUIRED=1：拒绝以降级形态启动）")
+    logger.warning(message)
+    return False
+
+
 def install() -> None:
     """登记 PlatformSpec（幂等）。"""
+    # 出口池自检排第一：它决定了所有出口请求是走池还是裸奔直连，
+    # 池空必须在上线后第一屏日志里就能看见（见 check_egress 的 docstring）。
+    check_egress()
     _validate_qimei_pool()
     from admin.platform import registry as _registry
 

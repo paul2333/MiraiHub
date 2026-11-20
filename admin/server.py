@@ -503,6 +503,20 @@ app.include_router(join_gate_api.router)
 
 @app.on_event("startup")
 def _startup():
+    # Marvis 出口池硬闸门（**只**在 MARVIS_EGRESS_REQUIRED=1 时才可能抛错）。
+    #
+    # 为什么不放在 marvis.install()：平台装配走 admin.platform.loader 的
+    # 逐项 try/except（「单个平台装配失败不得影响主服务启动」），异常会被吞成
+    # 一条 warning，进程照样起 —— 闸门等于没装。这里在 uvicorn 启动钩子里，
+    # 抛出去就是进程退出，才是部署侧要的「没池就别起」。
+    # 默认（未设 REQUIRED）仍是 WARNING，不拦启动。
+    try:
+        from admin.platform.marvis import check_egress
+    except ImportError:  # marvis 目录被裁剪：本平台的事，不该拖累启动
+        pass
+    else:
+        check_egress(strict=True)
+
     # 启动手机号登录会话的**定时回收**线程。
     #
     # 为什么必须定时回收：原来的 `_gc_locked()` 只在「新建会话」时被调用，

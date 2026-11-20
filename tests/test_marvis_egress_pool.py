@@ -11,12 +11,16 @@
   5. 配了出口 → opener 装的是 `ProxyHandler(真实代理)`；
      没配 → 与改动前一致（`ProxyHandler({})`，硬禁代理）；
   6. `open_chat_stream()` 空池走直连、不绑 contextvar；有池就绑；
-     传输层失败回退平台出口，业务错误**不回退**（不二次记账）。
+     传输层失败回退平台出口，业务错误**不回退**（不二次记账）；
+  7. 启动期 fail-fast：池空 → WARNING（不崩），`MARVIS_EGRESS_REQUIRED=1`
+     → 抛错 —— 因为「全新 clone 构建的镜像没有 egress_pool.json」这件事
+     必须在第一屏日志里看得见，不能靠 rel2 工作副本里那份未跟踪文件兜着。
 
 跑法：`python tests/test_marvis_egress_pool.py`（仓库现有测试都是这个形态）。
 """
 import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -32,7 +36,7 @@ from admin.platform.marvis.core import client, egress
 
 ok = fail = 0
 _ENV_KEYS = ("MARVIS_EGRESS_POOL", "MARVIS_EGRESS_POOL_FILE",
-             "MIRAIHUB_MARVIS_PROXY")
+             "MARVIS_EGRESS_REQUIRED", "MIRAIHUB_MARVIS_PROXY")
 
 
 def check(name, cond, extra=""):
@@ -295,6 +299,123 @@ def main():
     finally:
         client._open_chat_stream_direct = real_direct
         client.reset_egress_openers()
+
+    # ---- 7. 启动期 fail-fast：池空不许静默 ----
+    #
+    # 这一节锁的是**全新 clone 构建**这条路：`egress_pool.json` 不进 git
+    #（数据一律不进仓库），新 clone 出来的镜像里没有这个文件 —— 池一空
+    # `_load()` 就返回 []，`pick()` 全 ""，请求退回直连；出口 IP 一变上游就是
+    # 4100404，而错误面完全看不出「池丢了」。线上 5e4fb04 能跑，只因为构建源
+    # rel2 的工作副本里恰好留了这个未跟踪文件 —— 这条隐式依赖必须被日志打穿。
+    from admin.platform import marvis as marvis_platform
+
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    def warns():
+        return [r for r in records if r.levelno >= logging.WARNING]
+
+    collector = _Collect()
+    marvis_logger = logging.getLogger("admin.platform.marvis")
+    saved_level = marvis_logger.level
+    marvis_logger.addHandler(collector)
+    marvis_logger.setLevel(logging.DEBUG)  # INFO 也要收，后面按 levelno 过滤
+    try:
+        # 7.1 全新 clone 的形态：**无 env、无文件** → 启动不崩，但必须 WARNING。
+        # 直接把 DEFAULT_POOL_FILE 指到不存在的临时路径来复现（模块全局，
+        # finally 里立刻还原 —— 这里必须动它，否则本机那份真值池会把空池盖住，
+        # 测的就不是「全新 clone」了）。
+        real_pool_file = egress.DEFAULT_POOL_FILE
+        restore = env(MARVIS_EGRESS_POOL=None, MARVIS_EGRESS_POOL_FILE=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            egress.DEFAULT_POOL_FILE = os.path.join(tmp, "egress_pool.json")
+            egress.reload()
+            try:
+                records.clear()
+                crashed, ready = None, None
+                try:
+                    ready = marvis_platform.check_egress()
+                except Exception as exc:  # noqa: BLE001 - 崩了就是这里要抓的
+                    crashed = exc
+                check("全新 clone（无 env、无文件）→ 启动不崩", crashed is None, crashed)
+                check("全新 clone → check_egress() 返回 False", ready is False, ready)
+                check("全新 clone → exits() 为空", egress.exits() == [])
+                hit = warns()
+                check("全新 clone → 打 WARNING（池空必须有声音）",
+                      len(hit) == 1, [r.getMessage() for r in hit])
+                text = hit[0].getMessage() if hit else ""
+                check("WARNING 写明注入方式（MARVIS_EGRESS_POOL）",
+                      "MARVIS_EGRESS_POOL" in text, text)
+                check("WARNING 写明后果（4100404）", "4100404" in text, text)
+            finally:
+                egress.DEFAULT_POOL_FILE = real_pool_file
+                restore()
+
+        # 7.2 env 显式空池（"[]"）：同样 WARNING、同样不崩。
+        restore = env(MARVIS_EGRESS_POOL="[]", MARVIS_EGRESS_POOL_FILE=None,
+                      MARVIS_EGRESS_REQUIRED=None)
+        try:
+            records.clear()
+            check('env "[]" → exits() 为空', egress.exits() == [])
+            check('env "[]" → check_egress() False 且不崩',
+                  marvis_platform.check_egress() is False)
+            check('env "[]" → 打 WARNING', len(warns()) == 1,
+                  [r.getMessage() for r in records])
+        finally:
+            restore()
+
+        # 7.3 有池（内联 JSON）：解析正确、不 WARNING、INFO 里看得见条数。
+        restore = env(MARVIS_EGRESS_POOL='["http://egress-a.example:8080"]',
+                      MARVIS_EGRESS_POOL_FILE=None, MARVIS_EGRESS_REQUIRED=None)
+        try:
+            records.clear()
+            check("内联 JSON → exits() 解析正确",
+                  egress.exits() == ["http://egress-a.example:8080"], egress.exits())
+            check("内联 JSON → check_egress() True",
+                  marvis_platform.check_egress() is True)
+            check("有池 → 不打 WARNING", warns() == [],
+                  [r.getMessage() for r in warns()])
+            check("有池 → INFO 里有出口条数",
+                  any(r.levelno == logging.INFO and "1 个出口" in r.getMessage()
+                      for r in records), [r.getMessage() for r in records])
+        finally:
+            restore()
+
+        # 7.4 MARVIS_EGRESS_REQUIRED=1 + 池空 → 硬失败（strict=True 才走）。
+        restore = env(MARVIS_EGRESS_POOL="[]", MARVIS_EGRESS_POOL_FILE=None,
+                      MARVIS_EGRESS_REQUIRED="1")
+        try:
+            raised = None
+            try:
+                marvis_platform.check_egress(strict=True)
+            except RuntimeError as exc:
+                raised = exc
+            check("MARVIS_EGRESS_REQUIRED=1 且池空 → 抛 RuntimeError",
+                  raised is not None, raised)
+            check("抛错信息带 REQUIRED 说明",
+                  raised is not None and "MARVIS_EGRESS_REQUIRED=1" in str(raised),
+                  raised)
+            # install() 走的是 strict=False：同一状态下只告警，不能把平台装配打断。
+            check("同一状态 check_egress() 不抛（install 路径只告警）",
+                  marvis_platform.check_egress() is False)
+        finally:
+            restore()
+    finally:
+        marvis_logger.removeHandler(collector)
+        marvis_logger.setLevel(saved_level)
+
+    # ---- 7.5 接线必须真的存在（删掉调用就等于把闸门拆了） ----
+    with open(os.path.join(ROOT, "admin", "platform", "marvis", "__init__.py"),
+              encoding="utf-8") as fh:
+        marvis_src = fh.read()
+    with open(os.path.join(ROOT, "admin", "server.py"), encoding="utf-8") as fh:
+        server_src = fh.read()
+    check("install() 里调了 check_egress()", "    check_egress()" in marvis_src)
+    check("FastAPI startup 里调了 check_egress(strict=True)",
+          "check_egress(strict=True)" in server_src)
 
     print()
     print("%d/%d passed" % (ok, ok + fail))
