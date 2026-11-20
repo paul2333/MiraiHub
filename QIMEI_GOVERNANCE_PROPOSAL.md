@@ -1,5 +1,14 @@
 # 设备身份（qimei）治理提案
 
+> ⚠️ **已过时（文件已删）**：本文引用的 `uskey_signer.py` / `uskey_remote.py` /
+> `uskey_cache.py` / `docs/uskey-wine-deploy.md` / `docs/uskey-reverse-report.md` /
+> `tools/uskey_sign_service.py` / `deploy/marvis-uskey-sidecar/` / `vendor/beacon/*.dll`
+> 均已在 commit `0cd124d`（`chore(marvis): drop the wine-based uskey sidecar`）中删除。
+> 文中所有 `文件:行号` 都是**历史行号**，指向 `3e797bc` 及更早的版本，不是当前仓库内容；
+> 每处引用行尾的 `<!-- 0cd124d 删除 -->` 就是这个标记。
+> 保留本文只为留存问题现象与治理思路；实现现状见 `admin/platform/marvis/core/uskey.py`
+> （纯 Python mint，唯一签名路径，无侧车、无 DLL、无 HTTP 回落）。
+
 - 目标仓：xiaofan6ya/MiraiHub，基线 origin/main = 8cf3c15
 - 性质：改进提案稿（只写稿，不含提交/推送）
 
@@ -13,13 +22,13 @@
 
 证据链：
 
-- `uskey_signer.py:293` 是模块级单例 `_beacon = _Beacon()`，进程内只加载一次 DLL。
-- `uskey_signer.py:195-198` 通过 ctypes 调 `beacon_get_uskey(busiid, bus_info, out, size)`，四个参数里没有 guid、没有 device 入参。
-- `uskey_signer.py:299-312` per-account 唯一的差异是 bus_info 里的 originOpenID 和随机 nonce。
+- `uskey_signer.py:293` 是模块级单例 `_beacon = _Beacon()`，进程内只加载一次 DLL。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
+- `uskey_signer.py:195-198` 通过 ctypes 调 `beacon_get_uskey(busiid, bus_info, out, size)`，四个参数里没有 guid、没有 device 入参。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
+- `uskey_signer.py:299-312` per-account 唯一的差异是 bus_info 里的 originOpenID 和随机 nonce。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 - `tools/uskey_sign_service.py:62-63` 同样是进程内单例，请求体只有 `{busiid, bus_info}`，没有 qimei 入参。
-- `uskey_remote.py:54` 网关默认打 `127.0.0.1:8792/sign`，所有网关共用一个签名器。
+- `uskey_remote.py:54` 网关默认打 `127.0.0.1:8792/sign`，所有网关共用一个签名器。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 - `docs/uskey-wine-deploy.md:130-131` 单 prefix（HOME=/opt/marvis-sign，WINEPREFIX=/opt/marvis-sign/.wine）。
-- `uskey_signer.py:108-112` 的 `_DEFAULTS` 只有 agent_tag/scene/model，没有 qimei；`uskey_signer.py:82` 全文件唯一一处 qimei 出现在注释里。也就是说 Python 层没有账号级设备概念，qimei 由 qimei.dll 在 prefix 环境里算，输入是宿主机 MAC、卷序列号这一类东西。
+- `uskey_signer.py:108-112` 的 `_DEFAULTS` 只有 agent_tag/scene/model，没有 qimei；`uskey_signer.py:82` 全文件唯一一处 qimei 出现在注释里。也就是说 Python 层没有账号级设备概念，qimei 由 qimei.dll 在 prefix 环境里算，输入是宿主机 MAC、卷序列号这一类东西。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 
 结论：1 个部署 = 1 个 qimei = 1 台设备，账号数量不改变这个事实。上游按设备归因风险，所以风险以部署为单位传导，而不是以账号为单位。
 
@@ -32,7 +41,7 @@
 两个后果：
 
 1. 任何照抄这串值的人，设备身份与那台真机相同，那台真机上的官方客户端会被一起连坐。这是把风险转嫁给无关用户。
-2. 「固定」与代码事实相反 —— `uskey_signer.py:108-112` 的 `_DEFAULTS` 里没有 qimei，`uskey_signer.py:82` 只在注释里提到它，代码层面本来就不可能写死。文档给出的是一条走不通的路。
+2. 「固定」与代码事实相反 —— `uskey_signer.py:108-112` 的 `_DEFAULTS` 里没有 qimei，`uskey_signer.py:82` 只在注释里提到它，代码层面本来就不可能写死。文档给出的是一条走不通的路。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 
 建议：立即删除或打码成 `<REDACTED_QIMEI36>`，并在同页加一行加粗警告：qimei 是设备级标识，随运行环境生成，一个部署一份，不可写死、不可跨部署共享。
 
@@ -58,7 +67,7 @@ Docker 路线更糟：
 
 - 文档里搜 轮换 / 隔离 / 共享 / 多账号 / device，零命中。
 - git log 里没有设备隔离或轮换相关提交。
-- `uskey_cache.py` 的 `_CACHE_TRUST_SECONDS = 0`，每次都现签 —— 这只解决重放，不解决多账号共设备。
+- `uskey_cache.py` 的 `_CACHE_TRUST_SECONDS = 0`，每次都现签 —— 这只解决重放，不解决多账号共设备。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 
 结果是：一旦发现设备被标记，使用者手里没有任何受支持的处置动作，只能自己猜。
 
@@ -72,13 +81,13 @@ Docker 路线更糟：
 
 进程启动时做三项检查，任一失败就显式报错退出，不要静默 fail-closed：
 
-- vendor 下 DLL 是否存在、能否 load（对应 `uskey_signer.py:293` 的加载点）
+- vendor 下 DLL 是否存在、能否 load（对应 `uskey_signer.py:293` 的加载点）  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 - 首次启动把 prefix 卷序列号 + 当前 qimei 指纹写入 `<prefix>/.deploy-id`
 - 后续启动比对：qimei 变了（环境漂移）、或同一 qimei 出现在另一个 deploy-id（克隆）都报错
 
 ### 3) 多设备分片
 
-支持配置多个签名后端（多 prefix / 多侧车进程），按账号哈希分配，使单个 qimei 只承载少量账号。我们实测每设备 1-2 个号是安全的。改动面：`uskey_remote.py:54` 从单 URL 改成后端列表；`tools/uskey_sign_service.py:62-63` 从单例改成按 backend 索引的实例表；分配用 openid 哈希取模，保证同一账号稳定落到同一后端。
+支持配置多个签名后端（多 prefix / 多侧车进程），按账号哈希分配，使单个 qimei 只承载少量账号。我们实测每设备 1-2 个号是安全的。改动面：`uskey_remote.py:54` 从单 URL 改成后端列表；`tools/uskey_sign_service.py:62-63` 从单例改成按 backend 索引的实例表；分配用 openid 哈希取模，保证同一账号稳定落到同一后端。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 
 ### 4) 轮换流程
 
@@ -98,7 +107,7 @@ Docker 路线更糟：
 
 1. `docs/uskey-reverse-report.md:17,87` —— 删除真机 qimei36，替换为 `<REDACTED_QIMEI36>`，同页加粗警告。
 2. `docs/uskey-wine-deploy.md` —— 加一节「设备身份」：一部署一份、不可写死、prefix 不可复制分发、换 MAC 会被识别为新设备。
-3. 启动自检 —— DLL 存在性 + `<prefix>/.deploy-id` 克隆检测，失败显式报错（`uskey_signer.py:293` 附近）。
+3. 启动自检 —— DLL 存在性 + `<prefix>/.deploy-id` 克隆检测，失败显式报错（`uskey_signer.py:293` 附近）。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 4. `status()` —— 增加 qimei 指纹与 openid 计数（`tools/uskey_sign_service.py:62-63`）。
-5. 多后端配置 —— `USKEY_BACKENDS` 列表 + 按 openid 哈希取模（`uskey_remote.py:54`）。
+5. 多后端配置 —— `USKEY_BACKENDS` 列表 + 按 openid 哈希取模（`uskey_remote.py:54`）。  <!-- 0cd124d 删除；行号指向 3e797bc 历史版本 -->
 6. `Dockerfile:17-20` —— 补 COPY vendor + wine，或在文档声明必须外挂签名服务。
