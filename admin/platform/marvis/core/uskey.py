@@ -1,62 +1,43 @@
-"""Marvis uskey 签名侧车客户端 —— 生产口径。
+"""Marvis uskey —— 纯 Python 本地 mint（唯一签名路径）。
 
-## 两条路径：本地 mint（默认）→ 侧车（降级）
+## 只有一条路径
 
-**2026-11-18 起 uskey 可以纯 Python 本地生成**，算法在 `core/uskey_local.py`：
-三段（TEA 双反馈 → 异或掩 → AES-128-CBC）全部逆出来了，4/4 条真实 uskey
-逐字节复现，且 `dev18` 用 `os.urandom(18)` 全随机也是上游 **HTTP 200**
-（2026-11-18 实测 1.90 s，真实出字）。所以默认路径是 `_local_sign()`。
+算法全在 `core/uskey_local.py`：三段（TEA 双反馈 → 异或掩 → AES-128-CBC）
+已经逆完，4/4 条真实 uskey 逐字节复现；`dev18` 用 `os.urandom(18)` 全随机
+上游也是 HTTP 200（2026-11-18 实测 1.90 s，真实出字）。所以本模块只做三件事：
+拼 bus_info、按账号取设备串、调 :func:`uskey_local.mint_uskey`。
 
-侧车（Wine + Windows node.exe，见 `deploy/marvis-uskey-sidecar/`）保留为
-**降级路径**：本地 mint 抛异常时才 POST 它（`_http_sign()`）。要强制走侧车
-（排障 / 对照实验）设 `MARVIS_USKEY_FORCE_SIDECAR=1`。
+**2026-11-20 起只有这一条路**：仓库里没有任何外部签名服务、DLL 或
+子进程代签，本模块也不再有任何 HTTP 回落。签不出来就抛 :class:`MintError`，
+上层当「平台暂时不可用」处理 —— **绝不**退化成随机 uskey：
+那会把「签名不可用」变成「4100404 风控」，还会把风控计数算到账号头上。
 
-历史坑（别再踩）：当年手工拼 `magic + F(bus_info) + 随机尾` 100% 撞
-`4100404`，是因为 TLV 里还有 md5(bus_info)、两处 qimei36、15 字节进程常量
+## 历史坑（别再踩）
+
+当年手工拼 `magic + F(bus_info) + 随机尾` 100% 撞 `4100404`，
+是因为 TLV 里还有 md5(bus_info)、两处 qimei36、15 字节进程常量
 和 TEA/异或/AES 三层；**不是**"必须由 SDK 出"。现在三层都在
 `uskey_local.py` 里，且偏移有校准常量（`OFF_*`），别手调。
 
-## 侧车当年的证据（降级路径仍然可用）
-
-Wine 生成的 uskey 是 480 字符 / 360 字节（真机 504/376），`getQimei()` 报的是
-Wine 虚拟设备指纹 `3aeda2c4343993fc64eec8c830001591ab11`；这一组直打
-`/v1/chat/completions`（账号 190）**上游同样 200**。
-⇒ 服务端认的是「uskey 内部自洽 + bus_info 与 header 一致」，不是真机指纹。
-
 ## 铁律
 
-* 本地 mint 失败**才**回落侧车；两条都失败就抛 `SidecarError`，
-  **绝不**退化成随机 uskey —— 那会把「签名不可用」变成「4100404 风控」，
-  还会把风控计数算到账号头上。
+* 签名失败就抛异常，**绝不**填充随机字节 —— 见上面那段。
 * 每组 `(cid, rid, nonce, uskey)` 只能用一次；撞 4100404 必须**整组换新**。
 * `qimei36` 必须与签这块 uskey 时用的那串**完全一致**（它写进 TLV 两处）；
-  默认走内置常量，换设备串设 `MARVIS_QIMEI36`。
+  优先 qimei 真值表，没有才按账号派生；不允许共享常量。
 """
 from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import logging
 import os
 import secrets
-import urllib.error
-import urllib.request
 import uuid
 
 logger = logging.getLogger("admin.platform.marvis.uskey")
 
-#: 侧车地址。MiraiHub 跑在容器里时 `127.0.0.1` 是**容器自己**，
-#: 必须走宿主 docker0 网关，所以默认值是 `172.17.0.1`。
-#: 侧车与 MiraiHub 同 netns（host 网络 / 本机调试）时用
-#: `MARVIS_USKEY_SIDECAR=http://127.0.0.1:8791/uskey` 覆盖。
-SIDECAR_URL = (os.environ.get("MARVIS_USKEY_SIDECAR")
-               or "http://172.17.0.1:8791/uskey").strip()
-
-#: 侧车超时（秒）。侧车正常是毫秒级，5 s 只用来兜住「Wine 卡死」。
-SIDECAR_TIMEOUT = float(os.environ.get("MARVIS_USKEY_TIMEOUT") or 5.0)
-
-#: Beacon 的业务 id —— 侧车固定用它调 `getUskey`。
+#: Beacon 的业务 id —— 只作服务端路由标识，不参与运算。
 BUSINESS_ID = "7800255"
 
 #: uskey 的 base64 头（= magic `0ac0d50c2111` 的前 8 字符）。只做体检。
@@ -68,13 +49,10 @@ USKEY_HEAD = "CsDVDCE"
 #: 8 个不同 guid 共用一个 qimei => 上游把这台"设备"整体标记，连真客户端
 #: 一起 4100404。真机常量已删除，**不要把它写回代码**。
 #:
-#: 形态（2026-11-18 由三个真实样本逆出：真机 / 侧车 / Wine）：
+#: 形态（2026-11-18 由三个真实样本逆出）：
 #:   字符 0-23   (字节 0-11 ) 12 字节设备摘要，随环境变
 #:   字符 24-27  (字节 12-13) '3000' —— 跨环境恒定，是**格式标记**，不是数据
 #:   字符 28-35  (字节 14-17) 4 字节尾段，可变
-#:    真机 84097bfe4bec892cb32e99d7 | 3000 | 1bd1a611
-#:    侧车 36aa5d5bcd60d5878553c2b5 | 3000 | 1851ab12
-#:    Wine 3aeda2c4343993fc64eec8c8 | 3000 | 1591ab11
 #: 旧实现是 md5()[:34] + "ab12"：'3000' 格式标记被冲掉（只有 1/65536 概率撞上），
 #: 且 8 个账号尾段全是 ab12 —— 格式非法 + 尾段聚簇，等于自报"假的"。
 #:
@@ -86,7 +64,7 @@ DEVICE_MARK = "3000"
 
 #: 字节下限 = 真品口径 **376**（504 字符 base64）。
 #:
-#: 历史：300 → 240 是因为侧车漂移出 264 字节的包，账号 190 打过去居然 200，
+#: 历史：300 → 240 是因为旧实现漂移出 264 字节的包，账号 190 打过去居然 200，
 #: 于是把阈值降下来"放行"。2026-11-18 真客户端 200 抓包证明真品是 376 字节，
 #: 264 那版是「旧形态 + 仿的身份」（SDK 1.0.0.0 / node.exe / Not Specified、
 #: 没有 320 字节业务 TLV），后来上游收紧即全线 4100404。
@@ -95,8 +73,27 @@ DEVICE_MARK = "3000"
 USKEY_MIN_BYTES = int(os.environ.get("MARVIS_USKEY_MIN_BYTES") or 376)
 
 
-class SidecarError(RuntimeError):
-    """侧车不可用或返回不合法（上层按 `network` / 平台不可用处理）。"""
+class MintError(RuntimeError):
+    """本地 mint 不可用，且调用方要求 **fail-closed**（不许用随机字节顶替）。
+
+    ## 为什么需要这个异常（fail-closed 的理由）
+
+    签名不可用时如果「随机填充 376 字节」，看上去网关还活着，实际后果：
+
+      · 上游一定回 `4100404 请求被风控拦截`；
+      · 上层会把这个 4100404 记成**当前账号**的失败并挂冷却 ——
+        一个环境问题被写成「账号被风控」，用户去换号、重扫码、换 Key，
+        全是无效动作；
+      · 连撞几个号，整池进入风控冷却，网关自己开始回 `503 accounts_cooling`，
+        真正的故障点被彻底掩盖。
+
+    fail-closed 的做法是：**签不出来就别发请求**，把原因直说。
+    """
+
+    def __init__(self, message: str, *, detail: str = ""):
+        super().__init__(message)
+        self.message = message
+        self.detail = detail
 
 
 #: 测试与离线环境的注入点：`set_signer(lambda **kw: {...})`。
@@ -119,7 +116,6 @@ def fail_closed() -> bool:
     """
     raw = (os.getenv("MARVIS_USKEY_FAIL_CLOSED") or "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
-
 
 
 def new_identity() -> dict:
@@ -152,21 +148,21 @@ def bus_info(*, agent_tag: str, conversation_id: str, response_id: str,
 
 
 def _validate(payload: dict) -> dict:
-    """校验侧车回包；不合法就抛 —— **绝不**兜底造一个 uskey。"""
+    """校验产物；不合法就抛 —— **绝不**兜底造一个 uskey。"""
     if not isinstance(payload, dict):
-        raise SidecarError("侧车回包不是 JSON 对象")
+        raise MintError("签名结果不是 JSON 对象")
     uskey = str(payload.get("uskey") or "")
     qimei36 = str(payload.get("qimei36") or "")
     if not uskey:
-        raise SidecarError("侧车没有返回 uskey：%s" % payload.get("error") or payload)
+        raise MintError("没有返回 uskey：%s" % payload.get("error") or payload)
     try:
         raw = base64.b64decode(uskey, validate=True)
     except Exception as exc:  # noqa: BLE001
-        raise SidecarError("侧车返回的 uskey 不是合法 base64") from exc
+        raise MintError("返回的 uskey 不是合法 base64") from exc
     if len(raw) < USKEY_MIN_BYTES:
-        raise SidecarError("侧车返回的 uskey 太短（%d 字节 < %d；uskeyLen=%d qimei36=%s）" % (len(raw), USKEY_MIN_BYTES, len(uskey), qimei36[:8]))
+        raise MintError("返回的 uskey 太短（%d 字节 < %d；uskeyLen=%d qimei36=%s）" % (len(raw), USKEY_MIN_BYTES, len(uskey), qimei36[:8]))
     if not uskey.startswith(USKEY_HEAD):
-        # 不硬失败：magic 变了说明 SDK 换了版本，记一笔就够。
+        # 不硬失败：magic 变了说明算法有变，记一笔就够。
         logger.warning("uskey 头不是预期的 %s：前 8 字符 %s",
                        USKEY_HEAD, uskey[:8])
     if len(qimei36) != 36:
@@ -177,47 +173,12 @@ def _validate(payload: dict) -> dict:
             "ms": payload.get("ms")}
 
 
-def _http_sign(**kwargs) -> dict:
-    """POST 侧车 `/uskey`。"""
-    body = json.dumps({
-        "agentTag": kwargs["agent_tag"],
-        "conversationId": kwargs["conversation_id"],
-        "responseId": kwargs["response_id"],
-        "scene": kwargs["scene"],
-        "model": kwargs["model"],
-        "nonce": kwargs["nonce"],
-        "openId": kwargs["openid"],
-    }, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        SIDECAR_URL, data=body, method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=SIDECAR_TIMEOUT) as resp:
-            text = resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-        except Exception:  # noqa: BLE001
-            pass
-        raise SidecarError("uskey 侧车 HTTP %d：%s" % (exc.code, detail)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise SidecarError(
-            "uskey 侧车不可达（%s）：%s" % (SIDECAR_URL, exc)) from exc
-    try:
-        payload = json.loads(text or "{}")
-    except ValueError as exc:
-        raise SidecarError("uskey 侧车回包不是 JSON：%r" % text[:200]) from exc
-    return _validate(payload)
-
-
 def qimei_for(account_key: str) -> str:
     """按账号派生**结构合法**的 qimei36：24hex 摘要 + '3000' + 8hex 尾段。
 
-    同一账号恒定，不同账号互不相同。⚠ 这不是真机 qimei：真机值由 qimei.dll
-    采集整台设备向量（SMBIOS UUID / 磁盘序列号 / MAC / BSSID / GPU / CPU /
-    分辨率 / locale / 计算机名）后经 /ola/v2 注册得到；这里只是格式合法的
-    占位值，只换摘要不换源数据本身仍是"自相矛盾"信号。
+    同一账号恒定，不同账号互不相同。⚠ 这不是真机 qimei：真机值由设备采集
+    （SMBIOS UUID / 磁盘序列号 / MAC / BSSID / GPU / CPU / 分辨率 / locale /
+    计算机名）后注册得到，见 qimei 真值表；这里只是格式合法的占位值。
     """
     h = hashlib.sha256((DEVICE_TAG + str(account_key)).encode('utf-8')).hexdigest()
     value = h[:24] + DEVICE_MARK + h[24:32]
@@ -271,50 +232,26 @@ def _local_sign(*, device_key: str = '', **kwargs) -> dict:
 def sign(*, agent_tag: str, conversation_id: str, response_id: str,
          scene: str, model: str, nonce: str, openid: str,
          account_key: str = '') -> dict:
-    """取一块 uskey：**本地 mint 优先**，失败才回落侧车。
+    """取一块 uskey：**只有本地 mint 一条路**。
 
     返回值：`{"uskey", "qimei36", "uskey_len", "uskey_bytes", "bus_info", "ms"}`。
 
-    顺序：(1) 注入的 `_signer`（测试/离线）；(2) `MARVIS_USKEY_FORCE_SIDECAR=1`
-    强制侧车；(3) `_local_sign()`；(4) 本地异常 → `_http_sign()`。
-    两条路都不可用抛 :class:`SidecarError`，上层当「平台暂时不可用」处理，
-    **不是**「账号坏了」。
+    顺序：(1) 注入的 `_signer`（测试/离线）；(2) `_local_sign()`。
+    失败抛 :class:`MintError`（配置类错误抛 `ValueError`），
+    上层当「平台暂时不可用」处理，**不是**「账号坏了」。
     """
     kwargs = dict(agent_tag=agent_tag, conversation_id=conversation_id,
                   response_id=response_id, scene=scene, model=model,
                   nonce=nonce, openid=openid)
     if _signer is not None:
         return _signer(**kwargs)
-    if os.environ.get("MARVIS_USKEY_FORCE_SIDECAR") == "1":
-        return _http_sign(**kwargs)
-    try:
-        return _local_sign(device_key=account_key, **kwargs)
-    except ValueError:
-        # 配置类错误（没给账号标识之类）不是「本地 mint 挂了」，直接抛，别掩盖真因。
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("本地 mint uskey 失败，回落侧车（%s）：%s",
-                       SIDECAR_URL, exc)
-        return _http_sign(**kwargs)
+    return _local_sign(device_key=account_key, **kwargs)
 
 
-def health(timeout: float = 2.0) -> dict:
-    """侧车体检（控制台/排障用）：`GET /health`。"""
-    url = SIDECAR_URL[:-len("/uskey")] if SIDECAR_URL.endswith("/uskey") else SIDECAR_URL
-    url = url.rstrip("/") + "/health"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace") or "{}")
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)[:300], "url": url}
-
-
-
-# --- qimei_table override (appended 2026-11-18) ---
-#: 真实 qimei 表：每台"虚拟设备"由真实 MAC 经 qimei.dll 算出（见
-#: /opt/marvis-wine/logs/MAC-SPOOF-FINDINGS.md）。MAC 是 qimei 三项散列输入之一，
-#: 换 MAC 即换 qimei；这些值全部格式合法且从未被上游看到过。
-#: 有值就用真值，没值才退回派生（派生值会自报"假的"）。
+# --- qimei_table override ---
+#: 真实 qimei 表：每台"虚拟设备"由真实 MAC（换 MAC 即换 qimei）算出；
+#: 这些值全部格式合法且从未被上游看到过。有值就用真值，没值才退回派生
+#: （派生值会自报"假的"）。
 _QIMEI_TABLE_CACHE = None
 
 

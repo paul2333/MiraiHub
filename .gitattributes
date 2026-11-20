@@ -1,4 +1,0 @@
-# 部署脚本必须永远保持 LF：CRLF 会让 bash 在 "set -euo pipefail" 那行直接报错，
-# 而 wine node.exe 的启动脚本一旦带 \r 就静默跑不起来。
-deploy/marvis-uskey-sidecar/*.sh text eol=lf
-deploy/marvis-uskey-sidecar/*.js text eol=lf

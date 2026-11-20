@@ -230,7 +230,7 @@ def _error_payload(exc: client.UpstreamError,
             "Marvis 客户端指纹签名器不可用，网关已按 fail-closed 拒绝本次"
             "请求（请求一个字节都没发给上游）。这与你的 API Key、"
             "Marvis 账号状态都无关，换号 / 重扫码 / 换 Key 都不会好。"
-            "处理方式：① 确认本机 uskey 签名链路可用（qimei 真值表 / 侧车）；"
+            "处理方式：① 确认本机 uskey 签名链路可用（qimei 真值表 / 本地 mint）；"
             "② 或设 MARVIS_USKEY_FAIL_CLOSED=0 临时退回随机填充，仅限排查用。"
             + ("诊断：%s" % detail[:300] if detail else ""))
     # ------------------------------------------------------------------

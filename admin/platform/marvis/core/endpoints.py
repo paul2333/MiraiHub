@@ -27,15 +27,15 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
 import random
 import time
-import uuid
 
-from . import uskey, uskey_cache, uskey_signer
+from . import uskey
 
 log = logging.getLogger(__name__)
 
@@ -313,7 +313,7 @@ def login_type_header(acct: dict) -> str:
     return "1"
 
 
-#: beacon 的业务 id（getUskey 的 busiid，最多 9 字符）
+#: 业务 id（getUskey 的 busiid；只作服务端路由标识，不参与运算）
 USKEY_BUSIID = "7800255"
 
 #: 真签用的默认 model（上游 PR #55 口径）
@@ -324,11 +324,11 @@ _DEFAULT_SIGN_MODEL = "deepseek-v4-pro-external"
 #: uskey 的字节长度（上游按长度校验格式）
 USKEY_BYTES = 376
 
-#: 签名器不可用的异常（`uskey_signer` 定义，这里做个转发别名）。
+#: 签名器不可用的异常（`uskey.MintError` 的转发别名）。
 #:
-#: 放这个别名是为了让上层只 import `endpoints` 就够，不用再引 `uskey_signer`，
-#: 也避免调用方写成 `endpoints.uskey_signer.SignerUnavailable` 那种绕路。
-SignerUnavailable = uskey_signer.SignerUnavailable
+#: 放这个别名是为了让上层只 import `endpoints` 就够，不用再引 `uskey`，
+#: 也避免调用方写成 `endpoints.uskey.MintError` 那种绕路。
+SignerUnavailable = uskey.MintError
 
 
 def uskey_fail_closed() -> bool:
@@ -347,29 +347,38 @@ def uskey_fail_closed() -> bool:
 def uskey_of(*, openid: str = "", busiid: str = USKEY_BUSIID,
              conversation_id: str = "", response_id: str = "",
              scene: str = "", model: str = "", nonce: str = "",
-             agent_tag: str = "") -> str:
-    """现签一个 uskey —— 直调本机 Beacon SDK，与正版客户端同源。
+             agent_tag: str = "", account_key: str = "") -> str:
+    """现签一个 uskey（纯 Python 本地 mint），只要 base64 文本。
 
-    走 `uskey_signer`：DLL 在就用 `beacon_get_uskey` 真签，
-    不在就退回 376 字节随机填充（网关不断链，只在日志留 WARNING）。
+    走 `uskey.sign()`：不碰 DLL、不碰远程服务；签不出来抛 `uskey.MintError`。
 
-    ⚠ `busiid` 必须 ≤ 9 字符，否则输出会多 16 字节。
+    ⚠ `busiid` 保留在签名里只为兼容旧调用点：它不参与运算（历史实现
+    还要求它 ≤ 9 字符，本地实现无此约束）。
     """
-    return uskey_signer.uskey(
+    return uskey.sign(
         openid=openid,
-        busiid=busiid[:9],
         conversation_id=conversation_id,
         response_id=response_id,
         scene=scene,
         model=model,
         nonce=nonce,
         agent_tag=agent_tag,
-    )
+        account_key=account_key,
+    )["uskey"]
 
 
 def uskey_status() -> dict:
-    """uskey 签名器的状态（给控制台/自检看是真签还是降级）。"""
-    return uskey_signer.status()
+    """uskey 签名器的状态（给控制台/自检看能不能 mint）。"""
+    from .uskey_local import mint_uskey
+
+    state = {"available": True, "mode": "local-python", "local": True,
+             "dll": "", "bytes": USKEY_BYTES, "error": ""}
+    try:
+        mint_uskey("0" * 24 + "3000" + "0" * 8, "marvisAgentTag=main")
+    except Exception as exc:  # noqa: BLE001
+        state["available"] = False
+        state["error"] = "%s: %s" % (type(exc).__name__, exc)
+    return state
 
 
 def uskey_identity(acct: dict, *, scene: str = "", agent_tag: str = "",
@@ -399,81 +408,51 @@ def uskey_identity(acct: dict, *, scene: str = "", agent_tag: str = "",
     version = str(acct.get("client_version") or CLIENT_VERSION)
     sign_model = model or _DEFAULT_SIGN_MODEL
 
-    #: 本次真签耗时（毫秒）。只用于日志埋点 —— 不放进返回值的 dict 里，
+    ident = uskey.new_identity()
+    cid = str(conversation_id or _conversation_id_for(acct)
+              or ident["conversation_id"])
+    rid = str(response_id or ident["response_id"])
+    non = str(ident["nonce"])
+
+    #: 本次 mint 耗时（毫秒）。只用于日志埋点 —— 不放进返回值的 dict 里，
     #: 因为那份 dict 会被 `marvis_ext()` 序列化成请求头，多一个键就是脏头。
-    sign_ms = 0.0
+    began = time.perf_counter()
+    try:
+        sig = uskey.sign(
+            agent_tag=agent_tag or "main",
+            conversation_id=cid,
+            response_id=rid,
+            scene=scene or "agent_chat",
+            model=sign_model,
+            nonce=non,
+            openid=openid,
+            account_key=uskey.account_key_of(acct),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # --------------------------------------------------------------
+        # 走到这里 = mint 没成。两条路，默认走前者（fail-closed）
+        # --------------------------------------------------------------
+        if uskey_fail_closed():
+            # 不造随机 uskey、不发请求。理由见 `uskey.MintError`：
+            # 随机指纹必然 4100404，而 4100404 会被网关记成「这个号被风控」，
+            # 环境问题就此变成账号问题，后面全是无效排查。
+            raise SignerUnavailable(
+                "Marvis 客户端指纹签名不可用，已按 fail-closed 拒绝本次请求"
+                "（与 API Key、账号无关）",
+                detail=("%s: %s" % (type(exc).__name__, exc))[:300],
+            ) from exc
 
-    def _sign(bus_info: str) -> str:
-        """只返回**真签**结果；签不出来返回空串。
-
-        ## 为什么不能直接用 `uskey_signer.uskey()`
-
-        那个函数在 DLL 缺失时会返回 376 字节随机填充 —— 这是为了「网关不断链」
-        做的降级，但它会把**随机值**当成功结果交出去。
-
-        随机值写进历史文件后，诊断时会误以为「签过了」，
-        排查时容易往错误方向找。所以这里只认真签结果。
-        """
-        nonlocal sign_ms
-        if not uskey_signer._beacon.available:  # noqa: SLF001
-            log.warning("beacon 不可用，本次无法真签 uskey")
-            return ""
-        began = time.perf_counter()
-        try:
-            return uskey_signer._beacon.sign(busiid, bus_info)  # noqa: SLF001
-        except Exception as exc:  # noqa: BLE001
-            log.warning("uskey 真签失败：%s", exc)
-            return ""
-        finally:
-            sign_ms = (time.perf_counter() - began) * 1000.0
-
-    signed = uskey_cache.get_or_create(
-        model=sign_model,
-        openid=openid,
-        sign_fn=_sign,
-        scene=scene or "agent_chat",
-        agent_tag=agent_tag or "main",
-        conversation_id=conversation_id,
-        response_id=response_id,
-        client_version=version,
-    )
-
-    if signed is not None:
-        uskey, nonce, cid, rid = signed
-        log.debug("uskey 真签成功 | model=%s | cost=%.2fms", sign_model, sign_ms)
-        return {"uskey": uskey, "nonce": nonce,
-                "conversation_id": cid, "response_id": rid,
+        # 显式回退到旧行为（MARVIS_USKEY_FAIL_CLOSED=0）：随机填充。
+        # 只给探针/复现实验用 —— 随机 uskey 一定被上游拒。
+        log.warning("uskey 签名不可用，按 MARVIS_USKEY_FAIL_CLOSED=0 退回随机填充"
+                    "（上游会判 4100404，仅用于复现问题）")
+        return {"uskey": base64.b64encode(os.urandom(USKEY_BYTES)).decode("ascii"),
+                "nonce": non, "conversation_id": cid, "response_id": rid,
                 "client_version": version, "cached": False}
 
-    # ------------------------------------------------------------------
-    # 走到这里 = 真签没成。两条路，默认走前者（fail-closed）
-    # ------------------------------------------------------------------
-    if uskey_fail_closed():
-        # 不造随机 uskey、不发请求。理由见 `uskey_signer.SignerUnavailable`：
-        # 随机指纹必然 4100404，而 4100404 会被网关记成「这个号被风控」，
-        # 环境问题就此变成账号问题，后面全是无效排查。
-        state = uskey_signer.status()
-        reason = ""
-        if isinstance(state, dict):
-            reason = str(state.get("error") or state.get("mode") or "")
-        raise SignerUnavailable(
-            "Marvis 客户端指纹签名不可用，已按 fail-closed 拒绝本次请求"
-            "（与 API Key、账号无关）",
-            detail=reason[:300],
-        )
-
-    # 显式回退到旧行为（MARVIS_USKEY_FAIL_CLOSED=0）：随机填充。
-    # 只给探针/复现实验用 —— 随机 uskey 一定被上游拒。
-    log.warning("uskey 签名不可用，按 MARVIS_USKEY_FAIL_CLOSED=0 退回随机填充"
-                "（上游会判 4100404，仅用于复现问题）")
-    nonce = str(uuid.uuid4())
-    cid = conversation_id or str(uuid.uuid4())
-    rid = response_id or uuid.uuid4().hex
-    uskey = uskey_of(
-        openid=openid, busiid=busiid, conversation_id=cid, response_id=rid,
-        scene=scene, model=model, nonce=nonce, agent_tag=agent_tag,
-    )
-    return {"uskey": uskey, "nonce": nonce,
+    log.debug("uskey 真签成功 | model=%s | cost=%.2fms", sign_model,
+              (time.perf_counter() - began) * 1000.0)
+    return {"uskey": sig["uskey"], "nonce": non,
             "conversation_id": cid, "response_id": rid,
             "client_version": version, "cached": False}
 
@@ -485,9 +464,9 @@ def marvis_ext(acct: dict, *, uskey_value: str, qimei36: str,
     reqScene(0) → taskType → clientVersion → clientPlatform →
     clientPlatformVersion → isIoa。`json.dumps` 保序（3.7+ 字典插入序）。
 
-    ⚠ `uskey` 必须来自 beacon_napi 整块产出（见 `uskey.py`），本地拼装的
-    `magic + F(bus_info) + 随机尾` 100% 被拦成 4100404；`qimei36` 必须与签
-    这块 uskey 时 SDK 报的 `getQimei()` 完全相同。
+    ⚠ `uskey` 必须来自完整的三层流水线（见 `uskey_local.py` / `uskey.py`），
+    手工拼的 `magic + F(bus_info) + 随机尾` 100% 被拦成 4100404；`qimei36` 必须
+    与签这块 uskey 时写进 TLV 的那串完全相同。
     """
     payload = {
         "qimei36": str(qimei36),

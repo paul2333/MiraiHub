@@ -33,9 +33,9 @@ from admin.platform.marvis.services import accounts as marvis_accounts  # noqa: 
 ACCT = {"openid": "openid-abc", "access_token": "tok-xyz", "guid": "guid-123",
         "login_type": "1"}
 
-#: 侧车替身：单测不打真侧车（真侧车要 Wine + beacon_napi）。
-#: 这里只锁「header / bus_info / MarvisExt 三者自洽」；真实签名的
-#: 实发正确性由 `tests/test_marvis_uskey_sidecar.py` 覆盖。
+#: 签名替身：单测不打真签名器（纯 Python mint 的可复现性由
+#: `tests/test_marvis_uskey_local.py` 覆盖）。
+#: 这里只锁「header / bus_info / MarvisExt 三者自洽」。
 FAKE_QIMEI36 = "3aeda2c4343993fc64eec8c830001591ab11"
 
 

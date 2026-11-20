@@ -32,16 +32,12 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env.docker}
       ADMIN_JWT_SECRET: ${ADMIN_JWT_SECRET:?Set ADMIN_JWT_SECRET in .env.docker}
       TZ: Asia/Shanghai
-      # 强制走 uskey 侧车（Wine + 真 qimei.dll + 真 beacon_napi）
-      MARVIS_USKEY_FORCE_SIDECAR: "0"
-      MARVIS_USKEY_SIDECAR: http://172.20.0.1:8791/uskey
-      # 侧车会按 bus_info 产 264 或 360 字节两种形态，两者上游都收；
-      # 376 只适用于本地 mint 的新模板，走侧车时必须放回 240。
-      MARVIS_USKEY_MIN_BYTES: "376"
+      # uskey 走纯 Python 本地 mint（core/uskey_local.py），不需要任何外部
+      # 签名服务。长度闸门默认 376 字节，代码里已经钉死，这里不再重复配置。
       # 上游对请求体大小有硬上限：实测 5.34 MB 能过、12.8 MB 直接
       # 500 5100007 / 400 3000101。设 6 MB 让超限请求在网关就地 413，
       # 不打上游、也不烧风控预算。要放宽改这个值即可。
-      # 容器里没有 Wine/netns：新号要生成真 qimei36 时打宿主生成服务
+      # 容器里没有设备生成环境：新号要生成真 qimei36 时打宿主生成服务
       # （deploy/qimei-gen/qimei-gen.service，172.17.0.1:8792）。
       QIMEI_GEN_URL: http://172.17.0.1:8792/qimei
       QIMEI_GEN_TIMEOUT: "30"

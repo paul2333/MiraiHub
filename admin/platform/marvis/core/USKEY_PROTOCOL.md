@@ -115,5 +115,5 @@ marvisAgentTag={agentTag}
 | 变量 | 作用 |
 |---|---|
 | `MARVIS_QIMEI36` | 设备串（36 hex）。**必填**，没有默认值 |
-| `MARVIS_USKEY_MIN_BYTES` | 长度闸门，默认 376 |
-| `MARVIS_USKEY_FORCE_SIDECAR` | `1` = 强制走旧侧车（对照实验用） |
+| `MARVIS_USKEY_MIN_BYTES` | 长度闸门，默认 376（排障时临时放行用） |
+| `MARVIS_USKEY_FAIL_CLOSED` | `0` = 签不出来时退回随机填充（仅探针复现用） |

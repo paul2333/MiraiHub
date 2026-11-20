@@ -284,8 +284,8 @@ def fetch_wallet(credential: dict, realm: str = "cn", *, account_id: int = 0) ->
 #: 风控码：`4100404 请求被风控拦截`。
 #:
 #: 2026-11-17 四发实测：手工拼装的 uskey（`magic + F(bus_info) + 随机尾`）
-#: 100% 撞这个码；只有 beacon_napi **整块**产出的 uskey 才 200。这说明
-#: `uskey` 的尾块服务端会校验，不是装饰。
+#: 100% 撞这个码；只有走完整三层流水线产出的 uskey（见 `uskey_local.py`）
+#: 才 200。这说明 `uskey` 的尾块服务端会校验，不是装饰。
 #:
 #: 即便是好 uskey，**同一组 (cid/rid/nonce)** 也不该复用 —— 拿到 4100404
 #: 就整组换新重试，复用只会继续撞同一个判定、把风控计数刷上去。
