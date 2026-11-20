@@ -315,3 +315,6 @@ tools/set_safe_context_limits.py
 # 是对的；进 git 就等于把内网出口地址随仓库发布出去。
 # tests/test_marvis_egress_pool.py 用 git ls-files --error-unmatch 无条件锁这一条。
 /admin/platform/marvis/core/egress_pool.json
+
+# ===== PR-21: streaming business codes must survive the error frame =====
+!tests/test_marvis_stream_business_error.py
