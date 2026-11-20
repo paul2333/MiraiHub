@@ -41,7 +41,9 @@ services:
       # （deploy/qimei-gen/qimei-gen.service，172.17.0.1:8792）。
       QIMEI_GEN_URL: http://172.17.0.1:8792/qimei
       QIMEI_GEN_TIMEOUT: "30"
-      MIRAIHUB_MARVIS_MAX_BODY_BYTES: "6291456"
+      # 并集：默认值仍是我方实测的 6 MiB（上游默认 256 MiB 会把超限请求打到上游、
+      # 白烧风控预算），但改成环境变量可覆盖，部署侧要放大就改 env，不用改文件。
+      MIRAIHUB_MARVIS_MAX_BODY_BYTES: ${MIRAIHUB_MARVIS_MAX_BODY_BYTES:-6291456}
       # 流式请求的「真实状态码」宽限期（秒）—— 见 gateway._stream_status_grace()。
       # 语义：流式请求先派发上游，且等这么久看能不能拿到最终状态；
       #   · 窗口内失败 -> 还没写字节，回真实状态码（401/429/400…）；

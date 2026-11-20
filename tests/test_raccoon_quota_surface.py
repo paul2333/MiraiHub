@@ -67,10 +67,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def quota_error(scope: str = "platform:raccoon"):
     """造一个真机形态的额度失败：HTTP 400 + 业务码 1000007。"""
-    exc = client.UpstreamError("raccoon#171 上游错误（HTTP 400）",
+    exc = client.UpstreamError("raccoon#1 上游错误（HTTP 400）",
                                status=400, kind="quota", code=1000007)
     exc.quota_scope = scope
-    exc.account_id = 171
+    exc.account_id = 1
     exc.model = "deepseek-v4.1-flash"
     return exc
 
@@ -85,9 +85,9 @@ def build_db():
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     db = Session()
-    db.add(Account(platform="raccoon", name="RaccoonEthan", uid="r-171",
+    db.add(Account(platform="raccoon", name="test-account", uid="t-1",
                    auth_json="{}", status="active", domain="cn",
-                   balance_total=100, balance_remain=92))
+                   balance_total=100, balance_remain=100))
     db.commit()
     return db, Session
 
@@ -127,7 +127,7 @@ def main() -> int:
         check("platform 级专属字段不出现", "platform" not in payload, payload)
 
         print("\n== 3) 非额度失败不受影响（不把所有 4xx 都改写成 402）==")
-        other = client.UpstreamError("raccoon#171 上游错误（HTTP 502）",
+        other = client.UpstreamError("raccoon#1 上游错误（HTTP 502）",
                                      status=502, kind="upstream")
         response = raccoon_gateway._fail(other)
         check("HTTP 502 照旧", response.status_code == 502, response.status_code)
@@ -148,7 +148,7 @@ def main() -> int:
             check("platform='raccoon'", (row.platform or "") == "raccoon", row.platform)
             check("model 记的是请求的模型名",
                   (row.model or "") == "deepseek-v4.1-flash", row.model)
-            check("account_id 归属失败账号", int(row.account_id or 0) == 171, row.account_id)
+            check("account_id 归属失败账号", int(row.account_id or 0) == 1, row.account_id)
             check("失败不扣额度", float(row.credits or 0) == 0.0, row.credits)
 
         print("\n== 5) 额度冷却落在 (账号 × 模型) 维度，不整号 600s ==")

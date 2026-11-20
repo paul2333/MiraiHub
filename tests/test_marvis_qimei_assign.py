@@ -44,7 +44,7 @@ UID_C = "C" * 32
 
 
 def _fail():
-    raise RuntimeError("wine unavailable")
+    raise RuntimeError("generator unavailable")
 
 
 class QimeiAssignTest(unittest.TestCase):

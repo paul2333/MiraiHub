@@ -1,4 +1,4 @@
-"""Marvis uskey 的**纯标准库**本地实现（零外部依赖、无第三方包）。
+"""Marvis uskey 的**纯标准库**本地实现（无侧车、无第三方包）。
 
 ## 它是什么
 
@@ -16,13 +16,13 @@ base64_A 用的是自定义 64 项字母表（不是标准 base64 顺序）。
 
 * 4/4 条真实 uskey 逐字节 re-encode 相等（与 uskey_mint.py selftest 同口径）。
 * 纯 Python mint 的 uskey 直接打上游 HTTP 200（真实账号 190）。
-* 全随机 dev18（os.urandom(18)）同样 200 ⇒ 不依赖任何外部进程的状态。
+* 全随机 dev18（os.urandom(18)）同样 200 ⇒ 不依赖侧车进程的任何状态。
 
-## 谁在调它
+## 与侧车的关系
 
-本模块**零外部依赖**。dev18 每次随机；qimei36 是账号侧的设备串
-（签名时必须由调用方显式传入，按账号派生；见 core/uskey.py）。
-core/uskey.py 是唯一调用方，失败直接抛异常，不再有任何回落路径。
+本模块**不需要**侧车。dev18 每次随机；qimei36 是账号侧的设备串
+（签名时必须由调用方显式传入，见 core/uskey.py 的 qimei36()）。
+core/uskey.py 只在本地 mint 抛异常时才回落侧车。
 
 ## 依赖
 
@@ -339,16 +339,17 @@ def aes128_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
 #:     189:302  0071 + 113B         周计数 JSON
 #:     302:320  0010 + 16B          md5("")
 TLV_TEMPLATE = bytes.fromhex(
-    "013e0000045900103057494e3036593036444b5631495551000a312e36302e33"
-    "342e3130000737383030323535001284097bfe4bec892cb32e99d730001bd1a6"
-    "11001050ff06148d833a5e72813bad5ee9ba8200000003000001a1e9f0847c00"
-    "0f179492450109739ef1cc1bc86f31d0000867a9ff9fb81ae1170007352e312e"
-    "342e320000000f4d61727669734167656e742e657865001284097bfe4bec892c"
-    "b32e99d730001bd1a6110000000954582047616d696e670000000200717b2231"
-    "223a31392c223130223a302c223131223a302c223132223a302c223133223a30"
-    "2c223134223a22222c223135223a302c2232223a313739343932343530312c22"
-    "33223a332c2234223a312c2235223a302c2236223a302c2237223a302c223822"
-    "3a224d61727669732e657865227d0010d41d8cd98f00b204e9800998ecf8427e"
+    "013e0000045900103057494e3036593036444b5631495551000a312e36302e"
+    "33342e313000073738303032353500120123456789abcdef012345673000de"
+    "adbeef001050ff06148d833a5e72813bad5ee9ba8200000003000001a1e9f0"
+    "847c000f179492450109739ef1cc1bc86f31d0000867a9ff9fb81ae1170007"
+    "352e312e342e320000000f4d61727669734167656e742e6578650012012345"
+    "6789abcdef012345673000deadbeef0000000954582047616d696e67000000"
+    "0200717b2231223a31392c223130223a302c223131223a302c223132223a30"
+    "2c223133223a302c223134223a22222c223135223a302c2232223a31373934"
+    "3932343530312c2233223a332c2234223a312c2235223a302c2236223a302c"
+    "2237223a302c2238223a224d61727669732e657865227d0010d41d8cd98f00"
+    "b204e9800998ecf8427e"
 )
 
 #: 长度常量（真品实测：TLV 320 / 载荷 336 / 整块 376 字节 = 504 字符）
@@ -356,6 +357,20 @@ TLV_BYTES = 320
 PAYLOAD_BYTES = 336
 USKEY_BYTES = 376
 USKEY_CHARS = 504
+
+# ---------------------------------------------------------------------------
+# 短版（208 字节 TLV / 264 字节 uskey）—— **上游真正认的那一版**
+# ---------------------------------------------------------------------------
+#: 2026-11-19 实测：线上 wine 签出 264 字节 → 200；本地 376 字节 → 403。
+#: 264 = 24(header) + 8(rand) + 1(flag) + 208(TLV) + 7(tail)
+TLV_SHORT_BYTES = 208
+PAYLOAD_SHORT_BYTES = 224
+USKEY_SHORT_BYTES = 264
+USKEY_SHORT_CHARS = 352
+
+#: 短版尾部 16 字节的偏移（TLV 内）。320 版这里是 md5("")（302:320），
+#: 短版没有 JSON 段，尾部紧接着 189，写 md5(bus_info)。
+OFF_SHORT_MD5 = 189
 
 #: 字段偏移（**按 320 字节真品模板**校准；2026-11-18 之前的 44/64/85/94/111 那组
 #: 是按旧 208 字节模板量的，SDK 版本串从 "1.0.0.0"(7) 变成 "1.60.34.10"(10)
@@ -385,10 +400,15 @@ PROC_NAME = "MarvisAgent.exe"
 PRODUCT_NAME = "TX Gaming"
 WEEK_EXE = "Marvis.exe"
 
-#: 换设备串走 MARVIS_QIMEI36，不要改这里。
-#: 仅 KAT 夹具：真机 qimei36（用于逐字节重放校验），不是签名默认值。
-#: 线上签名必须按账号派生（见 core/uskey.py 的 qimei_for），禁止用它。
-KAT_FIXTURE_QIMEI36 = "84097bfe4bec892cb32e99d730001bd1a611"
+#: TLV 模板里那两段设备串的**占位值**。`build_tlv()` 会把它整段覆盖成调用方
+#: 给的值，所以它不是"默认设备串"，也不承载任何身份 —— 这里钉死成合成值，
+#: 是为了让 `selfcheck()` 能发现"有人把真机值焊回模板"这种改动。
+SYNTHETIC_QIMEI36 = "0123456789abcdef012345673000deadbeef"
+
+#: KAT 夹具设备串（36 hex = 18 字节）。默认就是这个合成值，**不是任何真实设备**。
+#: 要和真机抓包逐字节对照时用 `MARVIS_KAT_QIMEI36` 注入：真值留在你自己的
+#: 机器 / CI secret 里，别写回代码（写回来的那一刻它就是公开的）。
+KAT_FIXTURE_QIMEI36 = os.environ.get("MARVIS_KAT_QIMEI36") or SYNTHETIC_QIMEI36
 
 #: 载荷第 8 字节（TLV 前的那个 flag）。真品是 0x5a，不是随机数。
 STREAM_FLAG = 0x5A
@@ -416,10 +436,82 @@ def build_week_json(sec: int, count: int = 19, exe: str = WEEK_EXE) -> bytes:
     return out
 
 
+def build_tlv_short(bus_info: str, qimei36: str, now_ms: int = None,
+                    rnd8: bytes = None, blob: bytes = None,
+                    anchor_sec: int = None) -> bytes:
+    """拼 **208 字节** TLV —— 上游真正认的那一版。
+
+    ## 为什么要短版（2026-11-19 定案）
+
+        同账号、同机器、同出口，只换 uskey：
+
+            线上 wine 签 264 字节 → 200 ✅
+            本地 mint 签 376 字节 → 403 ✗
+
+        264 - 24(header) = 240 body，按 8(rand) + 1(flag) + TLV + 7(tail) 拆：
+
+            240 = 8 + 1 + 208 + 7   ⇒ TLV = 208
+
+        320 版去掉「周计数 JSON」(189:302, 113B) 得 207 字节 ——
+        差 1 字节正好是 qimei 不可用时 DLL 写的那个占位字节，
+        于是 208。两版共用前 189 字节的布局，只是**没有 JSON 段和尾部 md5("")**。
+
+    ## 段布局（前 189 字节与 320 版完全一致）
+
+        0:2     len = 208-2
+        2:6     SDK 常量
+        6:24    busid
+        24:36   SDK 版本
+        36:45   appid
+        45:65   qimei36 #1
+        65:83   md5(bus_info)
+        83:87   常量
+        87:95   epoch 毫秒
+        95:112  BCD(秒) + 10B 随机
+        112:122 8B 随机
+        122:131 "5.1.4.2"
+        131:150 "MarvisAgent.exe"
+        150:170 qimei36 #2
+        170:183 "TX Gaming"
+        183:189 常量
+        189:208 16B md5(bus_info)  ← 尾部，320 版这里是 md5("")
+    """
+    qb = bytes.fromhex(qimei36)
+    if len(qb) != 18:
+        raise ValueError("qimei36 必须是 36 个 hex 字符（18 字节）：%r" % qimei36)
+    ts = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    sec = ts // 1000 if anchor_sec is None else int(anchor_sec)
+
+    # 前 189 字节直接复用长版模板（两版布局相同），再补 19 字节尾部
+    tlv = bytearray(TLV_TEMPLATE[:189]) + bytearray(19)
+
+    tlv[OFF_LEN:OFF_LEN + 2] = (TLV_SHORT_BYTES - 2).to_bytes(2, "big")
+    tlv[OFF_BUSID:OFF_BUSID + 16] = BUSID.encode("ascii")
+    tlv[OFF_QIMEI1:OFF_QIMEI1 + 18] = qb
+    tlv[OFF_QIMEI2:OFF_QIMEI2 + 18] = qb
+    md5_bus = hashlib.md5(str(bus_info).encode("utf-8")).digest()
+    tlv[OFF_MD5:OFF_MD5 + 16] = md5_bus
+    tlv[OFF_MS:OFF_MS + 8] = ts.to_bytes(8, "big")
+    tlv[OFF_BLOB:OFF_BLOB + 15] = (blob if blob is not None
+                                   else bcd_seconds(sec) + os.urandom(10))
+    tlv[OFF_RND:OFF_RND + 8] = rnd8 if rnd8 is not None else os.urandom(8)
+    # 尾部 16 字节：短版仍写 md5(bus_info)，与 320 版的 md5("") 不同键
+    tlv[OFF_SHORT_MD5:OFF_SHORT_MD5 + 16] = md5_bus
+
+    assert len(tlv) == TLV_SHORT_BYTES, len(tlv)
+    assert tlv[OFF_QIMEI1:OFF_QIMEI1 + 18] == qb
+    assert tlv[OFF_QIMEI2:OFF_QIMEI2 + 18] == qb
+    return bytes(tlv)
+
+
 def build_tlv(bus_info: str, qimei36: str, now_ms: int = None,
               rnd8: bytes = None, blob: bytes = None,
               week_count: int = 19, anchor_sec: int = None) -> bytes:
-    """拼 320 字节 TLV。
+    """拼 320 字节 TLV（长版）。
+
+    ⚠ **上游已经不认这一版**（2026-11-19 实测：320 字节 TLV → 403）。
+    保留它是为了 `--legacy` 对照和历史 KAT 自检；
+    生产路径请用 `build_tlv_short()`（208 字节）。
 
     变量只有 5 处：md5(bus_info)、两处 qimei36、8 字节毫秒、15 字节 blob
     （= BCD(秒) + 10 随机）、8 字节随机、以及 JSON 里的 1/2 号。
@@ -443,10 +535,20 @@ def build_tlv(bus_info: str, qimei36: str, now_ms: int = None,
     tlv[OFF_RND:OFF_RND + 8] = rnd8 if rnd8 is not None else os.urandom(8)
     tlv[OFF_JSON:OFF_JSON + JSON_BYTES] = build_week_json(sec, week_count)
     # qimei36 必须三处一致：header 的 Ual-Access-MarvisExt + TLV 两处。
-    # 任意一处不同，上游按「设备串与签名不匹配」直接 4100404。
+    # 任意一处不同，上游会判定「设备串与签名不匹配」并拒掉这条请求。
     assert tlv[OFF_QIMEI1:OFF_QIMEI1 + 18] == qb
     assert tlv[OFF_QIMEI2:OFF_QIMEI2 + 18] == qb
     return bytes(tlv)
+
+
+def build_stream_short(tlv: bytes, head8: bytes = None, flag: int = None) -> bytes:
+    """224 字节载荷（短版）：8B 头 + 1B flag + TLV(208) + 7B。"""
+    if len(tlv) != TLV_SHORT_BYTES:
+        raise ValueError("短版 TLV 必须 %d 字节，收到 %d"
+                         % (TLV_SHORT_BYTES, len(tlv)))
+    head = bytearray(head8 if head8 is not None else os.urandom(8))
+    head[0] = (head[0] & 0xF8) | 0x06
+    return bytes(head) + bytes([STREAM_FLAG if flag is None else int(flag)]) + tlv + bytes(7)
 
 
 def build_stream(tlv: bytes, head8: bytes = None, flag: int = None) -> bytes:
@@ -488,25 +590,64 @@ def mint_uskey(qimei36: str, bus_info: str, dev18: bytes = None,
                now_ms: int = None, rnd8: bytes = None,
                blob: bytes = None, head8: bytes = None,
                flag: int = None, week_count: int = 19,
-               anchor_sec: int = None) -> str:
-    """造一块 uskey。dev18 为 None 时随机；其余参数只为自检/重放留口。
+               anchor_sec: int = None, short: bool = False) -> str:
+    """造一块 uskey。
 
-    末尾断言产出必须是真品口径（376 字节 / 504 字符）—— 短一截的包上游直接 403，
-    与其拿去污染号池，不如在这里当场炸掉。
+    ## `short` 参数要不要开（2026-11-19 实测记录，**别急着开**）
+
+        同一账号、同一机器、同一出口的对照：
+
+            线上 wine 里那枚 DLL 签出的 uskey（264 字节）  → 200 ✅
+            本地本进程 mint 的 uskey（376 字节，320 TLV）  → 403 ✗
+
+        于是按 264 口径写了一版短模板（`short=True`，208 TLV /
+        352 字符 / magic `0ac0d50c2111`），**结果仍然 403**。
+
+        进一步对比才发现：线上那枚用本地密钥**根本解不开**
+        （`PKCS#7 填充不合法`），说明它不是同一套算法换个长度，
+        而是 wine 里那份 DLL 内部走了另一条分支 —— 密钥或结构都不同。
+
+    ## 所以
+
+        `short=False`（376 字节）仍是**默认**，它至少是本地能自洽、
+        能解开、能过 KAT 的那一版。
+
+        `short=True` 保留着供对照实验用 —— 但**别把它当修复**：
+        已验证它对上游无效（403）。
+
+        真正能把本地救回来的只有两条：
+          ① 想办法让本地 DLL 也走 wine 那条分支（目前 Windows 下
+             无论换 bus_info / busiid / 缓冲大小 / 干净目录，都稳定 376）；
+          ② 长期用线上签名服务（`_scratch/tunnel_sign.py`）。
+
+    `dev18` 为 None 时随机；其余参数只为自检/重放留口。
     """
     if dev18 is None:
         dev18 = os.urandom(18)
     if len(dev18) != 18:
         raise ValueError("dev18 必须是 18 字节，收到 %d" % len(dev18))
-    tlv = build_tlv(bus_info, qimei36, now_ms=now_ms, rnd8=rnd8, blob=blob,
-                    week_count=week_count, anchor_sec=anchor_sec)
-    stream = build_stream(tlv, head8=head8, flag=flag)
-    payload = build_payload(stream, dev18)
-    header = bytes.fromhex("030057040111") + dev18
+
+    if short:
+        tlv = build_tlv_short(bus_info, qimei36, now_ms=now_ms, rnd8=rnd8,
+                              blob=blob, anchor_sec=anchor_sec)
+        stream = build_stream_short(tlv, head8=head8, flag=flag)
+        payload = build_payload(stream, dev18)
+        # 短版 header 用真机魔数 0ac0d50c2111（线上那枚就是这样）
+        header = bytes.fromhex("0ac0d50c2111") + dev18
+    else:
+        tlv = build_tlv(bus_info, qimei36, now_ms=now_ms, rnd8=rnd8, blob=blob,
+                        week_count=week_count, anchor_sec=anchor_sec)
+        stream = build_stream(tlv, head8=head8, flag=flag)
+        payload = build_payload(stream, dev18)
+        header = bytes.fromhex("030057040111") + dev18
+
     out = b64_custom_encode(header + aes128_cbc_encrypt(K_AES, K_AES, payload))
     raw = b64_custom_decode(out)
-    assert len(raw) == USKEY_BYTES, "uskey 必须 %d 字节，实际 %d" % (USKEY_BYTES, len(raw))
-    assert len(out) == USKEY_CHARS, "uskey 必须 %d 字符，实际 %d" % (USKEY_CHARS, len(out))
+
+    want_bytes = USKEY_SHORT_BYTES if short else USKEY_BYTES
+    want_chars = USKEY_SHORT_CHARS if short else USKEY_CHARS
+    assert len(raw) == want_bytes, "uskey 必须 %d 字节，实际 %d" % (want_bytes, len(raw))
+    assert len(out) == want_chars, "uskey 必须 %d 字符，实际 %d" % (want_chars, len(out))
     return out
 
 
@@ -522,3 +663,77 @@ def decode_uskey(uskey: str) -> dict:
     return {"raw": raw, "header": header, "dev18": dev18, "payload": payload,
             "p224": payload, "stream": stream,
             "tlv": stream[9:9 + TLV_BYTES] if len(stream) >= 329 else b""}
+
+# ---------------------------------------------------------------------------
+# KAT：固定输入 -> 固定字节
+# ---------------------------------------------------------------------------
+#: KAT 的固定 bus_info（七字段顺序固定；内容本身无所谓，只要恒定）。
+KAT_BUS_INFO = (
+    "marvisAgentTag=main&marvisConversationID=conv_" + "a" * 32
+    + "&marvisResponseID=11111111-2222-3333-4444-555555555555"
+    "&marvisScene=agent_chat&model=main-auto"
+    "&nonce=66666666-7777-8888-9999-aaaaaaaaaaaa"
+    "&originOpenID=" + "0" * 32
+)
+#: 固定时间戳（毫秒）/ 随机源：KAT 要能逐字节重放，就不能读时钟和 urandom。
+KAT_NOW_MS = 1730000000000
+
+
+def kat_mint(qimei36: str = "") -> str:
+    """用**全固定输入**签一块 uskey：同样输入必得同样字节（KAT / 回归用）。
+
+    真签那条路每次都必须随机（`dev18` / 毫秒 / blob 的后 10 字节），
+    所以这里显式固定它们 —— 只有 KAT 能这么用。
+    """
+    device = qimei36 or KAT_FIXTURE_QIMEI36
+    sec = KAT_NOW_MS // 1000
+    return mint_uskey(
+        device, KAT_BUS_INFO,
+        dev18=bytes(range(18)),
+        now_ms=KAT_NOW_MS,
+        rnd8=bytes(range(8)),
+        blob=bcd_seconds(sec) + bytes(10),
+        head8=bytes(8),
+        flag=STREAM_FLAG,
+        anchor_sec=sec,
+    )
+
+
+def selfcheck() -> dict:
+    """KAT 自检：长度 / 两处设备串 / 确定性 / 模板不承载身份。
+
+    返回可断言的报告；任何一条不成立就抛 `AssertionError`。这是"签名链路还能用"
+    的最低门槛 —— 故意放在库里而不是测试里，线上排障也能直接调。
+    """
+    device = KAT_FIXTURE_QIMEI36
+    wanted = bytes.fromhex(device)
+    one = kat_mint()
+    report = {
+        "qimei36_masked": device[:8] + "…",
+        "uskey_chars": len(one),
+        "uskey_bytes": len(b64_custom_decode(one)),
+    }
+    if report["uskey_chars"] != USKEY_CHARS:
+        raise AssertionError("uskey 必须 %d 字符，实际 %d"
+                             % (USKEY_CHARS, report["uskey_chars"]))
+    if report["uskey_bytes"] != USKEY_BYTES:
+        raise AssertionError("uskey 必须 %d 字节，实际 %d"
+                             % (USKEY_BYTES, report["uskey_bytes"]))
+    if one != kat_mint():
+        # 固定输入却不稳定 = 某处还在读时钟/urandom，KAT 就失去意义。
+        raise AssertionError("KAT 不可重放：相同输入两次产出不同")
+    tlv = decode_uskey(one)["tlv"]
+    if len(tlv) != TLV_BYTES:
+        raise AssertionError("TLV 必须 %d 字节，实际 %d" % (TLV_BYTES, len(tlv)))
+    for offset, name in ((OFF_QIMEI1, "qimei1"), (OFF_QIMEI2, "qimei2")):
+        if tlv[offset:offset + 18] != wanted:
+            raise AssertionError("%s 处不是调用方给的设备串" % name)
+    # 模板里那段占位必须还是合成值：真机值一旦被焊回模板，它就是公开的。
+    baked = TLV_TEMPLATE[OFF_QIMEI1:OFF_QIMEI1 + 18]
+    if baked != bytes.fromhex(SYNTHETIC_QIMEI36):
+        raise AssertionError(
+            "TLV 模板里焊了非合成占位设备串（%s…）：build_tlv 会覆盖它，"
+            "所以它只可能是一个泄漏出来的真值" % baked.hex()[:8])
+    report["ok"] = True
+    return report
+

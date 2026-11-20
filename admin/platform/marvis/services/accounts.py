@@ -426,10 +426,15 @@ def select(db: Session, realm: str = "", *, exclude_ids: set[int] | None = None)
 
 
 def _assign_qimei_for_account(account: Account) -> None:
-    """新号入库后自动分配 qimei（失败只记日志，不阻断入库）。
+    """新号入库后自动分配「设备串」（失败只记日志，不阻断入库）。
 
-    这里是扫码登录 / 批量导入的共同出口。生成真品要 7–13s，所以这次调用是
-    同步的：账号创建请求会等生成；生成失败按 WARNING 走共用，不静默派生。
+    这里是扫码登录 / 批量导入的**共同出口**，所以挂在这里而不是各个入口。
+    真机设备串的生成要 7~13 s，同步调用意味着创建账号的请求会等它 ——
+    这是有意的：先拿到设备串再让号进池，比"号先进池、设备串稍后再补"
+    少一类并发状态。
+
+    失败**不回滚**账号：号本身是好的，只是设备串还缺；按 WARNING 走
+    共用/派生，留痕即可。`QIMEI_AUTO_ASSIGN=0` 可整体关掉。
     """
     if os.environ.get("QIMEI_AUTO_ASSIGN", "1") == "0":
         return

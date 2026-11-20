@@ -72,8 +72,26 @@ BROWSER_UA = (
     "Electron/44.7.0 Safari/537.36"
 )
 
-#: 客户端版本，随 `Ual-Access-MarvisExt` 上报
-CLIENT_VERSION = "1.60.3300.765"
+#: 客户端版本的兜底值，随 `Ual-Access-MarvisExt` 上报（我方 fork 实测值）。
+#:
+#: 上游 origin/main 同位置是 `CLIENT_VERSION_FALLBACK = "1.60.3400.35"` +
+#: `_detect_client_version()`。本批只并回它**结构上的那一条**（不探测本机客户端
+#: 目录、可用环境变量覆盖），取值仍保留我方实测值 —— 指纹值本身不在本批改动范围。
+#: 上游理由（2026-11-18）：网关要能脱离 Marvis 客户端独立跑；去扫
+#: `E:\Marvis\Application\*` / 注册表会让它在干净机器上探不到版本、退化成
+#: 一个可能已失效的兜底值，故障点还藏在「客户端装没装」这件事里。
+CLIENT_VERSION_FALLBACK = "1.60.3300.765"
+
+
+def _detect_client_version() -> str:
+    """取上报用的版本号 —— **只认环境变量和常量，不碰客户端目录**。"""
+    override = (os.getenv("MARVIS_CLIENT_VERSION") or "").strip()
+    if override:
+        return override
+    return CLIENT_VERSION_FALLBACK
+
+
+CLIENT_VERSION = _detect_client_version()
 
 #: 登录方式 → `Ual-Access-Login-Type`（**`/v3/*` 业务接口**用这一组）
 LOGIN_TYPE = {"QC": "1", "WX": "2", "WXAPP": "2"}

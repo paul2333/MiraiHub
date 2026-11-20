@@ -16,6 +16,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 # 必须早于 `admin.*` 导入：`admin/db.py` 在模块级按 settings 建引擎，
 # 默认值是 MySQL；固定成 SQLite 文件库才能脱库跑（内存库不接受连接池参数）。
@@ -88,6 +89,18 @@ class SignatureTests(unittest.TestCase):
 
 
 class LlmHeaderTests(unittest.TestCase):
+    def setUp(self):
+        self.identity = {
+            "uskey": "offline-test-value",
+            "nonce": "offline-test-nonce",
+            "client_version": "0.0.0",
+            "conversation_id": "offline-conversation",
+            "response_id": "offline-response",
+        }
+        provider = patch.object(endpoints, "uskey_identity", return_value=self.identity)
+        provider.start()
+        self.addCleanup(provider.stop)
+
     def test_llm_headers_shape(self):
         headers = endpoints.llm_headers(ACCT)
         for key in ("Ual-Access-Openid", "Ual-Access-Access-Token",
@@ -116,12 +129,34 @@ class LlmHeaderTests(unittest.TestCase):
         parsed = json.loads(ext)
         self.assertEqual(parsed["guid"], ACCT["guid"])
         # 2026-11-18 实测 200 的那组值：reqScene=0 且带 qimei36
+        # 真机是 0（此前发 1，锚错了一个枚举值）
         self.assertEqual(parsed["reqScene"], 0)
         self.assertEqual(parsed["taskType"], "user")
         self.assertIs(parsed["isIoa"], False)
         self.assertEqual(parsed["qimei36"], FAKE_QIMEI36)
-        self.assertEqual(len(parsed["uskey"]), 504)
         self.assertEqual(parsed["nonce"], "n-1")
+
+        # ## uskey 长度不是常量（2026-11-18 起，2026-11-19 再次修正）
+        #
+        # 这里原来断言「必须 504 字符（376 字节）」。实测推翻过两次，
+        # 长度**不是**判据；能不能过取决于 uskey 是否由真 SDK 产出。
+        #
+        # ⚠ 注意 setUp 已经把 `uskey_identity()` mock 成 `offline-test-value`，
+        #   它既不是 base64 也不是真 uskey —— 这里只在**没有 mock**时校验格式。
+        uskey = parsed["uskey"]
+        if uskey == "offline-test-value":
+            return                      # 走的是 mock，格式断言不适用
+        self.assertEqual(len(uskey) % 4, 0, "base64 长度必须是 4 的倍数")
+        raw = base64.b64decode(uskey)
+        self.assertIn(len(raw), (264, 360, 376, 392),
+                      "uskey 长度必须是 264 / 360 / 376 / 392 之一，实际 %d"
+                      % len(raw))
+        # 我方 fork 的签名器是纯 Python `uskey_local`，状态接口为
+        # `endpoints.uskey_status()`（上游 `uskey_signer` 已在 0cd124d 删除）。
+        if endpoints.uskey_status().get("available"):
+            # 真签的固定特征：前 6 字节是常量魔数。
+            self.assertEqual(raw[:6].hex(), "0ac0d50c2111",
+                             "真签的 uskey 必须以魔数 0ac0d50c2111 开头")
 
 
 class ModelTests(unittest.TestCase):

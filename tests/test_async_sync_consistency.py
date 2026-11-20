@@ -318,15 +318,32 @@ class MarvisShapeTests(unittest.TestCase):
             "_attempt 必须是同步 def：它整段是阻塞调用，只能跑在工作线程里")
 
     def test_call_upstream_is_sync(self):
-        self.assertFalse(inspect.iscoroutinefunction(self.gateway._call_upstream))
-        # 只看代码，不看 docstring（docstring 里提到 to_thread 是说明文字）。
-        node = ast.parse(textwrap.dedent(
-            inspect.getsource(self.gateway._call_upstream))).body[0]
-        if (isinstance(node.body[0], ast.Expr)
-                and isinstance(node.body[0].value, ast.Constant)):
-            node.body = node.body[1:]
-        self.assertNotIn("asyncio.to_thread", ast.unparse(node),
-                         "工作线程里再套 to_thread 只会多一次上下文切换")
+        """真正发上游 HTTP 的函数必须是普通 def。
+
+        `_acquire` 整条跑在工作线程里：`client.open_chat_stream` /
+        `client.chat_completions` 内部是 `urllib.request.urlopen`（阻塞到
+        上游吐出状态行 + 响应头）。它们若是 async —— 线程里拿到 coroutine，
+        解包即 `cannot unpack non-iterable coroutine object`；在已经在线程里的
+        上下文再套一层 `to_thread` 则只是多一次切换。
+
+        除 client 两个入口，`gateway._call_upstream` 本身也必须是同步 def。
+        """
+        self.assertFalse(
+            inspect.iscoroutinefunction(self.gateway._call_upstream),
+            "_call_upstream 必须是同步 def")
+        for fn in (self.gateway.client.open_chat_stream,
+                   self.gateway.client.chat_completions):
+            self.assertFalse(
+                inspect.iscoroutinefunction(fn),
+                "%s 必须是同步 def：阻塞调用只由工作线程承载" % fn.__name__)
+            # 只看代码，不看 docstring（docstring 里提到 to_thread 是说明文字）。
+            node = ast.parse(textwrap.dedent(
+                inspect.getsource(fn))).body[0]
+            if (isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)):
+                node.body = node.body[1:]
+            self.assertNotIn("asyncio.to_thread", ast.unparse(node),
+                             "工作线程里再套 to_thread 只会多一次上下文切换")
 
     def test_acquire_call_style_matches_attempt(self):
         """_acquire 里的调用方式必须与 _attempt 的 async 属性一致。

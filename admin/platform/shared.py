@@ -681,24 +681,14 @@ def realm_domain_cond(realm: str):
                func.coalesce(Account.domain, "") == "")
 
 
-def _mark_picked(account: Account, model: str, now: datetime) -> None:
-    """标记「这次选的是哪个号」。
-
-    以前只有 WorkBuddy 主链路调 `mark_attempt`，三个平台网关都没调 ——
-    于是面板上平台请求的「账号」一列永远是 `—`，出问题时无法归因。
-    这里挂在**唯一的选号出口**上，平台新增也不用再改一遍。
-    """
-    account.last_picked_at = now
-    try:
-        from admin import request_metrics
-
-        request_metrics.mark_attempt(account.id, model)
-    except Exception:  # noqa: BLE001 - 观测失败不能影响选号
-        pass
-
-
 def _sticky_hit(pool, sticky_key: str, rows) -> Account | None:
-    """粘性命中返回那个号，未命中 / 绑定的号已不可用则返回 None。"""
+    """粘性命中返回那个号，未命中 / 绑定的号已不可用则返回 None。
+
+    上游 origin/main 删掉了会话粘性（`select_account` 不再收 `sticky_key`），
+    但 marvis 侧 `gateway._bind_sticky` / `_sticky_key_for` 仍在写绑定，
+    `tests/test_marvis_sticky.py` 也有 5 处在调 —— D3 决定保留我方实现，
+    所以本函数随 `sticky_key` 参数一起并回。
+    """
     try:
         bound = pool.sticky.resolve(
             sticky_key, {(row.uid or "") for row in rows})
@@ -787,7 +777,13 @@ def select_account(db: Session, *, storage: str, realm: str = "",
     if sticky_key:
         bound = _sticky_hit(POOL, sticky_key, rows)
         if bound is not None:
-            _mark_picked(bound, model, now)
+            bound.last_picked_at = now
+            try:
+                from admin import request_metrics
+
+                request_metrics.mark_attempt(bound.id, model)
+            except Exception:  # noqa: BLE001 - 观测失败不能影响选号
+                pass
             return bound
     # 排序因子（从前到后）：
     #   1. 在途数 —— 优先最闲的号；
@@ -801,7 +797,18 @@ def select_account(db: Session, *, storage: str, realm: str = "",
         0 if row.balance_remain is not None else 1,
         row.last_used_at or datetime.min,
         row.id))
-    _mark_picked(account, model, now)
+    account.last_picked_at = now
+    # 让「请求动态 / 请求审计」知道这次用的是哪个号。
+    #
+    # 以前只有 WorkBuddy 主链路调 `mark_attempt`，三个平台网关都没调 ——
+    # 于是面板上平台请求的「账号」一列永远是 `—`，出问题时无法归因。
+    # 这里挂在**唯一的选号出口**上，平台新增也不用再改一遍。
+    try:
+        from admin import request_metrics
+
+        request_metrics.mark_attempt(account.id, model)
+    except Exception:  # noqa: BLE001 - 观测失败不能影响选号
+        pass
     return account
 
 

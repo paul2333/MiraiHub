@@ -42,7 +42,7 @@ CLI
     python3 -m admin.platform.marvis.core.qimei_assign --assign UID
     python3 -m admin.platform.marvis.core.qimei_assign --release UID
     python3 -m admin.platform.marvis.core.qimei_assign --sync-pool
-    python3 -m admin.platform.marvis.core.qimei_assign --serve-generator --host 172.17.0.1 --port 8792
+    python3 -m admin.platform.marvis.core.qimei_assign --serve-generator --host 127.0.0.1 --port 8792
 """
 from __future__ import annotations
 
@@ -77,11 +77,17 @@ MAX_OWNERS_PER_QIMEI = 2
 #: qimei36 的合法形态：24 hex 摘要 + '3000' 格式标记 + 8 hex 尾段。
 QIMEI_MARK = "3000"
 QIMEI_RE = re.compile(r"^[0-9a-f]{24}3000[0-9a-f]{8}$")
-DEVICE_TAG = "mh-qimei:"
+#: 与 `uskey.DEVICE_TAG` 同一个环境变量：两个模块派生同一串，改一个必须改两个。
+DEVICE_TAG = (os.environ.get("MARVIS_QIMEI_DEVICE_TAG") or "mh-qimei:")
 DEVICE_MARK = "3000"
 
-DEFAULT_GEN_CMD = "/opt/marvis-wine/gen_qimei_for_mac.sh"
-DEFAULT_DB_PATH = "/data/workbuddy.db"
+#: 生成器命令行属**部署数据**：脚本路径、运行时依赖、网络命名空间之类都在部署机上，
+#: 仓库不提供默认值。没配 `QIMEI_GEN_CMD` 时就只走 `QIMEI_GEN_URL`
+#: （外部 HTTP 生成服务），两条都没有则报「生成器不可用」而不是偷偷派生。
+DEFAULT_GEN_CMD = ""
+#: DB 位置同样属部署数据：`QIMEI_DB_PATH` > `ADMIN_DATABASE_URL`(sqlite) > 空。
+#: 为空时只有 `--reconcile` 需要它，其余子命令照常工作。
+DEFAULT_DB_PATH = ""
 STATE_LOCK_NAME = "qimei_state.lock"
 
 _ORM_HOOKS_INSTALLED = False
@@ -340,10 +346,23 @@ def load_state(state_dir=None, *, table_path=None, pool_path=None) -> State:
     dirty_flag: list[str] = []
 
     raw_pool = _read_json(pp)
+    #: 先读表：表里**引用到**的值即使形态不合法也必须保留（历史真值就长那样），
+    #: 所以 pool 的键过滤要拿它当白名单。读一次两处复用，别读两遍。
+    raw_table = _read_json(tp)
+    referenced = {normalize_qimei(value) for value in raw_table.values()
+                  if normalize_qimei(value)}
     pool: dict[str, dict] = {}
     for qimei, raw in sorted(raw_pool.items()):
         q = normalize_qimei(qimei)
         if not q:
+            continue
+        if not QIMEI_RE.match(q) and q not in referenced:
+            # 注释键（示例文件里的 `_comment`）静默跳过；其它不合法键要吭声。
+            # 关键在于**不能把非设备键当成设备**：一台"设备"如果谁都能挑到，
+            # 容量账本（2 号/台）就形同虚设，_pick_shareable 会把假设备发出去。
+            if not q.startswith("_"):
+                logger.warning("qimei_pool 里的键不是合法 qimei36（已忽略）：%s",
+                               mask_qimei(q))
             continue
         if q in pool:
             raise QimeiPoolError("qimei_pool 里有重复键：%s" % mask_qimei(q))
@@ -365,13 +384,14 @@ def load_state(state_dir=None, *, table_path=None, pool_path=None) -> State:
             kept.append(uid)
         entry["owners"] = kept
 
-    raw_table = _read_json(tp)
     table: dict[str, str] = {}
     for key, value in sorted(raw_table.items()):
         uid = normalize_uid(key)
         q = normalize_qimei(value)
         if not uid or not q:
             continue
+        if uid.startswith("_"):
+            continue  # 注释键（`_comment` / `_example`），uid 不可能是这种形态
         if uid in table and table[uid] != q:
             logger.warning("qimei_table 漂移：uid=%s 有多个值，保留字典序靠前的",
                            mask_uid(uid))
@@ -534,8 +554,9 @@ def generate_real_qimei(*, mac: str | None = None) -> str:
     cmd = (os.environ.get("QIMEI_GEN_CMD") or DEFAULT_GEN_CMD).strip()
     if not cmd or not os.path.exists(cmd):
         raise QimeiGenError(
-            "生成器不可用：QIMEI_GEN_CMD=%r 不存在（容器里没有 Wine；"
-            "请配 QIMEI_GEN_URL 指向宿主生成服务）" % cmd)
+            "生成器不可用：QIMEI_GEN_CMD=%r 不存在（配 QIMEI_GEN_URL 指向外部"
+            " HTTP 生成服务，或把 QIMEI_GEN_CMD 指向本机能执行的生成脚本）"
+            % cmd)
     return _cmd_generate(cmd, mac)
 
 
@@ -745,6 +766,9 @@ def reconcile(*, db_path: str | None = None, dry_run: bool = False,
     """
     sd = _state_dir(state_dir)
     db = db_path or _default_db_path()
+    if not db:
+        raise QimeiError("未指定数据库：用 --db，或设 QIMEI_DB_PATH / "
+                         "ADMIN_DATABASE_URL（sqlite:///...）")
     state = load_state(sd)
     rows = _db_rows(db, active_only=True)
     active = {normalize_uid(uid) for _id, uid in rows}
@@ -890,8 +914,14 @@ def install_orm_hooks() -> None:
 def serve_generator(host: str, port: int) -> None:
     """极简 HTTP 生成服务：POST /qimei {"mac": "..."} -> {"qimei36": "..."}。
 
-    给容器用。容器里没有 Wine/netns，不能自己跑 gen_qimei_for_mac.sh；
-    宿主起这个服务后，容器设 QIMEI_GEN_URL=http://172.17.0.1:8792/qimei。
+    给**自己生成不了**的一方用：生成能力（脚本、依赖、网络命名空间）留在
+    能跑它的那台机器上，通过 HTTP 暴露；调用方配
+    `QIMEI_GEN_URL=http://<host>:<port>/qimei` 即可，不必把生成器依赖
+    装进同一个容器。
+
+    只做三件事：校验入参 MAC、调 `QIMEI_GEN_CMD`、把 stdout 里的
+    qimei36 摘出来。不存任何表，**它自己也不知道哪台设备已经发给谁** ——
+    名额账本在 `qimei_pool.json` 那一侧。
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -955,7 +985,9 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="python3 -m admin.platform.marvis.core.qimei_assign",
         description="qimei 自动分配 / 回收 / 对账（一台设备最多 2 个号）")
     parser.add_argument("--state-dir", default="", help="qimei_table/pool 所在目录")
-    parser.add_argument("--db", default="", help="workbuddy.db 路径（默认 /data/workbuddy.db）")
+    parser.add_argument("--db", default="",
+                        help="accounts 表所在 sqlite 路径"
+                             "（默认取 QIMEI_DB_PATH / ADMIN_DATABASE_URL）")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     parser.add_argument("--verbose", action="store_true", help="DEBUG 日志")
     parser.add_argument("--allow-derived", action="store_true",
@@ -970,7 +1002,8 @@ def _build_parser() -> argparse.ArgumentParser:
     action.add_argument("--serve-generator", action="store_true", help="起宿主生成服务")
     parser.add_argument("--dry-run", action="store_true", help="只读演练，不生成不写盘")
     parser.add_argument("--prune", action="store_true", help="回收账号已不存在的名额")
-    parser.add_argument("--host", default="172.17.0.1", help="生成服务监听地址")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="生成服务监听地址（跨容器调用时显式改成该网卡地址）")
     parser.add_argument("--port", type=int, default=8792, help="生成服务端口")
     return parser
 
