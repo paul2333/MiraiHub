@@ -323,6 +323,9 @@ tools/set_safe_context_limits.py
 !tests/qimei_*_sdk_vectors.json
 !tests/test_marvis_uskey_qimei_reload.py
 !tests/test_marvis_stream_business_error.py
+!tests/test_loomy_stream_ownership.py
+!tests/test_loomy_client_stream_ownership.py
+!tests/test_credit_reconciliation_identity.py
 !tests/test_marvis_device_identity.py
 !tests/test_marvis_dev18.py
 
