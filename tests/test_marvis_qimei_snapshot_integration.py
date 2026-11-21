@@ -149,6 +149,20 @@ class SnapshotIntegrationTests(unittest.TestCase):
             self.assertEqual(self.uskey.qimei_for(UID_A), Q2)
         self.assertEqual(self.uskey.qimei_for(UID_A), Q1)
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows realpath rename behavior")
+    def test_request_lookup_does_not_resolve_a_replaced_leaf_to_its_deleted_inode(self):
+        self._write_snapshot()
+        resolve = Path.resolve
+        deleted_inode = self.root / "$Deleted" / "old-version"
+
+        def resolving(path, *args, **kwargs):
+            if path == self.snapshot:
+                return deleted_inode
+            return resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", new=resolving):
+            self.assertEqual(self.uskey.qimei_for(UID_A), Q1)
+
     def test_unchanged_snapshot_lookups_share_validation_but_writers_read_fresh(self):
         self._write_snapshot()
         support = self.qa._snapshot_support()

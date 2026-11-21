@@ -84,6 +84,247 @@ class SnapshotTest(unittest.TestCase):
                 self.assertNotIn("sensitive-device", str(caught.exception))
                 self.assertEqual(list(self.directory.iterdir()), [self.path])
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows file sharing semantics")
+    def test_open_reader_keeps_old_revision_while_writer_atomically_publishes_new(self):
+        old = self._create()
+        opened, release = threading.Event(), threading.Event()
+        values, errors = [], []
+        real_load = self.backend.json.load
+
+        def load(stream, *args, **kwargs):
+            if threading.current_thread() is reader:
+                self.assertFalse(os.get_inheritable(stream.fileno()))
+                opened.set()
+                if not release.wait(5):
+                    raise AssertionError("paused reader was not released")
+            return real_load(stream, *args, **kwargs)
+
+        def read():
+            try:
+                values.append(self.backend.read_snapshot(self.path))
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        with patch.object(self.backend.json, "load", side_effect=load):
+            try:
+                reader.start()
+                self.assertTrue(opened.wait(5))
+                new = self.backend.write_snapshot(self.path, table={"new": "value"},
+                                                   pool={}, expected_revision=1)
+                self.assertEqual(self.backend.read_snapshot(self.path), new)
+            finally:
+                release.set()
+                reader.join(5)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(values, [old])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows atomic rename semantics")
+    def test_continuous_readers_never_see_missing_or_mixed_snapshot_during_replacement(self):
+        self.backend.write_snapshot(self.path, table={"value": "0" * 8192},
+                                     pool={}, expected_revision=0)
+        stop = threading.Event()
+        ready = [threading.Event() for _ in range(4)]
+        errors, counts = [], [0] * 4
+
+        def read(index):
+            while not stop.is_set():
+                try:
+                    value = self.backend.read_snapshot(self.path)
+                    if value["table"] != {"value": str(value["revision"] - 1) * 8192}:
+                        raise AssertionError("mixed snapshot revision")
+                    counts[index] += 1
+                    ready[index].set()
+                except BaseException as exc:
+                    errors.append(exc)
+                    stop.set()
+
+        readers = [threading.Thread(target=read, args=(i,), daemon=True) for i in range(4)]
+        try:
+            for reader in readers:
+                reader.start()
+            self.assertTrue(all(event.wait(5) for event in ready))
+            for revision in range(1, 101):
+                self.backend.write_snapshot(self.path, table={"value": str(revision) * 8192},
+                                             pool={}, expected_revision=revision)
+        finally:
+            stop.set()
+            for reader in readers:
+                reader.join(5)
+        self.assertFalse(any(reader.is_alive() for reader in readers))
+        self.assertEqual(errors, [])
+        self.assertTrue(all(counts))
+        self.assertEqual(self.backend.read_snapshot(self.path)["revision"], 101)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows native handle ownership")
+    def test_reader_releases_native_handle_and_descriptor_when_wrapping_fails(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self._create()
+        handles, descriptors = [], []
+        real_open = self.backend._windows_open
+
+        def opened(*args):
+            handle = real_open(*args)
+            handles.append(handle)
+            return handle
+
+        with patch.object(self.backend, "_windows_open", side_effect=opened):
+            with patch.object(self.backend.msvcrt, "open_osfhandle",
+                              side_effect=OSError(errno.EMFILE, "sensitive")):
+                with self.assertRaises(self.backend.SnapshotError):
+                    self.backend.read_snapshot(self.path)
+        get_info = ctypes.WinDLL("kernel32", use_last_error=True).GetHandleInformation
+        get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_info.restype = wintypes.BOOL
+        flags = wintypes.DWORD()
+        self.assertFalse(get_info(handles[0], ctypes.byref(flags)))
+        self.assertEqual(ctypes.get_last_error(), 6)
+
+        def failed_stream(fd, *args, **kwargs):
+            descriptors.append(fd)
+            raise OSError(errno.ENOMEM, "sensitive")
+
+        with patch.object(self.backend.os, "fdopen", side_effect=failed_stream):
+            with self.assertRaises(self.backend.SnapshotError):
+                self.backend.read_snapshot(self.path)
+        with self.assertRaises(OSError) as caught:
+            os.fstat(descriptors[0])
+        self.assertEqual(caught.exception.errno, errno.EBADF)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows native rename errors")
+    def test_native_rename_falls_back_only_for_unsupported_operation(self):
+        import ctypes
+        import types
+
+        native = self.backend._windows_api()
+        for code in (1, 50, 87, 120, 2, 5, 32):
+            with self.subTest(winerror=code):
+                source = self.directory / "replacement"
+                target = self.directory / "destination"
+                source.write_bytes(b"complete-new")
+                target.write_bytes(b"complete-old")
+                handles, fallback = [], []
+
+                def create(*args):
+                    handle = native.CreateFileW(*args)
+                    handles.append(handle)
+                    return handle
+
+                def failed_rename(*args):
+                    ctypes.set_last_error(code)
+                    return False
+
+                def legacy(source, destination):
+                    fallback.append(True)
+                    return real_replace(source, destination)
+
+                api = types.SimpleNamespace(CreateFileW=create, CloseHandle=native.CloseHandle,
+                                            SetFileInformationByHandle=failed_rename)
+                real_replace = os.replace
+                with patch.object(self.backend, "_windows_api", return_value=api):
+                    with patch.object(self.backend.os, "replace", side_effect=legacy):
+                        if code in (1, 50, 87, 120):
+                            self.backend._replace_snapshot(source, target)
+                            self.assertEqual(target.read_bytes(), b"complete-new")
+                            self.assertEqual(fallback, [True])
+                        else:
+                            with self.assertRaises(OSError) as caught:
+                                self.backend._replace_snapshot(source, target)
+                            self.assertEqual(caught.exception.winerror, code)
+                            self.assertEqual(target.read_bytes(), b"complete-old")
+                            self.assertEqual(source.read_bytes(), b"complete-new")
+                            self.assertEqual(fallback, [])
+                # Successful exclusive reopen proves the native source handle closed.
+                check = source if source.exists() else target
+                with check.open("rb") as stream:
+                    self.assertIn(stream.read(), (b"complete-new", b"complete-old"))
+                source.unlink(missing_ok=True)
+                target.unlink()
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows UTF-16 native paths")
+    def test_native_first_create_and_replacement_support_long_non_bmp_paths(self):
+        directory = self.directory
+        for _ in range(7):
+            directory /= "long-directory-" + "x" * 24
+        target = directory / "state-\U0001f9ea.json"
+        first = self.backend.write_snapshot(target, table={"old": "complete"},
+                                             pool={}, expected_revision=0)
+        self.assertEqual(self.backend.read_snapshot(target), first)
+        second = self.backend.write_snapshot(target, table={"new": "complete"},
+                                              pool={}, expected_revision=1)
+        self.assertEqual(self.backend.read_snapshot(target), second)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows post-rename handle errors")
+    def test_native_close_failure_after_rename_reports_uncertain_committed_revision(self):
+        import ctypes
+        import types
+
+        self._create()
+        native = self.backend._windows_api()
+        handle = None
+
+        def create(*args):
+            nonlocal handle
+            handle = native.CreateFileW(*args)
+            return handle
+
+        def close(value):
+            native.CloseHandle(value)
+            ctypes.set_last_error(6)
+            return False
+
+        api = types.SimpleNamespace(CreateFileW=create, CloseHandle=close,
+                                    SetFileInformationByHandle=native.SetFileInformationByHandle)
+        real_api = self.backend._windows_api
+        calls = []
+
+        def library():
+            calls.append(True)
+            # write_snapshot first reads current revision, then opens replacement.
+            return real_api() if len(calls) == 1 else api
+
+        with patch.object(self.backend, "_windows_api", side_effect=library):
+            with self.assertRaises(self.backend.SnapshotCommitUncertain):
+                self.backend.write_snapshot(self.path, table={"new": "complete"},
+                                             pool={}, expected_revision=1)
+        self.assertIsNotNone(handle)
+        self.assertEqual(self.backend.read_snapshot(self.path)["revision"], 2)
+        self.assertEqual(self.backend.read_snapshot(self.path)["table"], {"new": "complete"})
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows stable leaf resolution")
+    def test_canonical_never_resolves_an_ordinary_replaceable_leaf(self):
+        self._create()
+        real_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            if path == self.path:
+                raise AssertionError("ordinary leaf could resolve to a deleted inode")
+            return real_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", new=resolve):
+            self.assertEqual(self.backend._canonical(self.path), self.path)
+            self.assertEqual(self.backend.read_snapshot(self.path)["revision"], 1)
+            self.backend.write_snapshot(self.path, table={}, pool={}, expected_revision=1)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows symlink lock aliases")
+    def test_symlink_alias_keeps_the_same_canonical_writer_lock(self):
+        self._create()
+        alias = self.directory / "alias.json"
+        try:
+            alias.symlink_to(self.path.name)
+        except OSError:
+            self.skipTest("host does not permit synthetic file symlinks")
+        self.assertEqual(self.backend._canonical(alias), self.path)
+        with self.backend.snapshot_lock(alias):
+            with self.backend.snapshot_lock(self.path):
+                updated = self.backend.write_snapshot(alias, table={"new": "value"},
+                                                       pool={}, expected_revision=1)
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(self.backend.read_snapshot(alias), updated)
+
     def test_strict_schema_revision_and_shapes_are_required(self):
         base = {"schema": 1, "revision": 1, "table": {}, "pool": {}}
         invalid = [{}, {**base, "schema": True}, {**base, "schema": 1.0},
@@ -173,7 +414,7 @@ class SnapshotTest(unittest.TestCase):
         before = self.path.read_bytes()
         for code in (errno.EBUSY, errno.EXDEV, errno.EPERM, errno.EACCES, errno.EIO):
             with self.subTest(errno=code):
-                with patch.object(self.backend.os, "replace",
+                with patch.object(self.backend, "_replace_snapshot",
                                   side_effect=OSError(code, "sensitive-device")):
                     with self.assertRaises(self.backend.SnapshotError) as caught:
                         self.backend.write_snapshot(self.path, table={"changed": True},
@@ -211,7 +452,7 @@ class SnapshotTest(unittest.TestCase):
     def test_directory_fsync_failure_reports_uncertain_committed_revision(self):
         self._create()
         real_open, real_fsync = self.backend.os.open, self.backend.os.fsync
-        real_replace = self.backend.os.replace
+        real_replace = self.backend._replace_snapshot
         directory_fds = set()
         committed = False
 
@@ -234,7 +475,7 @@ class SnapshotTest(unittest.TestCase):
 
         with patch.object(self.backend.os, "open", side_effect=open_for_sync):
             with patch.object(self.backend.os, "fsync", side_effect=fsync):
-                with patch.object(self.backend.os, "replace", side_effect=replace):
+                with patch.object(self.backend, "_replace_snapshot", side_effect=replace):
                     with self.assertRaises(self.backend.SnapshotCommitUncertain) as caught:
                         self.backend.write_snapshot(self.path, table={"new": "value"},
                                                      pool={}, expected_revision=1)
@@ -247,14 +488,14 @@ class SnapshotTest(unittest.TestCase):
     def test_atomic_replace_exposes_only_complete_old_or_new_snapshots(self):
         self._create()
         observations = []
-        real_replace = self.backend.os.replace
+        real_replace = self.backend._replace_snapshot
 
         def observe_replace(source, destination):
             observations.append(self.backend.read_snapshot(destination))
             real_replace(source, destination)
             observations.append(self.backend.read_snapshot(destination))
 
-        with patch.object(self.backend.os, "replace", side_effect=observe_replace):
+        with patch.object(self.backend, "_replace_snapshot", side_effect=observe_replace):
             self.backend.write_snapshot(self.path, table={"next": "different"},
                                          pool={"different": {"owners": ["next"]}},
                                          expected_revision=1)
@@ -332,7 +573,7 @@ class SnapshotTest(unittest.TestCase):
         directories = {second, *second.parents}
         real_open, real_close = self.backend.os.open, self.backend.os.close
         real_fsync, real_mkdir = self.backend.os.fsync, self.backend.Path.mkdir
-        real_replace = self.backend.os.replace
+        real_replace = self.backend._replace_snapshot
         directory_fds, events = {}, []
 
         def directory_open(path, flags, *args, **kwargs):
@@ -365,7 +606,7 @@ class SnapshotTest(unittest.TestCase):
             with patch.object(self.backend.os, "close", side_effect=close):
                 with patch.object(self.backend.os, "fsync", side_effect=fsync):
                     with patch.object(self.backend.Path, "mkdir", new=mkdir):
-                        with patch.object(self.backend.os, "replace", side_effect=replace):
+                        with patch.object(self.backend, "_replace_snapshot", side_effect=replace):
                             self.backend.write_snapshot(target, table={}, pool={},
                                                          expected_revision=0)
         replace_index = events.index(("replace", target))
@@ -382,7 +623,7 @@ class SnapshotTest(unittest.TestCase):
         target = parent / "state.json"
         ancestry = (parent, *parent.parents)
         real_open, real_close = self.backend.os.open, self.backend.os.close
-        real_fsync, real_replace = self.backend.os.fsync, self.backend.os.replace
+        real_fsync, real_replace = self.backend.os.fsync, self.backend._replace_snapshot
         directory_fds, events = {}, []
         fail_first_sync = True
 
@@ -415,7 +656,7 @@ class SnapshotTest(unittest.TestCase):
         with patch.object(self.backend.os, "open", side_effect=directory_open):
             with patch.object(self.backend.os, "close", side_effect=close):
                 with patch.object(self.backend.os, "fsync", side_effect=fsync):
-                    with patch.object(self.backend.os, "replace", side_effect=replace):
+                    with patch.object(self.backend, "_replace_snapshot", side_effect=replace):
                         with self.assertRaises(self.backend.SnapshotError) as caught:
                             self.backend.write_snapshot(target, table={}, pool={},
                                                          expected_revision=0)

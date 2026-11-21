@@ -55,7 +55,24 @@ _lock_states_guard = threading.Lock()
 
 def _canonical(path) -> Path:
     try:
-        return Path(path).expanduser().resolve()
+        target = Path(path).expanduser()
+        if os.name == "nt":
+            # realpath on an ordinary leaf can return its $Deleted name during
+            # POSIX rename. Resolve stable parents and follow symlink text so
+            # readers and every cooperating writer keep the same lock name.
+            target = target.absolute()
+            seen = set()
+            while True:
+                target = target.parent.resolve() / target.name
+                if not target.is_symlink():
+                    return target
+                key = os.path.normcase(str(target))
+                if key in seen or len(seen) >= 40:
+                    raise RuntimeError("snapshot symlink loop")
+                seen.add(key)
+                link = Path(os.readlink(target))
+                target = link if link.is_absolute() else target.parent / link
+        return target.resolve()
     except (OSError, RuntimeError, TypeError, ValueError):
         raise SnapshotError("snapshot path resolution failed") from None
 
@@ -93,11 +110,67 @@ def _validate(value):
     return value
 
 
+def _windows_api():
+    """Load native declarations only when a Windows reader/writer needs them."""
+    import ctypes
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                               ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                               wintypes.HANDLE]
+    api.CreateFileW.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    api.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                              ctypes.c_void_p, wintypes.DWORD]
+    api.SetFileInformationByHandle.restype = wintypes.BOOL
+    return api
+
+
+def _windows_path(path):
+    text = str(path)
+    if text.startswith("\\\\?\\"):
+        return text
+    return "\\\\?\\UNC\\" + text[2:] if text.startswith("\\\\") else "\\\\?\\" + text
+
+
+def _windows_open(api, path, access):
+    import ctypes
+
+    # OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, share READ | WRITE | DELETE.
+    handle = api.CreateFileW(_windows_path(path), access, 7, None, 3, 128, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle
+
+
+@contextlib.contextmanager
+def _open_reader(path):
+    if os.name != "nt":
+        with path.open("r", encoding="utf-8") as stream:
+            yield stream
+        return
+    api = _windows_api()
+    handle = _windows_open(api, path, 0x80000000)  # GENERIC_READ
+    fd = None
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+        handle = None  # Ownership transferred to the CRT descriptor.
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as stream:
+            yield stream
+    finally:
+        if fd is not None:
+            os.close(fd)
+        elif handle is not None:
+            api.CloseHandle(handle)
+
+
 def read_snapshot(path) -> dict:
     """Read one complete revision strictly, without locks or filesystem writes."""
     target = _canonical(path)
     try:
-        with target.open("r", encoding="utf-8") as stream:
+        with _open_reader(target) as stream:
             value = json.load(stream, object_pairs_hook=_unique_object,
                               parse_constant=_reject_constant)
     except FileNotFoundError:
@@ -224,6 +297,48 @@ def _fsync_directory(directory):
         os.close(fd)
 
 
+def _replace_snapshot(source, target):
+    if os.name != "nt":
+        os.replace(source, target)
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class RenameInfo(ctypes.Structure):
+        _fields_ = [("Flags", wintypes.DWORD), ("RootDirectory", wintypes.HANDLE),
+                    ("FileNameLength", wintypes.DWORD), ("FileName", wintypes.WCHAR * 1)]
+
+    api = _windows_api()
+    handle = _windows_open(api, source, 0x00110000)  # DELETE | SYNCHRONIZE
+    renamed = False
+    error = None
+    try:
+        encoded = _windows_path(target).encode("utf-16-le")
+        length = RenameInfo.FileName.offset + len(encoded)
+        buffer = ctypes.create_string_buffer(max(ctypes.sizeof(RenameInfo), length + 2))
+        info = RenameInfo.from_buffer(buffer)
+        info.Flags = 3  # REPLACE_IF_EXISTS | POSIX_SEMANTICS; no name/backup window.
+        info.RootDirectory = None
+        info.FileNameLength = len(encoded)
+        ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.FileName.offset, encoded, len(encoded))
+        # https://learn.microsoft.com/windows/win32/api/winbase/ns-winbase-file_rename_info
+        if api.SetFileInformationByHandle(handle, 22, buffer, length):
+            renamed = True
+        else:
+            error = ctypes.get_last_error()
+    finally:
+        if not api.CloseHandle(handle):
+            if renamed:
+                raise SnapshotCommitUncertain(
+                    "snapshot replaced; native handle close failed; reload before retry") from None
+            raise ctypes.WinError(ctypes.get_last_error())
+    if error is not None:
+        if error in (1, 50, 87, 120):  # Unsupported API/class/flags on older OS/filesystems.
+            os.replace(source, target)  # Preserve legacy atomic behavior; never write in place.
+        else:
+            raise ctypes.WinError(error)
+
+
 def write_snapshot(path, *, table, pool, expected_revision, metadata=None) -> dict:
     """Compare-and-replace one revision, preserving omitted existing metadata."""
     if type(expected_revision) is not int or expected_revision < 0:
@@ -267,7 +382,7 @@ def write_snapshot(path, *, table, pool, expected_revision, metadata=None) -> di
                 stream.write(serialized)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, target)
+            _replace_snapshot(temporary, target)
             replaced = True
             _fsync_directory(target.parent)
         except OSError as exc:

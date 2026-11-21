@@ -225,7 +225,11 @@ def _snapshot_path(*, table_path=None, pool_path=None):
             (os.environ.get("QIMEI_TABLE_PATH") or "").strip() or
             (os.environ.get("QIMEI_POOL_PATH") or "").strip()):
         raise QimeiPoolError("QIMEI_SNAPSHOT_PATH cannot mix legacy file overrides")
-    return Path(value).expanduser().resolve()
+    support = _snapshot_support()
+    try:
+        return support._canonical(value)
+    except support.SnapshotError as exc:
+        raise QimeiPoolError(str(exc)) from exc
 
 
 def _snapshot_support():

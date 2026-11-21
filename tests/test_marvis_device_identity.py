@@ -399,7 +399,7 @@ class DeviceIdentityTests(unittest.TestCase):
         self.enroll()
         before = self.inventory()
         backend = self.qa._snapshot_support()
-        with patch.object(backend.os, "replace", side_effect=OSError(13, "synthetic denial " + UID_A)):
+        with patch.object(backend, "_replace_snapshot", side_effect=OSError(13, "synthetic denial " + UID_A)):
             self.assert_generic_error(lambda: self.identity.reset_ex(UID_A, guid=GUID_NEW,
                                                                      generator=lambda: Q4))
         self.assertEqual(self.inventory(), before)
