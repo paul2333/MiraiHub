@@ -395,17 +395,18 @@ def _error_payload(exc: client.UpstreamError,
     upstream_code = client._biz_code_of(exc.detail or "").strip()
     headers: dict[str, str] = {}
     family = ""
-    if exc.kind == "max_input_tokens" or upstream_code == "1000007":
+    max_input = exc.kind == "max_input_tokens" or upstream_code == "3000100"
+    if max_input or upstream_code == "1000007":
         # 额度族（3000100 / 1000007）：判据是「该号该模型当次可用额度」不够。
         status = 400
         code = ("max_input_tokens_exceeded"
-                if exc.kind == "max_input_tokens" else "insufficient_quota")
-        err_type = exc.kind or "quota_exceeded"
+                if max_input else "insufficient_quota")
+        err_type = "max_input_tokens" if max_input else (exc.kind or "quota_exceeded")
         shown_code = upstream_code
         if shown_code in ("", "400", "401", "402", "403", "404", "422",
                           "429", "500", "502", "503"):
             # detail 抠不出业务码时，exc.code 只是 HTTP 状态 —— 文案里要写上游码。
-            shown_code = ("3000100" if exc.kind == "max_input_tokens"
+            shown_code = ("3000100" if max_input
                           else "1000007")
         message = _quota_tight_message(shown_code, notes)
         family = "quota"
@@ -441,6 +442,16 @@ def _error_payload(exc: client.UpstreamError,
     if upstream_code:
         error_obj["upstream_code"] = upstream_code
     return status, error_obj, headers
+
+
+def _stream_business_error(exc: client.UpstreamError,
+                           notes: dict | None = None) -> dict:
+    """Use the same error classification before and after response headers."""
+    payload = _error_payload(exc, notes)
+    if payload is None:
+        payload = _fail_payload(exc, notes)
+    status, error_obj, _headers = payload
+    return dict(error_obj, http_status=int(status))
 
 
 def _fail(exc: client.UpstreamError, *, notes: dict | None = None,
@@ -2845,6 +2856,10 @@ _STREAM_CHUNK = 65536
 
 #: SSE 帧分隔符：一个空行。一帧由若干字段行 + 一个空行收尾。
 _FRAME_SEP = b"\n\n"
+# A blank SSE line can use LF, CRLF or CR. Negative lookarounds keep a
+# CRLF pair from being mistaken for two separate line terminators.
+_FRAME_END = re.compile(br"(?:\r\n|\r(?!\n)|(?<!\r)\n){2}")
+_LINE_END = re.compile(br"\r\n|\r|\n")
 
 #: 攒到这么多字节还没见到空行就原样放行。
 #:
@@ -2857,7 +2872,7 @@ _FRAME_MAX = 262144
 _SSE_FIELD_PREFIXES = (b"data:", b"event:", b"id:", b"retry:", b":")
 
 
-def _flush_tail(tail: bytes) -> bytes:
+def _flush_tail(tail: bytes, *, sse: bool = False) -> bytes:
     """给 EOF 前没等到空行的**半个帧**补上分隔符；非 SSE 尾巴原样返回。
 
     ## 为什么必须补
@@ -2878,10 +2893,16 @@ def _flush_tail(tail: bytes) -> bytes:
     这条承诺就破了。
     """
     if not tail:
+        return _FRAME_SEP if sse else tail
+    if any(match.end() == len(tail) for match in _FRAME_END.finditer(tail)):
         return tail
-    if not any(line.startswith(_SSE_FIELD_PREFIXES)
-               for line in tail.split(b"\n")):
+    if not sse and not any(line.startswith(_SSE_FIELD_PREFIXES)
+                           for line in _LINE_END.split(tail)):
         return tail
+    if tail.endswith(b"\r\n"):
+        return tail + b"\r\n"
+    if tail.endswith(b"\r"):
+        return tail + b"\r"
     return tail + b"\n" if tail.endswith(b"\n") else tail + _FRAME_SEP
 
 
@@ -2919,6 +2940,7 @@ async def _iter_upstream(resp):
     # 兜底：极老的 Python 或自定义 resp 没有 read1 时退回 read，行为与以前一致。
     read = getattr(resp, "read1", None) or resp.read
     buf = b""
+    partial_sse = False
     while True:
         chunk = await asyncio.to_thread(read, _STREAM_CHUNK)
         if not chunk:
@@ -2927,18 +2949,27 @@ async def _iter_upstream(resp):
         # 只把**已完整**的帧交出去（见 docstring 末段）：半帧留在 buf 里，
         # 等下一块拼齐。read1() 的块边界与 SSE 帧边界无关，直接透传就会
         # 让下游的空闲心跳插在半帧中间。
-        frames = buf.split(_FRAME_SEP)
-        buf = frames.pop()
-        for frame in frames:
-            yield frame + _FRAME_SEP
-        if len(buf) > _FRAME_MAX:
+        end = 0
+        deferred_cr = False
+        for match in _FRAME_END.finditer(buf):
+            if match.end() == len(buf) and buf.endswith(b"\r"):
+                # A CR at a transport boundary may still be the first half
+                # of CRLF. Wait for one more read (or EOF) before yielding.
+                deferred_cr = True
+                break
+            yield buf[end:match.end()]
+            end = match.end()
+            partial_sse = False
+        buf = buf[end:]
+        if len(buf) > _FRAME_MAX and not deferred_cr:
             # 上游不是 SSE（或迟迟不发空行）：宁可失去对齐，也不能卡死
+            partial_sse = partial_sse or _open_frame(buf)
             yield buf
             buf = b""
     # EOF：尾巴是半帧就补齐分隔符。不补的话紧随其后的帧会粘在这一行后面
     # —— 客户端看到 `data: [DONE]data: {...}`，一行两帧。
-    if buf:
-        yield _flush_tail(buf)
+    if buf or partial_sse:
+        yield _flush_tail(buf, sse=partial_sse)
 
 
 def _usage_of(result: dict) -> dict:
@@ -3034,6 +3065,10 @@ def _inband_error(obj: dict) -> str:
     if obj.get("error_code") or obj.get("error_msg"):
         return ("%s %s" % (obj.get("error_code") or "",
                            obj.get("error_msg") or "")).strip()
+    code = obj.get("code")
+    message = obj.get("msg") or obj.get("message")
+    if not isinstance(code, bool) and code not in (None, "", 0, "0") and message:
+        return "%s %s" % (code, message)
     return ""
 
 
@@ -3080,7 +3115,7 @@ def _scan_stream(pending: bytes, chunk: bytes, state: dict) -> bytes:
     if not isinstance(chunk, (bytes, bytearray)):
         return pending
     data = (pending or b"") + bytes(chunk)
-    lines = data.split(b"\n")
+    lines = _LINE_END.split(data)
     pending = lines.pop()
     # 上游若长时间不发换行，尾巴会无限增长；超过 1MB 说明不是正常 SSE，
     # 直接丢弃（拼行已经救不回来），只保留末尾供下次重试。
@@ -3109,8 +3144,12 @@ def _scan_stream(pending: bytes, chunk: bytes, state: dict) -> bytes:
             for item in choices:
                 if isinstance(item, dict) and item.get("finish_reason"):
                     state["finish"] = True
-        elif not state.get("error"):
+        if not state.get("error"):
             state["error"] = _inband_error(obj)
+            if state["error"]:
+                state["error_code"] = (client._biz_code_of(payload.decode("utf-8", "replace"))
+                                       or str(obj.get("error_code") or ""))
+                state["error_envelope"] = isinstance(obj.get("error"), (dict, str))
     return pending
 
 
@@ -3144,7 +3183,9 @@ async def _with_keepalive(source, *, interval: float, ping: bytes):
                 pending = asyncio.ensure_future(iterator.__anext__())
             done, _ = await asyncio.wait({pending}, timeout=interval)
             if not done:
-                if not tail.endswith(_FRAME_SEP) and (framed or _open_frame(tail)):
+                at_boundary = any(match.end() == len(tail)
+                                  for match in _FRAME_END.finditer(tail))
+                if not at_boundary and (framed or _open_frame(tail)):
                     # 停在半帧中间：这一轮不插心跳，接着等同一块
                     continue
                 yield ping
@@ -3156,7 +3197,7 @@ async def _with_keepalive(source, *, interval: float, ping: bytes):
             finally:
                 pending = None
             if chunk:
-                framed = framed or _FRAME_SEP in chunk
+                framed = framed or _FRAME_END.search(chunk) is not None
                 tail = chunk
             yield chunk
     finally:
@@ -3186,8 +3227,8 @@ def _wrap_keepalive(response, ping: bytes):
         return response
     from admin.platform import protocol_bridge as bridge
 
-    return StreamingResponse(
-        _with_keepalive(body, interval=bridge.PING_INTERVAL_S, ping=ping),
+    return bridge.owned_stream_response(
+        _with_keepalive(body, interval=bridge.PING_INTERVAL_S, ping=ping), body,
         status_code=response.status_code,
         headers=dict(response.headers))
 
@@ -3293,7 +3334,30 @@ async def chat_completions(request: Request):
     deadline = started_at + limit if limit > 0 else 0.0
     # 宽限期已经过掉了多少 —— 生成器里剩下的等待要扣掉这一段。
 
+    generator_entered = False
+
+    class UnstartedLease:
+        """Release an acquired lease even if no one starts the async generator."""
+        closed = False
+
+        async def aclose(self):
+            if self.closed or generator_entered:
+                return
+            self.closed = True
+            if acquired is None:
+                _reap_abandoned_acquire(acquire_task)
+                return
+            key, response, account, started = acquired
+            try:
+                client.close_stream(response)
+            finally:
+                shared.release(account)
+            await _bill_async(key, account, slot, {}, request=request,
+                              started=started, error="client_disconnected")
+
     async def generator(acquired_tuple=None):
+        nonlocal generator_entered
+        generator_entered = True
         stats = {"ttfb_ms": 0, "total_ms": 0}
         usage: dict = {}
         first_at = None
@@ -3301,6 +3365,7 @@ async def chat_completions(request: Request):
         key = resp = account = started = None
         buffer = b""
         pending = b""
+        forwarded_partial = False
         # 只读旁路状态：usage / finish_reason / [DONE] / 流内错误（见 _scan_stream）。
         state = {"usage": {}, "finish": False, "done": False, "error": ""}
         reaped = [False]
@@ -3311,6 +3376,24 @@ async def chat_completions(request: Request):
                 return
             reaped[0] = True
             _reap_abandoned_acquire(acquire_task)
+
+        def _inband_failure() -> dict:
+            # This runs before yielding an error, so a disconnected consumer
+            # still records a failure and releases the existing account lease.
+            description = str(state["error"])[:300]
+            notes["stream_error"] = description
+            try:
+                client.note_sentinel(
+                    realm, int(getattr(account, "id", 0) or 0),
+                    "upstream_business", detail=description[:200])
+            except Exception:  # noqa: BLE001 - observation cannot block cleanup
+                pass
+            detail = json.dumps({"code": state.get("error_code") or "",
+                                 "msg": description}, ensure_ascii=False)
+            exc = client.UpstreamError(
+                "Marvis 上游在流内返回错误：%s" % description,
+                status=502, kind="upstream_business", detail=detail)
+            return _stream_business_error(exc, notes)
 
         try:
             if acquired_tuple is None:
@@ -3350,9 +3433,7 @@ async def chat_completions(request: Request):
                         "http_status": int(exc.status)})
                     return
                 except client.UpstreamError as exc:
-                    status, error_obj, _hdr = _error_payload(exc, notes)
-                    yield _sse_error_frame(dict(error_obj,
-                                                http_status=int(status)))
+                    yield _sse_error_frame(_stream_business_error(exc, notes))
                     return
                 except Exception as exc:  # noqa: BLE001 - 流已开始，只能补帧
                     logger.warning("Marvis 流式建连异常: %s: %s",
@@ -3371,7 +3452,27 @@ async def chat_completions(request: Request):
                 # 只读旁路：解析 usage / finish_reason / 流内错误。
                 # **转发的字节一个都不改**，只记账与收尾需要这些信息。
                 pending = _scan_stream(pending, chunk, state)
+                usage = state["usage"] if isinstance(state.get("usage"), dict) else {}
+                if state.get("error"):
+                    # Bounded buffering may have already forwarded an oversized
+                    # event prefix. Complete that event before emitting anything
+                    # else; replacing only its tail would corrupt its JSON.
+                    state["done"] = True
+                    error_obj = _inband_failure()
+                    if forwarded_partial:
+                        yield _flush_tail(chunk, sse=True)
+                        if state.get("error_envelope"):
+                            yield b"data: [DONE]\n\n"
+                        else:
+                            yield _sse_error_frame(error_obj)
+                    else:
+                        yield _sse_error_frame(error_obj)
+                    return
                 yield chunk
+                forwarded_partial = not any(match.end() == len(chunk)
+                                            for match in _FRAME_END.finditer(chunk))
+                if state.get("done"):
+                    return
             # EOF：最后一段可能没带换行（裸 `data: [DONE]`），`_scan_stream`
             # 只缓存不成行的尾巴、不判读 —— 补一个分隔符再扫一遍，否则 `done`
             # 认不出来：白白多补一帧终止帧，还会和 `[DONE]` 粘成一行。
@@ -3379,30 +3480,22 @@ async def chat_completions(request: Request):
                 _scan_stream(pending, _FRAME_SEP, state)
             usage = state["usage"] if isinstance(state.get("usage"), dict) else {}
             if state.get("error"):
-                # HTTP 200 + 流内错误帧：状态码已经发出去了，补一帧 error 把原因
-                # 说清楚（客户端不该看到一个没有 finish_reason 的干净结尾）。
-                logger.warning("Marvis 流内错误 acc=%s | %s",
-                               int(getattr(account, "id", 0) or 0),
-                               str(state["error"])[:200])
-                notes["stream_error"] = str(state["error"])[:300]
-                try:
-                    client.note_sentinel(
-                        realm, int(getattr(account, "id", 0) or 0),
-                        "upstream_business", detail=str(state["error"])[:200])
-                except Exception:  # noqa: BLE001 - 哨兵坏了不能挡住收尾
-                    pass
-                yield _sse_error_frame({
-                    "type": "upstream", "code": "stream_inband_error",
-                    "message": "Marvis 上游在流内返回错误：%s"
-                               % str(state["error"])[:300],
-                    "http_status": 200,
-                })
-                # _sse_error_frame 自带 [DONE]，不再补终止帧。
                 state["done"] = True
+                yield _sse_error_frame(_inband_failure())
             if not state.get("done"):
                 # 上游有头无尾（提前 EOF / 错误帧后直接断）：补终止帧，别让客户端
                 # 以为连接掉了、无脑重试。
                 yield _terminal_frame(str(upstream_body.get("model") or slot))
+        except client.UpstreamError as exc:
+            state["error"] = exc.kind or "upstream_business"
+            try:
+                from admin import request_metrics
+
+                request_metrics.mark_stream_error()
+                request_metrics.mark_request_error("stream_interrupted")
+            except Exception:  # noqa: BLE001
+                pass
+            yield _sse_error_frame(_stream_business_error(exc, notes))
         except Exception as exc:  # noqa: BLE001 - 流已开始，只能补帧收尾
             # ④ 上游流中途断开：状态码在 headers-first 时已经发出去了，改不了。
             # 不补这一帧，客户端看到的是「流突然断掉」，只会无脑重试。
@@ -3423,8 +3516,9 @@ async def chat_completions(request: Request):
             yield _terminal_frame(str(upstream_body.get("model") or slot))
         finally:
             stats["total_ms"] = int((time.perf_counter() - began) * 1000)
-            if account is None and not acquire_task.done():
-                # 客户端半路断开：acquire 还卡在上游 —— 不回收就是永久租约。
+            if account is None:
+                # The acquire can finish after the heartbeat but before this
+                # generator resumes. Reap both pending and unclaimed results.
                 _reap_once()
             if resp is not None:
                 client.close_stream(resp)
@@ -3448,16 +3542,18 @@ async def chat_completions(request: Request):
     # 一个字节都不发时，bridge.CHAT_PING 是合法的空增量 data 帧，能重置客户端 /
     # 中间层的 idle 计时器。开关 MIRAIHUB_MARVIS_KEEPALIVE=0 可整体退回原样透传。
     ping = _heartbeat_frame()
+    from admin.platform import protocol_bridge as bridge
+
+    owner = UnstartedLease()
     if acquired is not None:
         return _wrap_keepalive(
-            StreamingResponse(generator(acquired),
-                              media_type="text/event-stream",
-                              headers=stream_headers), ping)
+            bridge.owned_stream_response(generator(acquired), owner,
+                                         headers=stream_headers), ping)
     # ③b 宽限期已过：状态码已经改不了，先亮明「这是待定流」，首帧是心跳。
     stream_headers["X-Marvis-Stream-Pending"] = "1"
     return _wrap_keepalive(
-        StreamingResponse(generator(None), media_type="text/event-stream",
-                          headers=stream_headers), ping)
+        bridge.owned_stream_response(generator(None), owner,
+                                     headers=stream_headers), ping)
 
 
 def _anthropic_to_openai(body: dict) -> dict:
