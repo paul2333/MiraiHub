@@ -283,7 +283,7 @@ def _local_sign(*, device_key: str = '', device_qimei: str | None = None,
     from .uskey_local import mint_uskey
     info = bus_info(**kwargs)
     device = qimei36(device_key) if device_qimei is None else device_qimei
-    value = mint_uskey(device, info, dev18_for(device_key, device))
+    value = mint_uskey(device, info, dev18_for(device_key or kwargs.get('openid'), device))
     return _validate({"uskey": value, "qimei36": device,
                       "busInfo": info, "ms": 0})
 
