@@ -829,7 +829,7 @@ _TENCENT_FINGERPRINT_RULES = (
     #    仍容忍空白归一（\s+）以及 `an AI coding agent`、`powered by` /
     #    `powered by the` 等形态漂移。
     (re.compile(r"You\s+are\s+an?\s+AI\s+(?:coding\s+)?agent\s*,?\s*powered\s+by\s+"
-                 r"(?:the\s+)?DeepSeek\s*(?:Harness|Runtime)", re.I),
+                r"(?:the\s+)?DeepSeek\s*(?:Harness|Runtime)", re.I),
      "You are a capable AI coding assistant, powered by a large language model"),
     # 5. DSH Web 运行面的开头两句。位置无关。
     #    触发串**跨句边界**（前半句、后半句各自都放行），find 必须是前两句的
@@ -891,6 +891,15 @@ _TENCENT_FINGERPRINT_RULES = (
     # 中文开场白。句末标点（`。` / `！` / 无标点）不在匹配内，原样保留。
     (re.compile(r"你是乐于助人的助手", re.I),
      "你是一位能力出众的助手"),
+    # 4b. DSH 的 assistant-powered-by 形态；品牌后的边界排除 RuntimePlus 等正文。
+    #     用 You're 避免首行身份兜底重复计数，保留品牌后的标点和约束。
+    (re.compile(r"You\s+are\s+an?\s+AI\s+coding\s+assistant\s*,?\s*powered\s+by\s+"
+                r"(?:the\s+)?DeepSeek\s*(?:Harness|Runtime)\b", re.I),
+     "You're a capable AI coding assistant, powered by a large language model"),
+    # 4c. 品牌前置身份句：只替换「You are + 品牌 + 逗号 + 冠词」，保留身份描述。
+    #     逗号必需，冠词后必须有单词边界，避免误改 and / another 等自然语言。
+    (re.compile(r"You\s+are\s+DeepSeek\s*(?:Harness|Runtime)?\s*,\s*an?\b", re.I),
+     "You're a capable"),
 )
 
 
@@ -2430,16 +2439,10 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
         logger.warning(
             "Marvis 平台级风控退避中，拒绝上游调用：剩余 %.0fs model=%s",
             remaining, str(body.get("model") or "") or "-")
-        raise shared.PlatformRejected(
-            503,
-            "Marvis 连续 %d 次命中上游风控（4100404），已进入平台级退避："
-            "约 %d 秒后自动恢复。这与你的 API Key、账号余额都无关，"
-            "不需要换 Key，等窗口过去即可。" % (risk_hits(), int(remaining) + 1),
-            kind="server_error", code="risk_control_backoff",
-            headers={"Retry-After": str(int(remaining) + 1)})
+        raise _risk_control_rejected()
     model = str(body.get("model") or "")
-    # PR #48 会话亲和：同一会话在 TTL 内优先回到上次成功的号（算不出就是空串，
-    # 退化成完全不粘，行为与改动前一致）。
+    # 会话亲和：同一会话在 TTL 内优先回到上次成功的号。算不出就是空串，
+    # 退化成完全不粘 —— 行为与改动前逐字节一致。
     sticky_key = _sticky_key_for(body)
     exclude: set[int] = set()
     last_error: client.UpstreamError | None = None
@@ -3169,6 +3172,14 @@ async def _with_keepalive(source, *, interval: float, ping: bytes):
                 await pending
             except BaseException:  # noqa: BLE001 - 取消与收尾异常都不外抛
                 pass
+        close = getattr(iterator, "aclose", None)
+        if close:
+            try:
+                await close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 收尾失败不覆盖原始流结果
+                pass
 
 
 def _wrap_keepalive(response, ping: bytes):
@@ -3362,10 +3373,10 @@ async def chat_completions(request: Request):
                 if first_at is None:
                     first_at = time.perf_counter()
                     stats["ttfb_ms"] = int((first_at - started) * 1000)
-                yield chunk
                 # 只读旁路：解析 usage / finish_reason / 流内错误。
                 # **转发的字节一个都不改**，只记账与收尾需要这些信息。
                 pending = _scan_stream(pending, chunk, state)
+                yield chunk
             # EOF：最后一段可能没带换行（裸 `data: [DONE]`），`_scan_stream`
             # 只缓存不成行的尾巴、不判读 —— 补一个分隔符再扫一遍，否则 `done`
             # 认不出来：白白多补一帧终止帧，还会和 `[DONE]` 粘成一行。

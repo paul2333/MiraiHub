@@ -1,70 +1,92 @@
-"""账号 ↔ 真实设备的绑定（**方案骨架，2026-11-18；本轮不接线、不部署**）。
+"""设备绑定骨架：把「账号」与**真机采集到的那一台设备**关联起来（本轮不接线）。
 
-## 为什么需要它（缺陷 B：8 个号共用 1 个 qimei36，却有 8 个随机 guid）
+## 为什么需要它
 
-线上现状：
+上游对每个请求都要求 `Ual-Access-Guid`（缺了直接 -109），mint 时还要把
+`qimei36` 写进签名 TLV。这两串在真机上**同源**：一台物理设备报一个 guid、
+一个 qimei36，换设备两者一起换。
 
-  · MARVIS_QIMEI36 没设 → uskey.qimei36() 全部退回内置常量
-    QIMEI36_FALLBACK = 84097bfe...bd1a611（core/uskey.py:66 / uskey_local.py:390）；
-  · 而 guid 是 services/accounts.py:437 / 645 在「凭证没带 guid」时补的
-    uuid.uuid4() —— 每个号一个新的随机 UUID；
-  · 结果：8 个账号 = 1 个设备串 + 8 个不同 guid。
+本仓库现状是两条线各自取值：
 
-真机不可能长这样：一个物理设备 = 一组 (guid, qimei36)，两者同源、一荣俱荣。
-上游拿到「同一台设备报出 8 个不同 guid」这种形状，等于把「这是一个账号簇」
-直接写在脸上 —— 这就是教科书级的簇特征。
+    · qimei36 —— `core/device.py::for_account(openid)` 按账号确定性派生
+      （`sha256(salt|openid)`，第 24-27 位是格式标记 `3000`，见 `is_well_formed`）；
+    · guid —— 直接读凭证里的 `guid` 列；`services/accounts.py` 在导入一份
+      **没带 guid** 的凭证时会补一个 `uuid.uuid4()` 写回库。
+
+两者互不知情，于是「这台设备的 guid」与「这台设备的 qimei36」在库里是两条
+没有约束的独立字符串：任何一处被替换，都不会有人报错。真机的形状是
+「一对同源设备串」，把它拆成两个自由变量，就是在给后续的配对错误留口子。
+
+本模块只补**数据形状 + 闸门**：绑定信息存在凭证 JSON 的 `device` 键里，
+mint 前通过 `require_device()` 取一次，保证「取到的 guid 与 qimei36 来自
+同一次绑定」。
 
 ## 本轮范围（重要）
 
-  ✅ 只提供**纯函数骨架** + 设计文档（docs/marvis-device-binding.md）；
-  ❌ 不改 accounts 表 schema（绑定信息塞进已有的 auth_json，见下）；
-  ❌ 不接线：本模块**没有任何生产调用点**，import 它不会改变任何行为；
-  ❌ 不改 QIMEI36_FALLBACK 常量（那一串是签名素材，动了连 200 都不会有）。
+    ✅ 纯函数骨架：校验 / 归一化 / 绑定 / 读取 / 闸门 / 指纹摘要；
+    ✅ 数据落点是已有凭证 JSON 的一个键（**不改表结构、不写迁移**）；
+    ❌ 不接线：本模块**没有任何生产调用点**，import 它不改变任何行为；
+    ❌ 不碰 `core/device.py`、不碰 `uskey` 签名链、不改 `guid` 的任何现有取值路径。
 
-## 数据落点：auth_json 里加一个 device 键
+## 数据落点：凭证 JSON 里加一个 device 键
 
-    auth_json = {
-        "openid": "...", "access_token": "...", "refresh_token": "...",
-        "guid": "...",                  # 已有列（历史遗留的账号级 guid）
-        "device": {                     # ← 新增：设备绑定（本模块负责）
-            "guid": "...",              # 该号**登录时**所用设备的 guid
-            "qimei36": "...",           # 同一台设备的 getQimei()（36 hex）
-            "bound_at": 1763500000,     # 绑定时刻（unix 秒）
-            "source": "login",          # login / manual / migrated
-        },
+    {
+      "openid": "...", "access_token": "...", "refresh_token": "...",
+      "guid": "...",                 # 已有字段（账号级 guid，历史遗留）
+      "device": {                    # ← 新增：设备绑定（本模块负责）
+        "guid": "...",               # 这次登录所用设备的 guid
+        "qimei36": "...",            # 同一台设备的 qimei36（36 hex）
+        "bound_at": 1763500000,      # 绑定时刻（unix 秒）
+        "source": "login"            # login / manual / migrated
+      }
     }
 
-为什么不用新列：schema 变更要走迁移（本轮明确不做），而 auth_json 本来就是
-「凭证 + 设备串」的落点（services/accounts.py 全程按它序列化），加一个键是
-纯 JSON 层面的事，回滚 = 删掉这个键。
+为什么不用新列：schema 变更要走迁移（本轮明确不做），而这份 JSON 本来就是
+「凭证 + 设备串」的落点，加一个键是纯 JSON 层面的事，回滚 = 删掉这个键。
 
 ## 接线顺序（下一轮做，本轮只留接口）
 
-  1. 登录落地（services/accounts.py 的 login/refresh 写回处）→ bind_device()；
-  2. mint 前（core/endpoints.py::llm_headers 的调用方）→ require_device()，
-     把返回的 guid / qimei36 显式传下去，**两处必须是同一份**；
-  3. 没绑定的号 → 抛 DeviceBindingMissing，网关回
-     400 checkin_required（文案：请重新扫码登录以采集设备指纹），
-     **绝不**退回 QIMEI36_FALLBACK 硬发 —— 那正是这次把簇送进风控的动作。
+    1. 登录落地：凭证写回处（`services/accounts.py` 的 upsert / refresh）→ `bind_device()`；
+    2. mint 前：调用处 → `require_device()`，把返回的 guid / qimei36 显式传下去，
+       两处必须是同一份；
+    3. 没绑定的号 → 抛 `DeviceBindingMissing`（code=`checkin_required`），
+       由调用方决定回什么错误，**绝不**现场编一组设备串顶上。
+
+## 校验规则为什么和 `core/device.py` 对齐
+
+`is_valid_qimei36()` 除了长度 / hex，还要求第 24-27 位是格式标记 `3000` —— 这是
+`core/device.py::is_well_formed` 的规则，也是上游认的形状。本模块**不复用**那个
+函数，是因为 `admin.platform.marvis` 的包 `__init__` 在 import 时会跑
+`install()`（登记平台 + 校验 qimei 池），而本模块的设计前提恰恰是
+「import 它不产生任何副作用」。规则是两份、语义必须一致：改动 `device.py` 的
+格式规则时，这里与 `tests/test_marvis_device_binding.py` 一起改。
 """
 from __future__ import annotations
 
 import time
 import uuid
 
-#: auth_json 里承载设备绑定的键名。
+#: 凭证 JSON 里承载设备绑定的键名。
 DEVICE_KEY = "device"
 #: 一条绑定至少要有这两项，且必须**同源**（同一台设备采集）。
 REQUIRED_FIELDS = ("guid", "qimei36")
 #: 允许的绑定来源（写进 device.source，排障时一眼看出是真机采集还是历史迁移）。
 SOURCES = ("login", "manual", "migrated")
 
+#: qimei36 的格式标记与位置（与 `core/device.py` 的 DEVICE_MARK / _MARK_POS 一致）。
+QIMEI_MARK = "3000"
+QIMEI_MARK_POS = 24
+#: qimei36 长度：36 hex = 18 字节，签名 TLV 里按 18 字节写。
+QIMEI_LEN = 36
+
 
 class DeviceBindingMissing(Exception):
-    """这个号没有可用的设备绑定 ⇒ 不许发 chat（对应网关的 checkin_required）。
+    """这个号没有可用的设备绑定 ⇒ 不许发 chat。
 
-    它是**拒绝发送**的信号，不是「换一个 fallback 继续」的信号：
-    用共享常量 qimei36 + 随机 guid 硬发的代价已经付过一次（整个设备簇被风控）。
+    它是**拒绝发送**的信号，不是「换一组设备串继续」的信号：调用方拿到它
+    应当让这个号回到「需要重新登录」的状态，而不是现场编 guid / qimei36。
+
+    `code` 面向接口层（本模块不决定 HTTP 状态码）。
     """
 
     code = "checkin_required"
@@ -84,19 +106,24 @@ def is_valid_guid(value: str) -> bool:
 
 
 def is_valid_qimei36(value: str) -> bool:
-    """qimei36 是否可用：必须是 36 个 hex 字符（18 字节，见 uskey_local.build_tlv）。"""
+    """qimei36 是否可用：36 个 hex，且第 24-27 位是格式标记 `3000`。
+
+    纯 36 hex 并不够：`core/device.py` 的注释记了五个按 `sha256[:18]`
+    直接切出来的值，第 24-27 位全是随机的，上游一次格式校验就能全判非法。
+    校验放行一个形状不对的设备串，等于把它留到签名那一刻才炸。
+    """
     text = str(value or "").strip()
-    if len(text) != 36:
+    if len(text) != QIMEI_LEN:
         return False
     try:
         bytes.fromhex(text)
     except ValueError:
         return False
-    return True
+    return text[QIMEI_MARK_POS:QIMEI_MARK_POS + len(QIMEI_MARK)] == QIMEI_MARK
 
 
 def device_of(credential: dict) -> dict:
-    """取 device 绑定；没有 / 畸形返回 {}。**绝不抛**（探针路径也要能用）。"""
+    """取 device 绑定；没有 / 畸形返回 {}。**绝不抛**（只读探针路径也要能用）。"""
     data = credential or {}
     raw = data.get(DEVICE_KEY) if isinstance(data, dict) else None
     if not isinstance(raw, dict):
@@ -105,7 +132,11 @@ def device_of(credential: dict) -> dict:
 
 
 def normalize_device(raw: dict) -> dict:
-    """把任意来源的 device 规整成统一形状；缺字段 / 不合法返回 {}。"""
+    """把任意来源的 device 规整成统一形状；缺字段 / 不合法返回 {}。
+
+    返回的 source 不在白名单里一律记 `unknown`（而不是丢弃整条绑定）：
+    设备串本身是有效的，来源只影响排障口径。
+    """
     if not isinstance(raw, dict):
         return {}
     guid = str(raw.get("guid") or "").strip()
@@ -126,11 +157,11 @@ def normalize_device(raw: dict) -> dict:
 
 
 def require_device(credential: dict, *, account_id: int = 0) -> dict:
-    """mint 前的闸门：没有合法绑定就抛 DeviceBindingMissing。
+    """mint 前的闸门：没有合法绑定就抛 `DeviceBindingMissing`。
 
-    ⚠ 这里**不允许**任何 fallback（不许读 MARVIS_QIMEI36、不许读
-    uskey.QIMEI36_FALLBACK、不许现编 guid）—— 缺绑定就是缺采集，
-    正确动作是让这个号回到「需要扫码」的状态。
+    ⚠ 这里**不允许**任何 fallback（不许读环境变量、不许现编 guid、不许退回
+    任何一个共享常量）—— 缺绑定就是缺采集，正确动作是让这个号回到
+    「需要重新登录」的状态。返回的 dict 是本次请求唯一该用的设备串来源。
     """
     device = device_of(credential)
     if not device:
@@ -142,15 +173,20 @@ def require_device(credential: dict, *, account_id: int = 0) -> dict:
 
 def bind_device(credential: dict, *, guid: str, qimei36: str,
                 source: str = "login", now: int | None = None) -> dict:
-    """把一对设备串写进 credential["device"] 并返回它（**调用方负责 commit**）。
+    """把一对设备串写进 `credential[DEVICE_KEY]` 并返回它（**调用方负责 commit**）。
 
-    写入前必须校验：guid 合法、qimei36 是 36 hex、来源在白名单里。
-    不合格直接抛 ValueError —— 静默吞掉只会让「绑定成功」变成谎话。
+    写入前必须校验：guid 合法、qimei36 是合规 36 hex、来源在白名单里。
+    不合格直接抛 `ValueError` —— 静默吞掉只会让「绑定成功」变成谎话。
+
+    重复绑定（同一个号再绑一次）走同一条路径：直接覆盖，并以新的
+    `bound_at` / `source` 为准 —— 重登本来就应该换成本次采集到的设备串。
     """
+    if not isinstance(credential, dict):
+        raise TypeError("credential 必须是 dict")
     if not is_valid_guid(guid):
         raise ValueError("guid 不合法：%r" % (guid,))
     if not is_valid_qimei36(qimei36):
-        raise ValueError("qimei36 不合法（必须是 36 hex）：%r" % (qimei36,))
+        raise ValueError("qimei36 不合法（必须是合规的 36 hex）：%r" % (qimei36,))
     if source not in SOURCES:
         raise ValueError("source 必须是 %r 之一：%r" % (SOURCES, source))
     device = {
@@ -159,24 +195,33 @@ def bind_device(credential: dict, *, guid: str, qimei36: str,
         "bound_at": int(now if now is not None else time.time()),
         "source": source,
     }
-    if not isinstance(credential, dict):
-        raise TypeError("credential 必须是 dict")
     credential[DEVICE_KEY] = device
     return device
 
 
-def new_guid_seed() -> str:
-    """历史账号补齐时的**唯一**合法用法：先扫码、再采集。
+def unbind_device(credential: dict) -> bool:
+    """删掉 `credential[DEVICE_KEY]`（**调用方负责 commit**）。
 
-    这里保留一个显式函数只是为了让 grep 好找 ——
-    生产路径**不许**用它当「没 guid 就编一个」的兜底（那正是缺陷 B 的成因，
-    见 services/accounts.py:437 的 uuid.uuid4()）。
+    返回是否真的删掉了一条。解绑 = 这个号回到「没有设备绑定」状态，
+    下一次 `require_device()` 必然抛 `DeviceBindingMissing`；本函数**不**
+    顺手补延长 bound_at 或留墓碑 —— 想留审计痕迹请写日志，别写进凭证。
+    """
+    if not isinstance(credential, dict):
+        return False
+    return credential.pop(DEVICE_KEY, None) is not None
+
+
+def new_guid_seed() -> str:
+    """生成一个 guid 形状的随机串。**不是**「没 guid 就编一个」的兜底。
+
+    保留成显式函数只是为了让 grep 好找：生产路径不许用它代替设备采集，
+    它能提供的只有「形状合法」，提供不了「这台设备真的存在」。
     """
     return str(uuid.uuid4())
 
 
 def device_fingerprint(device: dict) -> str:
-    """设备指纹摘要（日志/审计用，**不可逆、不含明文**）。"""
+    """设备指纹摘要（日志 / 审计用，**不可逆、不含明文**）。"""
     import hashlib
 
     guid = str((device or {}).get("guid") or "")
