@@ -681,14 +681,24 @@ def realm_domain_cond(realm: str):
                func.coalesce(Account.domain, "") == "")
 
 
-def _sticky_hit(pool, sticky_key: str, rows) -> Account | None:
-    """粘性命中返回那个号，未命中 / 绑定的号已不可用则返回 None。
+def _mark_picked(account: Account, model: str, now: datetime) -> None:
+    """标记「这次选的是哪个号」。
 
-    上游 origin/main 删掉了会话粘性（`select_account` 不再收 `sticky_key`），
-    但 marvis 侧 `gateway._bind_sticky` / `_sticky_key_for` 仍在写绑定，
-    `tests/test_marvis_sticky.py` 也有 5 处在调 —— D3 决定保留我方实现，
-    所以本函数随 `sticky_key` 参数一起并回。
+    以前只有 WorkBuddy 主链路调 `mark_attempt`，三个平台网关都没调 ——
+    于是面板上平台请求的「账号」一列永远是 `—`，出问题时无法归因。
+    这里挂在**唯一的选号出口**上，平台新增也不用再改一遍。
     """
+    account.last_picked_at = now
+    try:
+        from admin import request_metrics
+
+        request_metrics.mark_attempt(account.id, model)
+    except Exception:  # noqa: BLE001 - 观测失败不能影响选号
+        pass
+
+
+def _sticky_hit(pool, sticky_key: str, rows) -> Account | None:
+    """粘性命中返回那个号，未命中 / 绑定的号已不可用则返回 None。"""
     try:
         bound = pool.sticky.resolve(
             sticky_key, {(row.uid or "") for row in rows})
@@ -732,6 +742,13 @@ def select_account(db: Session, *, storage: str, realm: str = "",
     调用方于是报「没有可用账号」——号明明在，只是此刻都在途。
     置 True 就先返回最闲的那个（哪怕在途满），由调用方的
     `lease()` 失败分支去**排队**，而不是把"忙"说成"没有号"。
+
+    ## `sticky_key`（会话亲和）
+
+    空串（默认）= 完全不粘，选号行为与不传时逐字节一致 —— 既有调用方
+    与测试替身都不受影响。非空时先查 `POOL.sticky`：**绑定号仍在候选里**
+    就直接返回它；未命中、或绑定的号已被冷却 / 排除 / 在途占满排掉，
+    就落回「最闲」重排（`resolve()` 会顺手解绑，不会把会话钉死在坏号上）。
     """
     from admin.account_binding import scope_accounts
     from admin.pool import POOL
@@ -777,13 +794,7 @@ def select_account(db: Session, *, storage: str, realm: str = "",
     if sticky_key:
         bound = _sticky_hit(POOL, sticky_key, rows)
         if bound is not None:
-            bound.last_picked_at = now
-            try:
-                from admin import request_metrics
-
-                request_metrics.mark_attempt(bound.id, model)
-            except Exception:  # noqa: BLE001 - 观测失败不能影响选号
-                pass
+            _mark_picked(bound, model, now)
             return bound
     # 排序因子（从前到后）：
     #   1. 在途数 —— 优先最闲的号；
@@ -797,18 +808,7 @@ def select_account(db: Session, *, storage: str, realm: str = "",
         0 if row.balance_remain is not None else 1,
         row.last_used_at or datetime.min,
         row.id))
-    account.last_picked_at = now
-    # 让「请求动态 / 请求审计」知道这次用的是哪个号。
-    #
-    # 以前只有 WorkBuddy 主链路调 `mark_attempt`，三个平台网关都没调 ——
-    # 于是面板上平台请求的「账号」一列永远是 `—`，出问题时无法归因。
-    # 这里挂在**唯一的选号出口**上，平台新增也不用再改一遍。
-    try:
-        from admin import request_metrics
-
-        request_metrics.mark_attempt(account.id, model)
-    except Exception:  # noqa: BLE001 - 观测失败不能影响选号
-        pass
+    _mark_picked(account, model, now)
     return account
 
 

@@ -44,6 +44,7 @@ def _specimen(pattern):
     src = re.sub(r"\\s[*+]", " ", src)            # 空白类归一成单个空格
     src = re.sub(r"([A-Za-z])\?", r"\1", src)     # 单字符可选取该字符
     src = re.sub(r",\?", "", src)                  # 可选逗号取缺席
+    src = src.replace(r"\b", "")                  # 单词边界不产生字符
     src = re.sub(r"\\(.)", r"\1", src)           # 其余转义还原成字面量
     src = re.sub(r"^\^", "", src)               # 行首锚点 ^ 不贡献字符
     return src
@@ -53,8 +54,8 @@ class RuleTableTests(unittest.TestCase):
     """规则表本身：条数、每条都能命中自己的样例。"""
 
     def test_rule_table_has_all_fingerprints(self):
-        """少一条就是留一个随时会踩的 403；2026-11-18 扩到 13 条。"""
-        self.assertEqual(len(marvis_gateway._TENCENT_FINGERPRINT_RULES), 13)
+        """保留已有 12 条，并覆盖 PR #76 的两类 DSH 身份句漏检。"""
+        self.assertEqual(len(marvis_gateway._TENCENT_FINGERPRINT_RULES), 15)
 
     def test_every_rule_rewrites_its_own_specimen(self):
         """每条规则：样例命中 → 改写后文本变了、且不再命中。"""
@@ -151,13 +152,22 @@ class MessageScopeTests(unittest.TestCase):
         self.assertIs(body["messages"][0], system_msg)
 
     def test_all_system_messages_are_rewritten(self):
-        """非首位 system 同样会被拦，所以每一条都要改。"""
-        first = {"role": "system", "content": "无指纹的开场白"}
-        second = {"role": "system", "content": self.poison}
-        out = marvis_gateway._prepare_body(
-            {"model": "x", "messages": [first, second]}, "main-auto")
-        self.assertIs(out["messages"][0], first)
-        self.assertNotEqual(out["messages"][1]["content"], self.poison)
+        """各段身份行在合并前命中，输出仍只有一条 system。"""
+        first = {"role": "system", "content": "You are Codex."}
+        second = {"role": "developer", "content": "You are Claude Code."}
+        user = {"role": "user", "content": second["content"]}
+        body = {"model": "x", "messages": [first, second, user]}
+        with self.assertLogs("admin.platform.marvis.gateway", level="INFO") as captured:
+            out = marvis_gateway._prepare_body(body, "main-auto")
+        self.assertEqual(out["messages"], [
+            {"role": "system", "content": "You're Codex.\n\nYou're Claude Code."},
+            user])
+        self.assertIs(out["messages"][1], user)
+        self.assertEqual(first, {"role": "system", "content": "You are Codex."})
+        self.assertEqual(second, {"role": "developer", "content": "You are Claude Code."})
+        self.assertIs(body["messages"][0], first)
+        self.assertIs(body["messages"][1], second)
+        self.assertIn("rules_hit=2", "\n".join(captured.output))
 
     def test_odd_shapes_do_not_crash(self):
         """畸形 messages 不能把网关打成 500：原样放行，交给上游判。"""
@@ -441,7 +451,7 @@ class FollowUpSuggestionPrefixRuleTests(unittest.TestCase):
     def test_rule_is_eighth_and_prefix_anchored(self):
         """规则 8 必须存在、必须锚在行首、必须大小写不敏感。"""
         rules = marvis_gateway._TENCENT_FINGERPRINT_RULES
-        self.assertEqual(len(rules), 13)
+        self.assertEqual(len(rules), 15)
         pattern, replacement = rules[7]
         self.assertTrue(pattern.pattern.startswith("^"),
                         "规则 8 丢了行首锚点：%r" % (pattern.pattern,))
@@ -555,6 +565,111 @@ class GenericAssistantOpeningRuleTests(unittest.TestCase):
             self.assertEqual(body["messages"][0]["content"], poison)
 
 
+class HarnessIdentityRegressionTests(unittest.TestCase):
+    """持久回归测试：PR #76 的 assistant-powered-by 与品牌前置身份句。
+
+    样例和期望独立写成字面量；放到正文第二行时，首行身份兜底不能掩盖漏检。
+    """
+
+    ASSISTANT_CASES = (
+        ("You are an AI coding assistant, powered by the DeepSeek Harness.",
+         "You're a capable AI coding assistant, powered by a large language model."),
+        ("You are a AI coding assistant powered by DeepSeekRuntime.",
+         "You're a capable AI coding assistant, powered by a large language model."),
+        ("YOU\tARE AN AI CODING ASSISTANT, POWERED BY DEEPSEEK RUNTIME",
+         "You're a capable AI coding assistant, powered by a large language model"),
+        ("You are an AI coding assistant,\npowered by DeepSeekHarness. 回答用中文。",
+         "You're a capable AI coding assistant, powered by a large language model. 回答用中文。"),
+    )
+    BRAND_FIRST_CASES = (
+        ("You are DeepSeek Harness, an agentic coding tool. 回答用中文。",
+         "You're a capable agentic coding tool. 回答用中文。"),
+        ("You are DeepSeekRuntime, a coding assistant.",
+         "You're a capable coding assistant."),
+        ("You are DeepSeek Runtime, an AI coding assistant.",
+         "You're a capable AI coding assistant."),
+        ("You are DeepSeekHarness, a coding tool.",
+         "You're a capable coding tool."),
+        ("You are DeepSeek, an AI coding assistant.",
+         "You're a capable AI coding assistant."),
+        ("YOU\tARE DEEPSEEKRUNTIME , AN\tAI coding assistant",
+         "You're a capable\tAI coding assistant"),
+    )
+
+    def setUp(self):
+        self._env_backup = os.environ.get(marvis_gateway.SANITIZE_TENCENT_ENV)
+        os.environ.pop(marvis_gateway.SANITIZE_TENCENT_ENV, None)
+
+    def tearDown(self):
+        if self._env_backup is None:
+            os.environ.pop(marvis_gateway.SANITIZE_TENCENT_ENV, None)
+        else:
+            os.environ[marvis_gateway.SANITIZE_TENCENT_ENV] = self._env_backup
+
+    def test_assistant_powered_by_identity_is_fully_rewritten(self):
+        for original, expected in self.ASSISTANT_CASES:
+            for prefix in ("", "Preamble.\n"):
+                with self.subTest(original=original, prefix=prefix):
+                    out, hits = marvis_gateway.rewrite_tencent_fingerprints(
+                        prefix + original)
+                    self.assertEqual(out, prefix + expected)
+                    self.assertEqual(hits, 1)
+
+    def test_brand_first_identity_preserves_the_description(self):
+        for original, expected in self.BRAND_FIRST_CASES:
+            for prefix in ("", "Preamble.\n"):
+                with self.subTest(original=original, prefix=prefix):
+                    out, hits = marvis_gateway.rewrite_tencent_fingerprints(
+                        prefix + original)
+                    self.assertEqual(out, prefix + expected)
+                    self.assertEqual(hits, 1)
+
+    def test_similar_natural_language_is_untouched(self):
+        cases = (
+            "Notes: You are an AI coding assistant, powered by another runtime.",
+            "Notes: You are an AI coding assistant, powered by DeepSeekRuntimePlus.",
+            "Notes: You are an AI coding assistants, powered by DeepSeek Runtime.",
+            "Notes: You are DeepSeek Harness and you must preserve punctuation.",
+            "Notes: You are DeepSeek Runtime, and you must explain the API.",
+            "Notes: You are DeepSeek, another option in the comparison.",
+            "Notes: You are DeepSeek Runtime, anonymous to users.",
+            "Compare DeepSeek Harness, an agentic coding tool, with other tools.",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                out, hits = marvis_gateway.rewrite_tencent_fingerprints(text)
+                self.assertIs(out, text)
+                self.assertEqual(hits, 0)
+
+    def test_prepare_body_rewrites_system_and_developer_only(self):
+        for original, expected in (self.ASSISTANT_CASES[0], self.BRAND_FIRST_CASES[0]):
+            for role in ("system", "developer"):
+                with self.subTest(original=original, role=role):
+                    identity = {"role": role, "content": original}
+                    user = {"role": "user", "content": original}
+                    assistant = {"role": "assistant", "content": original}
+                    tool = {"role": "tool", "content": original,
+                            "tool_call_id": "call_1"}
+                    body = {"model": "x", "messages": [identity, user, assistant, tool]}
+                    out = marvis_gateway._prepare_body(body, "main-auto")
+                    self.assertEqual(out["messages"][0],
+                                     {"role": "system", "content": expected})
+                    self.assertNotIn("system", out)
+                    self.assertIs(out["messages"][1], user)
+                    self.assertIs(out["messages"][2], assistant)
+                    self.assertIs(out["messages"][3], tool)
+                    self.assertEqual(identity, {"role": role, "content": original})
+                    self.assertIs(body["messages"][0], identity)
+
+    def test_disabled_sanitizer_preserves_both_identity_forms(self):
+        os.environ[marvis_gateway.SANITIZE_TENCENT_ENV] = "0"
+        for original, _expected in (self.ASSISTANT_CASES[0], self.BRAND_FIRST_CASES[0]):
+            with self.subTest(original=original):
+                out, hits = marvis_gateway.rewrite_tencent_fingerprints(original)
+                self.assertIs(out, original)
+                self.assertEqual(hits, 0)
+
+
 class TopLevelSystemFieldTests(unittest.TestCase):
     """顶层 `system` 字段（Anthropic 风格）也必须过规则表。"""
 
@@ -573,33 +688,45 @@ class TopLevelSystemFieldTests(unittest.TestCase):
         body = {"model": "x", "system": poison,
                 "messages": [{"role": "user", "content": "ping"}]}
         out = marvis_gateway._prepare_body(body, "main-auto")
-        self.assertEqual(out["system"], "You are a capable assistant")
+        self.assertNotIn("system", out)
+        self.assertEqual(out["messages"][0],
+                         {"role": "system", "content": "You are a capable assistant"})
         self.assertEqual(body["system"], poison, "调用方 body 不能被就地改")
-        self.assertIs(out["messages"], body["messages"])
+        self.assertIs(out["messages"][1], body["messages"][0])
 
     def test_top_level_system_zero_hit_returns_same_object(self):
         text = "普通系统提示词，没有指纹。"
         out = marvis_gateway._prepare_body({"model": "x", "system": text},
                                            "main-auto")
-        self.assertIs(out["system"], text)
+        self.assertNotIn("system", out)
+        self.assertIs(out["messages"][0]["content"], text)
 
     def test_non_string_top_level_system_passes_through(self):
         payload = [{"type": "text", "text": "You are a helpful assistant"}]
-        out = marvis_gateway._prepare_body({"model": "x", "system": payload},
-                                           "main-auto")
-        self.assertIs(out["system"], payload)
+        user = {"role": "user", "content": "ping"}
+        body = {"model": "x", "system": payload, "messages": [user]}
+        out = marvis_gateway._prepare_body(body, "main-auto")
+        self.assertNotIn("system", out)
+        self.assertIs(out["messages"][0]["content"], payload)
+        self.assertIs(out["messages"][0]["content"][0], payload[0])
+        self.assertIs(body["system"], payload)
+        self.assertIs(out["messages"][1], user)
+        self.assertIs(body["messages"][0], user)
 
     def test_hits_from_messages_and_top_level_system_are_summed(self):
         body = {"model": "x",
-                "system": "You are a helpful assistant",
+                "system": "You are Codex.",
                 "messages": [{"role": "system",
-                              "content": "You are an AI assistant."}]}
+                              "content": "You are Claude Code."}]}
         with self.assertLogs("admin.platform.marvis.gateway",
                              level="INFO") as captured:
             out = marvis_gateway._prepare_body(body, "main-auto")
-        self.assertEqual(out["system"], "You are a capable assistant")
+        self.assertNotIn("system", out)
+        self.assertEqual(len(out["messages"]), 1)
         self.assertEqual(out["messages"][0]["content"],
-                         "You are a capable AI assistant.")
+                         "You're Codex.\n\nYou're Claude Code.")
+        self.assertEqual(body["system"], "You are Codex.")
+        self.assertEqual(body["messages"][0]["content"], "You are Claude Code.")
         self.assertIn("rules_hit=2", "\n".join(captured.output))
 
 

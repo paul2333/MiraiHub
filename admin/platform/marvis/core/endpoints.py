@@ -433,6 +433,36 @@ def uskey_identity(acct: dict, *, scene: str = "", agent_tag: str = "",
     rid = str(response_id or ident["response_id"])
     non = str(ident["nonce"])
 
+    if (os.getenv("QIMEI_SNAPSHOT_PATH") or "").strip() or os.getenv("QIMEI_MANAGED_IDENTITY") == "1":
+        # Explicit snapshot mode must use the assigned account identity. Legacy
+        # device-level remote/DLL signers cannot consume that identity.
+        try:
+            from . import device_identity
+            from . import uskey as account_signer
+            from .uskey_local import mint_uskey
+            context = device_identity.resolve(acct)
+            if os.getenv("MARVIS_USKEY_FORCE_SIDECAR") == "1":
+                raise ValueError("snapshot signing requires the local backend")
+            key = account_signer.account_key_of(acct)
+            device = context.qimei36 if context else account_signer.qimei36(key)
+            dev18 = context.dev18 if context else account_signer.dev18_for(key, device)
+            if context:
+                cid = context.conversation_id(cid)
+            nonce = non
+            info = account_signer.bus_info(agent_tag=agent_tag or "main", conversation_id=cid,
+                                  response_id=rid, scene=scene or "agent_chat",
+                                  model=sign_model, nonce=nonce, openid=openid)
+            signed = account_signer._validate({"uskey": mint_uskey(device, info, dev18),
+                                      "qimei36": device})
+            return {"uskey": signed["uskey"], "nonce": nonce,
+                    "conversation_id": cid, "response_id": rid,
+                    "qimei36": device, "guid": context.guid if context else str(acct.get("guid") or ""),
+                    "client_version": version, "cached": False}
+        except Exception as exc:
+            failure = SignerUnavailable("Account device signing is unavailable")
+            failure.detail = "required snapshot identity could not be signed"
+            raise failure from exc
+
     #: 本次 mint 耗时（毫秒）。只用于日志埋点 —— 不放进返回值的 dict 里，
     #: 因为那份 dict 会被 `marvis_ext()` 序列化成请求头，多一个键就是脏头。
     began = time.perf_counter()
@@ -456,11 +486,11 @@ def uskey_identity(acct: dict, *, scene: str = "", agent_tag: str = "",
             # 不造随机 uskey、不发请求。理由见 `uskey.MintError`：
             # 随机指纹必然 4100404，而 4100404 会被网关记成「这个号被风控」，
             # 环境问题就此变成账号问题，后面全是无效排查。
-            raise SignerUnavailable(
+            failure = SignerUnavailable(
                 "Marvis 客户端指纹签名不可用，已按 fail-closed 拒绝本次请求"
-                "（与 API Key、账号无关）",
-                detail=("%s: %s" % (type(exc).__name__, exc))[:300],
-            ) from exc
+                "（与 API Key、账号无关）")
+            failure.detail = ("%s: %s" % (type(exc).__name__, exc))[:300]
+            raise failure from exc
 
         # 显式回退到旧行为（MARVIS_USKEY_FAIL_CLOSED=0）：随机填充。
         # 只给探针/复现实验用 —— 随机 uskey 一定被上游拒。
@@ -512,7 +542,7 @@ def marvis_ext(acct: dict, *, uskey_value: str = "", qimei36: str = "",
         payload["qimei36"] = str(qimei36)
     payload.update({
         "osVersion": EXT_OS_VERSION,
-        "guid": str(acct.get("guid") or ""),
+        "guid": (identity or {}).get("guid", str(acct.get("guid") or "")),
         "uskey": str(uskey_value),
         "nonce": str(nonce),
         "reqScene": EXT_REQ_SCENE,
@@ -586,7 +616,7 @@ def llm_headers(acct: dict, *, scene: str = EXT_SCENE,
         "Ual-Access-Openid": str(acct.get("openid") or ""),
         "Ual-Access-Access-Token": str(acct.get("access_token") or ""),
         "Ual-Access-Login-Type": LOGIN_TYPE_LLM,
-        "Ual-Access-Guid": str(acct.get("guid") or ""),
+        "Ual-Access-Guid": ident.get("guid", str(acct.get("guid") or "")),
         "Marvis-AgentTag": agent_tag,
         "Marvis-Conversation-ID": cid,
         "Marvis-Response-ID": rid,
@@ -595,7 +625,7 @@ def llm_headers(acct: dict, *, scene: str = EXT_SCENE,
         # 缺了它上游判"请求没带请求 id"→ 4100404。
         "Ual-Access-Requestid": rid,
         "Marvis-Protocol-Version": "1000",
-        "X-Device-GUID": str(acct.get("guid") or ""),
+        "X-Device-GUID": ident.get("guid", str(acct.get("guid") or "")),
         "Ual-Access-MarvisExt": marvis_ext(acct, identity=ident),
     }
     # 真客户端这两者恒等；且同一个 rid 已经进了 bus_info 的 marvisResponseID，

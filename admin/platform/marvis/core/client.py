@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 from . import endpoints
 
@@ -245,6 +246,42 @@ def session_id_for(account_id: int, body: dict, *, prefix: str = "",
         return ""
 
 
+def conversation_id_for(account_id: int, body: dict) -> str:
+    """`Marvis-Conversation-ID` 的取值：**稳定派生**，形状仍按 UUID。
+
+    派生规则见 `session_id_for()`（`sha256(平台 | 账号 | 会话键)`），这里只
+    多做一件事：把 32 位十六进制重新排成 `8-4-4-4-12` 的 UUID 形状。
+
+    为什么还要管形状 —— 上游看到的 `Marvis-Conversation-ID` 一直是
+    `str(uuid4())`（36 字符带连字符）。改成裸 hex 虽然同样是「不随机」，
+    但等于换了一种从未在真机上验证过的 id 形状，没必要为一个纯外观问题
+    去赌风控。形状保持不变、取值变成确定性，风险最小。
+
+    ## 为什么必须改（对齐 INTEGRATION-CHECKLIST §八 / FIXED-BUGS 五·补47）
+
+    改造前这条链路是：
+
+        `open_chat_stream()` → `llm_headers(acct, model=...)`
+            → `uskey_identity()` → `uskey_cache.get_or_create()`
+                → `conversation_id or str(uuid4())`   ← 每请求一个新会话
+
+    后果是双份的，而且都看不见：
+
+      · 上游前缀缓存按会话算 —— 每条请求都是「全新对话」，系统提示、工具
+        定义、历史消息全部重算，首字更慢、费用更高，控制台命中率永远 0；
+      · 一个号在几分钟里「新建」几十个会话，是上游风控里最典型的脚本形状。
+
+    `response_id` **不在这里派生**：它是每次上游调用的去重键，必须每次唯一
+    （见 `INTEGRATION-CHECKLIST` 那张表 —— 会话级稳定、请求级唯一，别搞反）。
+    """
+    raw = session_id_for(account_id, body, size=32)
+    if len(raw) < 32:
+        return ""          # 派生失败 → 交给 `uskey_cache` 的老路径兜底
+    return "%s-%s-%s-%s-%s" % (raw[0:8], raw[8:12], raw[12:16],
+                               raw[16:20], raw[20:32])
+
+
+
 def _request(url: str, *, method: str = "GET", body: dict | None = None,
              raw_body: str | None = None,
              headers: dict | None = None, timeout: float = DEFAULT_TIMEOUT,
@@ -298,13 +335,27 @@ STREAM_TIMEOUT = 300.0
 def _acct(credential: dict) -> dict:
     """把落库的凭证规整成 endpoints 期望的形状（snake_case）。"""
     data = credential or {}
-    return {
+    acct = {
         "openid": str(data.get("openid") or data.get("openId") or ""),
         "access_token": str(data.get("access_token") or data.get("accessToken") or ""),
         "guid": str(data.get("guid") or ""),
         "login_type": str(data.get("login_type") or data.get("loginType") or "1"),
         "client_version": str(data.get("client_version") or ""),
     }
+    if (os.getenv("QIMEI_SNAPSHOT_PATH") or "").strip() or os.getenv("QIMEI_MANAGED_IDENTITY") == "1":
+        for key in ("uid", "id", "device"):
+            if key in data:
+                acct[key] = data[key]
+        if os.getenv("QIMEI_MANAGED_IDENTITY") == "1":
+            from . import device_identity
+            try:
+                # Capture once before any signing or authentication request.
+                acct[device_identity.CONTEXT_KEY] = device_identity.resolve(acct)
+            except device_identity.DeviceIdentityError as exc:
+                raise UpstreamError(
+                    "Managed device identity is unavailable; rebind the account",
+                    status=503, code="signer_unavailable", kind="signer_unavailable") from exc
+    return acct
 
 
 def fetch_wallet(credential: dict, realm: str = "cn", *, account_id: int = 0) -> dict:
@@ -355,7 +406,7 @@ def fetch_wallet(credential: dict, realm: str = "cn", *, account_id: int = 0) ->
 RISK_CONTROL_CODE = "4100404"
 
 #: 模型网关每次调用最多试几次：1 次首发 + 1 次整组轮换重试。
-CHAT_ATTEMPTS = 2
+CHAT_ATTEMPTS = 1
 
 
 def _open_chat_stream_direct(credential: dict, realm: str, body: dict, *,
@@ -368,53 +419,91 @@ def _open_chat_stream_direct(credential: dict, realm: str, body: dict, *,
 
     ⚠ 不要在这里读流：读干了上层就没东西可转发（插件侧踩过的同一个坑）。
     上层负责 finally 调 `close_stream()`。
-
-    ⚠ 撞 `4100404` 时**整组轮换**（新的 cid / rid / nonce / uskey）再试一次；
-    每次 `llm_headers()` 都会现签，所以重试天然就是换新的一组。
     """
     acct = _acct(credential)
     url = endpoints.chat_url(realm)
     data = json.dumps(body, ensure_ascii=False).encode()
-    # bus_info 的 `model=` 段必须是**请求体原文**（不是显示名、不是别名），
-    # 所以从这里透传下去，别让 endpoints 用自己的默认值。
-    # 上游 8aba19a 口径：**只认请求体里的 model 原文**，缺省就是空串 ——
-    # 不拿 endpoints.EXT_MODEL 去猜，否则 bus_info 的 model= 段与 body 不一致，
-    # 服务端复核 nonce 时直接判非法客户端（4100404）。
-    model = str(body.get("model") or "")
-    for attempt in range(CHAT_ATTEMPTS):
-        req = urllib.request.Request(url, data=data, method="POST")
-        for key, value in endpoints.llm_headers(acct, model=model).items():
-            req.add_header(str(key), str(value))
+    req = urllib.request.Request(url, data=data, method="POST")
+    # ⚠ 必须把 body 里的 model 带进签名头。
+    #
+    # `llm_headers()` 会把 model 写进 uskey 的 bus_info，服务端用 nonce 复核
+    # 这个指纹。以前这里调成 `llm_headers(acct)`，model 取默认空串，而 body
+    # 里发的是真实模型名 —— 两边对不上，上游直接判非法客户端回 4100404。
+    #
+    # 现场表现很像「出口被风控」：凭证钱包接口正常、换号无效、换 Key 无效，
+    # 因为被拦的根本不是账号，是这条请求的身份自证。
+    chat_model = str(body.get("model") or "")
+    # 会话级 id：同账号 + 同对话恒定（`conversation_id_for`）；请求级 id：
+    # 每次上游调用唯一（去重键，复用会少记账）。
+    #
+    # 两个值必须**一起**交给 `llm_headers()`：它内部只调一次 `uskey_identity()`
+    # 并签出 uskey，让 bus_info 与这两个请求头取自同一份身份 —— 缺一个就会
+    # 退回随机生成，uskey 与头对不上直接 403 4100404（见 2026-11-18 事故）。
+    conversation_id = conversation_id_for(account_id, body)
+    response_id = uuid.uuid4().hex
+    try:
+        headers = endpoints.llm_headers(acct, model=chat_model,
+                                        conversation_id=conversation_id,
+                                        response_id=response_id)
+    except endpoints.SignerUnavailable as exc:
+        # fail-closed：签名器不可用时**一个字节都不往上游发**。
+        #
+        # 这里必须转成 `UpstreamError` 而不是让异常裸奔：裸奔会被下面那个
+        # 兜底 except 归成 `network`，上层于是「换号重试」—— 换号也签不出来，
+        # 白白把号池里的号一个个 note_failure。归成 `signer_unavailable`
+        # 之后 `_attempt()` 会直接 break、不记账号失败（见 gateway）。
+        raise UpstreamError(
+            "Marvis 客户端指纹签名不可用（beacon 未就绪），已按 fail-closed "
+            "拒绝本次请求；这与 API Key、账号状态都无关",
+            status=503, code="signer_unavailable", kind="signer_unavailable",
+            detail=(exc.detail or str(exc))[:300]) from exc
+    for key, value in headers.items():
+        req.add_header(str(key), str(value))
+
+    # 排障开关：设 MARVIS_DEBUG_HEADERS=1 时把这次请求的关键字段打出来。
+    #
+    # 为什么需要它：同一账号、同一 uskey、同一分钟，
+    # 网关 200 而外部脚本 403 —— 只有比对「网关究竟发了什么」才能定因。
+    # 只打 uskey 前 16 字符和长度，不打完整 token。
+    if (os.getenv("MARVIS_DEBUG_HEADERS") or "").strip() in ("1", "true", "yes"):
+        ext = headers.get("Ual-Access-MarvisExt") or ""
         try:
-            resp = _opener().open(req, timeout=STREAM_TIMEOUT)
-        except urllib.error.HTTPError as exc:
-            payload = ""
-            try:
-                payload = exc.read().decode("utf-8", "replace")
-            except Exception:  # noqa: BLE001
-                pass
-            risk = _biz_code_of(payload) == RISK_CONTROL_CODE
-            if risk and attempt + 1 < CHAT_ATTEMPTS:
-                logger.warning(
-                    "Marvis 模型网关 4100404（account=%s），整组轮换 "
-                    "cid/rid/nonce/uskey 后重试", account_id)
-                try:
-                    exc.close()   # 别把上一发的连接晾着
-                except Exception:  # noqa: BLE001
-                    pass
-                continue
-            kind = _classify(exc.code, payload)
-            note_sentinel(realm, account_id, kind, code=str(exc.code),
-                          status=exc.code, detail=payload)
-            raise UpstreamError("模型网关失败（HTTP %d）" % exc.code,
-                                status=exc.code, code=str(exc.code), kind=kind,
-                                detail=payload) from exc
-        except Exception as exc:  # noqa: BLE001
-            note_sentinel(realm, account_id, "network", detail=str(exc)[:200])
-            raise UpstreamError("模型网关网络失败", status=0, kind="network",
-                                detail=str(exc)[:200]) from exc
-        # 200 但回 application/json：不是 SSE，是上游业务错误体（见下）。
-        return _reject_json_body(resp, body, realm, account_id)
+            parsed = json.loads(ext)
+        except Exception:  # noqa: BLE001
+            parsed = {}
+        logger.info(
+            "marvis 请求 | model=%r scene=%r agent=%r conv=%r rid=%r "
+            "uskey=%s(%d) nonce=%s clientVer=%s ua=%r",
+            chat_model,
+            headers.get("Marvis-Scene"),
+            headers.get("Marvis-AgentTag"),
+            headers.get("Marvis-Conversation-ID"),
+            headers.get("Marvis-Response-ID"),
+            str(parsed.get("uskey", ""))[:16],
+            len(str(parsed.get("uskey", ""))),
+            str(parsed.get("nonce", ""))[:8],
+            parsed.get("clientVersion"),
+            headers.get("User-Agent"),
+        )
+    try:
+        resp = _opener().open(req, timeout=STREAM_TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        payload = ""
+        try:
+            payload = exc.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            pass
+        kind = _classify(exc.code, payload)
+        note_sentinel(realm, account_id, kind, code=str(exc.code),
+                      status=exc.code, detail=payload)
+        raise UpstreamError("模型网关失败（HTTP %d）" % exc.code,
+                            status=exc.code, code=str(exc.code), kind=kind,
+                            detail=payload) from exc
+    except Exception as exc:  # noqa: BLE001
+        note_sentinel(realm, account_id, "network", detail=str(exc)[:200])
+        raise UpstreamError("模型网关网络失败", status=0, kind="network",
+                            detail=str(exc)[:200]) from exc
+    return _reject_json_body(resp, body, realm, account_id)
 
 
 def _classify_json_body(payload: str) -> str:
@@ -833,9 +922,8 @@ def refresh_credentials(refresh_token: str = "", realm: str = "cn", *,
             "请在控制台「授权登录」重新扫码（QQ / 微信）",
             status=401, code="credential_incomplete", kind="auth")
 
-    acct = {"openid": openid, "access_token": token, "refresh_token": refresh,
-            "guid": guid,
-            "login_type": str(data.get("login_type") or data.get("loginType") or "1")}
+    acct = _acct({**data, "openid": openid, "access_token": token, "guid": guid})
+    acct["refresh_token"] = refresh
     # 签名对象是**实际发出的那串字节**：先序列化，再拿同一串去做签名头。
     body = endpoints.refresh_body(acct)
     headers = endpoints.business_headers(acct, query=body, method="POST")

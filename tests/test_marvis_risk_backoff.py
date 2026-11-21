@@ -14,8 +14,7 @@
 
   · 4100404 **不再重试**（client.CHAT_ATTEMPTS = 1）—— 18:19:11 撞 4100404 后
     整组轮换重发，18:23 同一个 token 就变成 401 4100403（登录态被打死）；
-  · 撞墙的那个号改为打 **300 秒**账号冷却（COOL_SECONDS_RISK），
-    但**仍然不换号、不 exclude** —— 自放大来自「重放同一份 body」，不是冷却；
+  · 风控仅让当前请求失败，账号不冷却、不换号、不 exclude；
   · 平台级退避的阈值是**连续 5 次**（17:38 从 1 提到 5），单次命中只让本次失败。
 """
 import asyncio
@@ -149,29 +148,22 @@ def _quota_error():
 
 
 def test_cool_seconds_auth_and_risk():
-    """auth 600s；risk_control 用 300s（2026-11-18 起，不再是 0）。"""
+    """Persistent regression for authentication cooldown and request-scoped risk rejection."""
     assert gateway._cool_seconds("auth") == 600
-    assert gateway._cool_seconds("risk_control") == gateway.COOL_SECONDS_RISK
-    assert gateway.COOL_SECONDS_RISK == 300
+    assert gateway._cool_seconds("risk_control") == 0
     assert gateway._cool_seconds("quota_exceeded") == 0
     assert gateway._cool_seconds("upstream_business") == 0
 
 
-def test_cool_seconds_prefers_client_value():
-    """client 在撞墙处已经算好秒数（env 可调），gateway 不许覆盖它。"""
-    exc = marvis_client.UpstreamError(
-        "x", status=403, code="4100404", kind="risk_control", cool_seconds=420)
-    assert gateway._cool_seconds("risk_control", exc) == 420
+def test_risk_rejection_does_not_gain_an_account_cooldown():
+    """The client reports risk while the gateway keeps the account available."""
+    exc = _risk_error()
+    assert gateway._cool_seconds(exc.kind) == 0
+    assert exc.code == "4100404"
 
 
-def test_risk_control_cools_only_the_hit_account(monkeypatch, note_calls):
-    """风控命中后：**只**给撞墙的号打 300 秒冷却，另一个号一点都不许动。
-
-    旧断言是「cool_until 必须保持 None」。改判的不是「要不要保护号」，
-    而是保护方式：18:19 的现场证明重试会把 4100404 推成 4100403（不可逆），
-    所以必须让这个号歇一会儿；而「换号重放」已经被 risk_control 分支的
-    raise（不 exclude、不换号）挡住了，冷却不会自放大。
-    """
+def test_risk_control_preserves_both_accounts_without_cooldown(monkeypatch, note_calls):
+    """Persistent regression for the deployed request-scoped risk policy."""
     account = _FakeAccount(189)
     other = _FakeAccount(190)
     _install_pool(monkeypatch, [account, other])
@@ -182,13 +174,11 @@ def test_risk_control_cools_only_the_hit_account(monkeypatch, note_calls):
                          "cn", stream=False)
 
     assert note_calls, '失败必须留痕（note_failure 没被调用）'
-    assert note_calls[0]["cool_seconds"] == 300
+    assert note_calls[0]["cool_seconds"] == 0
     assert note_calls[0]["kind"] == "risk_control"
-    assert account.cool_until is not None, '撞墙的号没被打冷却'
-    assert account.cool_kind == "risk_control"
-    left = (account.cool_until - datetime.utcnow()).total_seconds()
-    assert 250 <= left <= 310, left
-    assert other.cool_until is None, '别的号被连带冷却了（自放大）'
+    assert account.cool_until is None
+    assert account.cool_kind == ""
+    assert other.cool_until is None
 
 
 # ---------------------------------------------------------------------------
@@ -210,20 +200,22 @@ def test_risk_control_does_not_switch_account(monkeypatch, note_calls):
     assert selected[0] == frozenset(), '失败号被加进了 exclude 集合'
 
 
-def test_local_cooldown_block_does_not_count_as_risk_hit(monkeypatch, note_calls):
-    """本端冷却拦下的请求（local=True）不算命中：没打上游就不可能被风控。"""
+def test_platform_backoff_block_does_not_count_as_an_upstream_risk_hit(monkeypatch, note_calls):
+    """A local backoff response neither selects an account nor adds a risk hit."""
+    monkeypatch.setenv(gateway.RISK_BACKOFF_THRESHOLD_ENV, "1")
+    gateway.note_risk_control()
+    before = gateway.risk_hits()
     account = _FakeAccount(189)
-    _install_pool(monkeypatch, [account])
-    local_exc = marvis_client.UpstreamError(
-        "Marvis 风控冷却中：本次不上上游", status=429, code="4100404",
-        kind="risk_control", cool_seconds=120, local=True)
-    _run_attempt(monkeypatch, exc=local_exc)
+    selected = _install_pool(monkeypatch, [account])
+    _run_attempt(monkeypatch, exc=_risk_error())
 
-    with pytest.raises(marvis_client.UpstreamError):
+    with pytest.raises(shared.PlatformRejected):
         gateway._attempt(_FakeDB(), None, None, {"model": "m"}, "cn", stream=False)
 
-    assert gateway.risk_hits() == 0, "本地拦截被算成上游命中（会自己推进退避）"
-    assert gateway.risk_backoff_remaining() == 0
+    assert gateway.risk_hits() == before
+    assert gateway.risk_backoff_remaining() > 0
+    assert selected == []
+    assert note_calls == []
 
 
 def test_platform_backoff_blocks_second_request(monkeypatch, note_calls):
