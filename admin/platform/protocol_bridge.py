@@ -67,6 +67,7 @@ loomy / raccoon / qoder 各自拷贝了一份「Anthropic ↔ OpenAI」与
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import queue
@@ -74,6 +75,7 @@ import threading
 import time
 import uuid
 
+import anyio
 from starlette.responses import StreamingResponse
 
 # ---------------------------------------------------------------------------
@@ -780,6 +782,114 @@ def openai_to_responses(result: dict, model: str) -> dict:
 # ---------------------------------------------------------------------------
 # SSE 行解析（内层 StreamingResponse → 行）
 # ---------------------------------------------------------------------------
+async def _close_relay_iterator(iterator):
+    """Close an owned iterator without replacing a stream result with cleanup errors."""
+    try:
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()
+        else:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                await anyio.to_thread.run_sync(close)
+    except Exception:  # Cancellation is a BaseException and must still propagate.
+        pass
+
+
+class _RelayBody:
+    """Own the relay and upstream iterator, including before the first read."""
+
+    def __init__(self, source, upstream):
+        self.source = source
+        self.upstream = upstream
+        self.closed = False
+        self.closing = False
+        self.pending = None
+        self.close_task = None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.closing:
+            raise StopAsyncIteration
+        if self.pending is not None:
+            raise RuntimeError("relay iterator is already being read")
+        pending = asyncio.ensure_future(self.source.__anext__())
+        self.pending = pending
+        try:
+            piece = await pending
+            if self.closing:
+                raise StopAsyncIteration
+            return piece
+        except BaseException as original:
+            try:
+                await self.aclose()
+            except BaseException as cleanup:
+                if isinstance(original, StopAsyncIteration):
+                    raise
+                # Keep a real read failure/cancellation primary, with cleanup's
+                # cancellation available as its explicit exception cause.
+                raise original from cleanup
+            raise
+        finally:
+            if self.pending is pending:
+                self.pending = None
+
+    async def aclose(self):
+        if self.close_task is None:
+            self.closing = True
+            self.close_task = asyncio.create_task(self._finish_close(self.pending))
+        # Starlette's ASGI 2.0 disconnect path cancels its task-group scope.
+        # Shield cleanup from that scope so upstream finally blocks can await.
+        with anyio.CancelScope(shield=True):
+            error = await asyncio.shield(self.close_task)
+        if error is not None:
+            raise error
+
+    async def _finish_close(self, pending):
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass  # The waiting reader retains its original read exception.
+        try:
+            try:
+                await _close_relay_iterator(self.source)
+            finally:
+                await _close_relay_iterator(self.upstream)
+        except BaseException as error:
+            # Returning it keeps Task from replacing a cleanup CancelledError
+            # with an empty cancellation; aclose re-raises the original object.
+            return error
+        finally:
+            self.closed = True
+
+
+class _RelayStreamingResponse(StreamingResponse):
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        except BaseException as original:
+            try:
+                await self.body_iterator.aclose()
+            except BaseException as cleanup:
+                raise original from cleanup
+            raise
+        else:
+            await self.body_iterator.aclose()
+
+
+def owned_stream_response(source, owner, *, status_code=200, headers=None):
+    """Return SSE whose body and explicit resource owner close together once."""
+    return _RelayStreamingResponse(
+        _RelayBody(source, owner), status_code=status_code,
+        media_type="text/event-stream", headers=headers)
+
+
 async def _iter_sse_lines(inner) -> "object":
     """把内层字节流拆成单行（bytes）。
 
@@ -1010,8 +1120,8 @@ def anthropic_stream_relay(inner, model: str, *, prefix: str = "gw") -> Streamin
                 {"type": "error", "error": error}, ensure_ascii=False)).encode()
         yield sse({"type": "message_stop"})
 
-    return StreamingResponse(
-        relay(), media_type="text/event-stream",
+    return owned_stream_response(
+        relay(), inner.body_iterator,
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
@@ -1301,8 +1411,8 @@ def responses_stream_relay(inner, model: str, *, prefix: str = "gw") -> Streamin
             yield event("response.completed",
                         {"type": "response.completed", "response": base})
 
-    return StreamingResponse(
-        relay(), media_type="text/event-stream",
+    return owned_stream_response(
+        relay(), inner.body_iterator,
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
