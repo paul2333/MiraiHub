@@ -575,6 +575,11 @@ def _fetch_real_credits(log_id: int, account_id: int, auth_json: str, model: str
             best = next((by_id[i] for i in wanted if i in by_id), None)
             matched_by = "requestId"
             if best is None:
+                if wanted:
+                    # A delayed or paginated bill must not borrow another request's cost.
+                    _logger.info("真实积分回写未找到请求 ID log=%s model=%s ids=%s",
+                                 log_id, model, wanted[:3])
+                    return
                 client_name = (settings.UPSTREAM_CLIENT_NAME or "WorkBuddy").strip() or "WorkBuddy"
                 candidates = [
                     r for r in data
