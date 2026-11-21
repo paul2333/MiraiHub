@@ -152,13 +152,22 @@ class MessageScopeTests(unittest.TestCase):
         self.assertIs(body["messages"][0], system_msg)
 
     def test_all_system_messages_are_rewritten(self):
-        """非首位 system 同样会被拦，所以每一条都要改。"""
-        first = {"role": "system", "content": "无指纹的开场白"}
-        second = {"role": "system", "content": self.poison}
-        out = marvis_gateway._prepare_body(
-            {"model": "x", "messages": [first, second]}, "main-auto")
-        self.assertIs(out["messages"][0], first)
-        self.assertNotEqual(out["messages"][1]["content"], self.poison)
+        """各段身份行在合并前命中，输出仍只有一条 system。"""
+        first = {"role": "system", "content": "You are Codex."}
+        second = {"role": "developer", "content": "You are Claude Code."}
+        user = {"role": "user", "content": second["content"]}
+        body = {"model": "x", "messages": [first, second, user]}
+        with self.assertLogs("admin.platform.marvis.gateway", level="INFO") as captured:
+            out = marvis_gateway._prepare_body(body, "main-auto")
+        self.assertEqual(out["messages"], [
+            {"role": "system", "content": "You're Codex.\n\nYou're Claude Code."},
+            user])
+        self.assertIs(out["messages"][1], user)
+        self.assertEqual(first, {"role": "system", "content": "You are Codex."})
+        self.assertEqual(second, {"role": "developer", "content": "You are Claude Code."})
+        self.assertIs(body["messages"][0], first)
+        self.assertIs(body["messages"][1], second)
+        self.assertIn("rules_hit=2", "\n".join(captured.output))
 
     def test_odd_shapes_do_not_crash(self):
         """畸形 messages 不能把网关打成 500：原样放行，交给上游判。"""
@@ -679,33 +688,45 @@ class TopLevelSystemFieldTests(unittest.TestCase):
         body = {"model": "x", "system": poison,
                 "messages": [{"role": "user", "content": "ping"}]}
         out = marvis_gateway._prepare_body(body, "main-auto")
-        self.assertEqual(out["system"], "You are a capable assistant")
+        self.assertNotIn("system", out)
+        self.assertEqual(out["messages"][0],
+                         {"role": "system", "content": "You are a capable assistant"})
         self.assertEqual(body["system"], poison, "调用方 body 不能被就地改")
-        self.assertIs(out["messages"], body["messages"])
+        self.assertIs(out["messages"][1], body["messages"][0])
 
     def test_top_level_system_zero_hit_returns_same_object(self):
         text = "普通系统提示词，没有指纹。"
         out = marvis_gateway._prepare_body({"model": "x", "system": text},
                                            "main-auto")
-        self.assertIs(out["system"], text)
+        self.assertNotIn("system", out)
+        self.assertIs(out["messages"][0]["content"], text)
 
     def test_non_string_top_level_system_passes_through(self):
         payload = [{"type": "text", "text": "You are a helpful assistant"}]
-        out = marvis_gateway._prepare_body({"model": "x", "system": payload},
-                                           "main-auto")
-        self.assertIs(out["system"], payload)
+        user = {"role": "user", "content": "ping"}
+        body = {"model": "x", "system": payload, "messages": [user]}
+        out = marvis_gateway._prepare_body(body, "main-auto")
+        self.assertNotIn("system", out)
+        self.assertIs(out["messages"][0]["content"], payload)
+        self.assertIs(out["messages"][0]["content"][0], payload[0])
+        self.assertIs(body["system"], payload)
+        self.assertIs(out["messages"][1], user)
+        self.assertIs(body["messages"][0], user)
 
     def test_hits_from_messages_and_top_level_system_are_summed(self):
         body = {"model": "x",
-                "system": "You are a helpful assistant",
+                "system": "You are Codex.",
                 "messages": [{"role": "system",
-                              "content": "You are an AI assistant."}]}
+                              "content": "You are Claude Code."}]}
         with self.assertLogs("admin.platform.marvis.gateway",
                              level="INFO") as captured:
             out = marvis_gateway._prepare_body(body, "main-auto")
-        self.assertEqual(out["system"], "You are a capable assistant")
+        self.assertNotIn("system", out)
+        self.assertEqual(len(out["messages"]), 1)
         self.assertEqual(out["messages"][0]["content"],
-                         "You are a capable AI assistant.")
+                         "You're Codex.\n\nYou're Claude Code.")
+        self.assertEqual(body["system"], "You are Codex.")
+        self.assertEqual(body["messages"][0]["content"], "You are Claude Code.")
         self.assertIn("rules_hit=2", "\n".join(captured.output))
 
 

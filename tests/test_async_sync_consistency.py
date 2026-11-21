@@ -572,8 +572,11 @@ class ChatCompletionsSmokeTests(unittest.IsolatedAsyncioTestCase):
         chunks = []
         async for chunk in response.body_iterator:
             chunks.append(chunk)
-        self.assertEqual([], [c for c in chunks if c],
-                         "假上游没有字节，转发器也不该凭空造帧")
+        payload = b"".join(chunk if isinstance(chunk, bytes) else chunk.encode()
+                           for chunk in chunks)
+        self.assertEqual(payload.count(b"data: [DONE]"), 1)
+        self.assertIn(b'"finish_reason": "stop"', payload)
+        self.assertNotIn(b'"content"', payload)
 
 
 if __name__ == "__main__":

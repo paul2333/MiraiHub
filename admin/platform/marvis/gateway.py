@@ -1007,7 +1007,7 @@ def rewrite_tencent_fingerprints(text: str) -> tuple[str, int]:
 
 
 def _sanitize_messages(messages: list) -> tuple[list, int]:
-    """对**每一条 system 消息**的 `content` 做指纹改写，其余角色原样不动。
+    """对每条 system/developer 消息的字符串正文改写，其余角色原样不动。
 
     为什么不是只改 `messages[0]`：非首位 system 同样会被上游拦，只改第一条
     等于留一条随时会踩的路径。
@@ -1021,7 +1021,7 @@ def _sanitize_messages(messages: list) -> tuple[list, int]:
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
-        if str(message.get("role") or "") != "system":
+        if str(message.get("role") or "") not in ("system", "developer"):
             continue
         content = message.get("content")
         if not isinstance(content, str):
@@ -1049,8 +1049,7 @@ def _sanitize_messages(messages: list) -> tuple[list, int]:
 #: = true），两者相乘 ⇒ **每条**请求的首条消息都是 developer。客户端版本不受
 #: 网关控制，归一化只能在这里做。
 #:
-#: ⚠ 归一化必须发生在**指纹改写之前**：改写只认 role=system 的消息，先合并再洗
-#:   才能保证 developer 转来的那几段正文整段都被洗到；反过来会漏掉它们。
+#: 每条 system/developer 字符串正文先分别改写，再归一合并，保留各段首行身份句检测。
 _SYSTEM_ROLE = "system"
 _DEVELOPER_ROLE = "developer"
 
@@ -1244,7 +1243,7 @@ def _prepare_body(body: dict, slot: str) -> dict:
 
     · **角色归一化**（2026-11-19）：`developer` -> `system`、多条 system 合并成
       一条、顶层 `system` 并入 —— 见上面「角色归一化」小节的实测证据。这一步
-      必须在指纹改写**之前**，否则 developer 转来的正文洗不到；
+      在各段指纹改写之后进行，避免合并使后续段落失去首行身份句检测；
     · `max_completion_tokens` -> `max_tokens`（上游只认后者，冲突打 WARNING）；
     · `model` 换成槽位名；
     · 流式时补 `stream_options.include_usage` —— 少了它上游不返回 usage 帧，
@@ -1257,15 +1256,6 @@ def _prepare_body(body: dict, slot: str) -> dict:
     """
     out = dict(body)
     out["model"] = slot
-    # ⓵ 角色归一化：developer -> system、多条 system 合并、顶层 system 并入。
-    # 必须排在指纹改写之前 —— 改写只认 role=system，先合并再洗才能保证
-    # developer 转来的那几段正文整段被洗到。
-    out, role_stats = _normalize_system_roles(out)
-    if role_stats:
-        logger.info(
-            "Marvis 角色归一化 | developer_to_system=%d system_merged=%d "
-            "top_system=%d", role_stats["developer_to_system"],
-            role_stats["system_merged"], role_stats["top_system_merged"])
     # ⓶ 上游只认 max_tokens：把 OpenAI 的新名字映射过去（含冲突告警）。
     _normalize_max_tokens(out)
     hits = 0
@@ -1283,6 +1273,13 @@ def _prepare_body(body: dict, slot: str) -> dict:
     if hits:
         # 只记命中条数，**不记原文**：system 里可能带用户的 prompt / 路径 / 密钥。
         logger.info("Marvis 内容风控指纹改写 | rules_hit=%d", hits)
+    # 各原始指令段已分别清洁，再保留现有单条 system 的发送契约。
+    out, role_stats = _normalize_system_roles(out)
+    if role_stats:
+        logger.info(
+            "Marvis 角色归一化 | developer_to_system=%d system_merged=%d "
+            "top_system=%d", role_stats["developer_to_system"],
+            role_stats["system_merged"], role_stats["top_system_merged"])
     # ⓷ response_format 归一（上游 PR #55）：上游未实现 json_object，
     # 直接透传会整条 400（3000101）。放在指纹改写之后、补 stream_options 之前。
     if "response_format" in out:
@@ -2684,9 +2681,7 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             # 正确处置：整平台退避，等出口 IP 换掉 / 风控自然过期。
             if exc.kind == "risk_control":
                 # 2026-11-18：单次 4100404 **不锁平台**，只让本次请求失败。
-                # 同号重试一次已经在下层做掉了（client.CHAT_ATTEMPTS = 2，
-                # 且每次重签 cid/rid/nonce/uskey 整组轮换，见 open_chat_stream）——
-                # 所以这里再重试只会把同一份 body 再打一遍上游，不做。
+                # client 首发拒绝后直接返回；这里继续拒绝同号重发和换号重放。
                 # 只有**连续**撞满阈值才开平台窗口，见 note_risk_control。
                 backoff = note_risk_control()
                 hits = risk_hits()
@@ -3222,7 +3217,7 @@ async def chat_completions(request: Request):
                                        "code": exc.code}},
                             status_code=404 if exc.code == "model_not_found" else 400)
 
-    upstream_body = _prepare_body(body, slot)
+    upstream_body = await asyncio.to_thread(_prepare_body, body, slot)
     wants_stream = bool(body.get("stream"))
     # /v1/messages 与 /v1/responses 的中继（见 _run_normalized）**不要**错误帧：
     # 它们按 choices[] 解析，帧会被丢掉。那边还没写任何字节，直接给真状态码。

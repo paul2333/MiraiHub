@@ -82,8 +82,6 @@ class NoResignOnRiskRegressionTests(unittest.TestCase):
                 client, "conversation_id_for", return_value=CONVERSATION_ID))
             stack.enter_context(mock.patch.object(
                 endpoints, "chat_url", return_value=CHAT_URL))
-            stack.enter_context(mock.patch.object(
-                endpoints, "ext_qimei36", return_value=SYNTHETIC_QIMEI))
             signer = stack.enter_context(mock.patch.object(
                 endpoints, "uskey_identity", side_effect=synthetic_identity))
 
