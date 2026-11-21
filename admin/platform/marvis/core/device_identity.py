@@ -12,8 +12,11 @@ import hashlib
 import os
 import re
 import secrets
+import threading
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from . import qimei_assign as _assign
 
@@ -24,6 +27,8 @@ _RECORD_FIELDS = {"seed", "generation", "guid", "qimei36"}
 _SEED = re.compile(r"[0-9a-f]{64}")
 _PLACEHOLDERS = {"0", "null", "none", "undefined", "unknown"}
 _ERROR = "managed device identity is unavailable"
+_context_cache_lock = threading.RLock()
+_context_cache = (None, None)
 
 
 class DeviceIdentityError(RuntimeError):
@@ -122,14 +127,15 @@ def _qimei(value) -> str:
     return text
 
 
-def _sole_mapping(state, user: str) -> str:
+def _sole_mapping(state, user: str, qimei_counts=None) -> str:
     value = state.table.get(user)
     if type(value) is not str or _qimei(value) != value:
         _fail()
     entry = state.pool.get(value)
     if (type(entry) is not dict or entry.get("real") is not True
             or entry.get("owners") != [user]
-            or sum(q == value for q in state.table.values()) != 1):
+            or (qimei_counts.get(value, 0) if qimei_counts is not None
+                else sum(q == value for q in state.table.values())) != 1):
         _fail()
     return value
 
@@ -145,6 +151,7 @@ def _records(state) -> dict:
             or type(namespace["accounts"]) is not dict):
         _fail()
     accounts = namespace["accounts"]
+    qimei_counts = Counter(state.table.values())
     seen_guids, seen_qimei = set(), set()
     for user, record in accounts.items():
         if type(user) is not str or _uid(user) != user:
@@ -157,7 +164,7 @@ def _records(state) -> dict:
         guid = _guid(record["guid"])
         qimei = _qimei(record["qimei36"])
         if (guid != record["guid"] or qimei != record["qimei36"]
-                or qimei != _sole_mapping(state, user)
+                or qimei != _sole_mapping(state, user, qimei_counts)
                 or guid.casefold() in seen_guids or qimei in seen_qimei):
             _fail()
         seen_guids.add(guid.casefold())
@@ -169,6 +176,24 @@ def _context(user: str, record: dict) -> Context:
     dev18 = _digest(b"marvis-managed-dev18-v1\0", user, record["qimei36"],
                     record["generation"], bytes.fromhex(record["seed"]))[:18]
     return Context(user, record["qimei36"], record["guid"], dev18, record["generation"])
+
+
+def _request_contexts(state):
+    """Cache one fully validated request state as immutable account contexts."""
+    global _context_cache
+    cached_state, contexts = _context_cache
+    if state is cached_state:
+        return contexts
+    with _context_cache_lock:
+        cached_state, contexts = _context_cache
+        if state is cached_state:
+            return contexts
+        # A failed validation must not leave an earlier state's contexts active.
+        _context_cache = (None, None)
+        contexts = MappingProxyType({user: _context(user, record)
+                                     for user, record in _records(state).items()})
+        _context_cache = (state, contexts)
+        return contexts
 
 
 def _check_credential(acct: dict, context: Context):
@@ -186,6 +211,7 @@ def _check_credential(acct: dict, context: Context):
 
 def resolve(acct: dict) -> Context | None:
     """Capture once, or reuse the caller's already captured in-flight context."""
+    global _context_cache
     if not enabled():
         return None
     try:
@@ -196,11 +222,15 @@ def resolve(acct: dict) -> Context | None:
             if not isinstance(context, Context):
                 _fail()
         else:
-            state = _assign.load_state()
-            record = _records(state).get(user)
-            if record is None:
+            try:
+                state = _assign._request_state()
+            except Exception:
+                with _context_cache_lock:
+                    _context_cache = (None, None)
+                raise
+            context = _request_contexts(state).get(user)
+            if context is None:
                 _fail()
-            context = _context(user, record)
         _check_credential(acct, context)
         return context
     except Exception:

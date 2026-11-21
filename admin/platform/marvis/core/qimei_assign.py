@@ -96,6 +96,8 @@ STATE_LOCK_NAME = "qimei_state.lock"
 
 _ORM_HOOKS_INSTALLED = False
 _SERVE_LOCK = threading.Lock()
+_REQUEST_STATE_LOCK = threading.Lock()
+_request_state_cache = None
 #: rename 的间接引用：容器里状态文件是单文件 bind mount，rename 会 EBUSY，
 #: 单测用它可以精确模拟那一步失败（不改全局 os.replace）。
 _REPLACE = os.replace
@@ -411,6 +413,60 @@ def load_state(state_dir=None, *, table_path=None, pool_path=None) -> State:
     pp = _pool_path(state_dir, pool_path)
     return _normalise_state(_read_json(tp), _read_json(pp), table_path=tp,
                             pool_path=pp, default_ts=_mtime_iso(tp) or _now())
+
+
+def _file_version(path: Path, *, missing_ok: bool) -> tuple:
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        if missing_ok:
+            return (path, None)
+        raise
+    # Legacy bind mounts permit in-place writes. On Windows an equal-sized
+    # overwrite can retain all stat fields, so legacy cache keys include bytes.
+    content_digest = None
+    if missing_ok:
+        content_digest = hashlib.sha256(path.read_bytes()).digest()
+    return (path, status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns, content_digest)
+
+
+def _request_state() -> State:
+    """Share validated request state until any source file version changes.
+
+    The returned state is private and read-only to callers. Writers and startup
+    validation use load_state instead, so mutations never affect this cache.
+    Each lookup stats the resolved source paths. Changed files validate again
+    and a failed refresh evicts the previous entry. Optional legacy files may
+    appear or disappear, while an explicit snapshot always remains required.
+    """
+    global _request_state_cache
+    snapshot = _snapshot_path()
+    paths = (snapshot,) if snapshot is not None else (_table_path(), _pool_path())
+    with _REQUEST_STATE_LOCK:
+        try:
+            for _ in range(3):
+                version = tuple(_file_version(path, missing_ok=snapshot is None)
+                                for path in paths)
+                if _request_state_cache is not None:
+                    cached_version, state = _request_state_cache
+                    if version == cached_version:
+                        return state
+                _request_state_cache = None
+                state = load_state()
+                loaded_paths = ((state.snapshot_path,) if state.snapshot_path is not None
+                                else (state.table_path, state.pool_path))
+                after = tuple(_file_version(path, missing_ok=snapshot is None)
+                              for path in paths)
+                if loaded_paths == paths and version == after:
+                    _request_state_cache = (version, state)
+                    return state
+        except OSError:
+            _request_state_cache = None
+            if snapshot is None:
+                return load_state()
+            raise QimeiPoolError("QIMEI snapshot could not be loaded") from None
+        raise QimeiPoolError("QIMEI state changed during request capture")
 
 
 def _normalise_state(raw_table, raw_pool, *, table_path, pool_path, default_ts,

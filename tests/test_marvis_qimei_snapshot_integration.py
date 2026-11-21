@@ -149,6 +149,80 @@ class SnapshotIntegrationTests(unittest.TestCase):
             self.assertEqual(self.uskey.qimei_for(UID_A), Q2)
         self.assertEqual(self.uskey.qimei_for(UID_A), Q1)
 
+    def test_unchanged_snapshot_lookups_share_validation_but_writers_read_fresh(self):
+        self._write_snapshot()
+        support = self.qa._snapshot_support()
+        with patch.object(support, "read_snapshot", wraps=support.read_snapshot) as read:
+            self.assertEqual(self.uskey.qimei_for(UID_A), Q1)
+            self.assertEqual(self.uskey.qimei_for(UID_A), Q1)
+            self.assertEqual(read.call_count, 1)
+            self.qa.load_state()
+            self.qa.load_state()
+            self.assertEqual(read.call_count, 3)
+
+    def test_cached_lookup_observes_equal_revision_size_and_mtime_replacement(self):
+        self._write_snapshot()
+        self.assertEqual(self.uskey.qimei_for(UID_A), Q1)
+        before = self.snapshot.stat()
+        replacement = self.snapshot.with_name("replacement.json")
+        self._write_snapshot(path=replacement, table={UID_A: Q2}, pool={Q2: pool_entry(UID_A)})
+        self.assertEqual(replacement.stat().st_size, before.st_size)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, self.snapshot)
+        self.assertEqual(self.uskey.qimei_for(UID_A), Q2)
+
+    def test_warm_lookup_rejects_deleted_and_corrupt_snapshot_then_recovers(self):
+        self._write_snapshot()
+        self.assertEqual(self.uskey.qimei_for(UID_A), Q1)
+        self.snapshot.unlink()
+        with self.assertRaises(self.qa.QimeiPoolError):
+            self.uskey.qimei_for(UID_A)
+        self.snapshot.write_text("{", encoding="utf-8")
+        with self.assertRaises(self.qa.QimeiPoolError):
+            self.uskey.qimei_for(UID_A)
+        self._write_snapshot(table={UID_A: Q2}, pool={Q2: pool_entry(UID_A)})
+        self.assertEqual(self.uskey.qimei_for(UID_A), Q2)
+
+    def test_snapshot_changed_during_request_capture_is_reloaded(self):
+        self._write_snapshot()
+        original = self.qa.load_state
+        loads = []
+
+        def load():
+            state = original()
+            loads.append(state.revision)
+            if len(loads) == 1:
+                replacement = self.snapshot.with_name("replacement.json")
+                self._write_snapshot(path=replacement, revision=2, table={UID_A: Q2},
+                                     pool={Q2: pool_entry(UID_A)})
+                os.replace(replacement, self.snapshot)
+            return state
+
+        with patch.object(self.qa, "load_state", side_effect=load):
+            self.assertEqual(self.uskey.qimei_for(UID_A), Q2)
+        self.assertEqual(loads, [1, 2])
+
+    def test_continuous_snapshot_changes_during_capture_fail_closed(self):
+        self._write_snapshot()
+        original = self.qa.load_state
+
+        def load():
+            state = original()
+            replacement = self.snapshot.with_name("replacement.json")
+            self._write_snapshot(path=replacement, revision=state.revision + 1)
+            os.replace(replacement, self.snapshot)
+            return state
+
+        with patch.object(self.qa, "load_state", side_effect=load):
+            with self.assertRaises(self.qa.QimeiPoolError):
+                self.uskey.qimei_for(UID_A)
+
+    def test_lookup_result_cannot_mutate_future_cached_assignments(self):
+        self._write_snapshot()
+        table = self.uskey._qimei_table()
+        table[UID_A] = Q2
+        self.assertEqual(self.uskey.qimei_for(UID_A), Q1)
+
     def test_direct_import_cannot_fall_back_to_a_legacy_table_in_snapshot_mode(self):
         direct = self._load("uskey", direct=True)
         # Even the current fallback is confined to an absent synthetic path.

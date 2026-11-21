@@ -11,6 +11,7 @@ import tempfile
 import types
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -429,6 +430,111 @@ class DeviceIdentityTests(unittest.TestCase):
                      self.acct(**{self.identity.CONTEXT_KEY: {"uid": UID_A}})):
             with self.subTest(acct=acct):
                 self.assert_generic_error(lambda acct=acct: self.identity.resolve(acct))
+
+    # Persistent regressions for bounded request caching and linear validation.
+    def test_warm_requests_reuse_validated_immutable_contexts_without_account_crossover(self):
+        self.enroll()
+        self.enroll(UID_B, GUID_B)
+        with patch.object(self.identity, "_records", wraps=self.identity._records) as validate:
+            a = self.identity.resolve(self.acct())
+            b = self.identity.resolve(self.acct(UID_B, GUID_B))
+            self.assertIs(self.identity.resolve(self.acct()), a)
+            self.assertIs(self.identity.resolve(self.acct(UID_B, GUID_B)), b)
+            self.assertEqual(validate.call_count, 1)
+        self.assertEqual((a.uid, a.qimei36, a.guid), (UID_A, Q1, GUID_A))
+        self.assertEqual((b.uid, b.qimei36, b.guid), (UID_B, Q2, GUID_B))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            a.qimei36 = Q2
+        self.assertEqual(self.identity.resolve(self.acct()).qimei36, Q1)
+
+    def test_namespace_validation_visits_binding_values_only_once(self):
+        self.enroll()
+        self.enroll(UID_B, GUID_B)
+        self.enroll(UID_C, "existing-login-guid-c")
+        state = self.qa.load_state()
+
+        class CountedTable(dict):
+            visited = 0
+
+            def values(self):
+                for value in super().values():
+                    self.visited += 1
+                    yield value
+
+        state.table = CountedTable(state.table)
+        self.assertEqual(set(self.identity._records(state)), {UID_A, UID_B, UID_C})
+        self.assertLessEqual(state.table.visited, len(state.table))
+
+    def test_reset_invalidates_warm_contexts_and_rejects_the_old_login_guid(self):
+        self.enroll()
+        self.enroll(UID_B, GUID_B)
+        a = self.identity.resolve(self.acct())
+        b = self.identity.resolve(self.acct(UID_B, GUID_B))
+        self.identity.reset_ex(UID_A, guid=GUID_NEW, generator=lambda: Q4)
+        self.assert_generic_error(lambda: self.identity.resolve(self.acct()))
+        updated = self.identity.resolve(self.acct(guid=GUID_NEW))
+        self.assertEqual((updated.qimei36, updated.guid, updated.generation), (Q4, GUID_NEW, 2))
+        self.assertNotEqual(updated.dev18, a.dev18)
+        self.assertEqual(self.identity.resolve(self.acct(UID_B, GUID_B)), b)
+
+    def test_release_invalidates_warm_context_without_breaking_another_account(self):
+        self.enroll()
+        self.enroll(UID_B, GUID_B)
+        self.identity.resolve(self.acct())
+        b = self.identity.resolve(self.acct(UID_B, GUID_B))
+        self.qa.release(UID_A)
+        self.assert_generic_error(lambda: self.identity.resolve(self.acct()))
+        self.assertEqual(self.identity.resolve(self.acct(UID_B, GUID_B)), b)
+
+    def test_warm_cache_revalidates_the_entire_namespace_after_corruption_and_repair(self):
+        self.enroll()
+        self.enroll(UID_B, GUID_B)
+        original = self.read()
+        old = self.identity.resolve(self.acct())
+        corrupted = copy.deepcopy(original)
+        corrupted["metadata"][NAMESPACE]["accounts"][UID_B]["seed"] = "bad"
+        self.write_snapshot(corrupted)
+        self.assert_generic_error(lambda: self.identity.resolve(self.acct()))
+        self.write_snapshot(original)
+        self.assertEqual(self.identity.resolve(self.acct()), old)
+
+    def test_warm_cache_rejects_missing_snapshot_and_observes_recreated_state(self):
+        self.enroll()
+        original = self.read()
+        self.identity.resolve(self.acct())
+        self.snapshot.unlink()
+        self.assert_generic_error(lambda: self.identity.resolve(self.acct()))
+        original["metadata"][NAMESPACE]["accounts"][UID_A]["generation"] = 2
+        self.write_snapshot(original)
+        self.assertEqual(self.identity.resolve(self.acct()).generation, 2)
+
+    def test_warm_cache_observes_snapshot_path_changes_and_checks_mode_each_time(self):
+        self.enroll()
+        self.identity.resolve(self.acct())
+        alternate = self.root / "alternate.json"
+        state = self.read()
+        state["table"][UID_A] = Q4
+        state["pool"][Q4] = state["pool"].pop(Q1)
+        state["metadata"][NAMESPACE]["accounts"][UID_A]["qimei36"] = Q4
+        alternate.write_text(json.dumps(state), encoding="utf-8")
+        with patch.dict(os.environ, {"QIMEI_SNAPSHOT_PATH": str(alternate)}):
+            self.assertEqual(self.identity.resolve(self.acct()).qimei36, Q4)
+        self.assertEqual(self.identity.resolve(self.acct()).qimei36, Q1)
+        with patch.dict(os.environ, {"MARVIS_QIMEI36": Q1}):
+            self.assert_generic_error(lambda: self.identity.resolve(self.acct()))
+
+    def test_concurrent_cold_requests_publish_only_their_own_account_context(self):
+        self.enroll()
+        self.enroll(UID_B, GUID_B)
+        credentials = [self.acct(), self.acct(UID_B, GUID_B)] * 8
+        with patch.object(self.identity, "_records", wraps=self.identity._records) as validate:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                contexts = list(executor.map(self.identity.resolve, credentials))
+            self.assertEqual(validate.call_count, 1)
+        for index, context in enumerate(contexts):
+            expected = (UID_A, Q1, GUID_A) if index % 2 == 0 else (UID_B, Q2, GUID_B)
+            self.assertEqual((context.uid, context.qimei36, context.guid), expected)
+            self.assertIs(context, contexts[index % 2])
 
 
 if __name__ == "__main__":

@@ -33,7 +33,8 @@ def _entry(*owners):
 @pytest.fixture
 def exporting(monkeypatch):
     with tempfile.TemporaryDirectory(prefix="qimei-export-regression-") as temporary:
-        root = Path(temporary)
+        # Match backend paths when Windows TEMP contains an 8.3 alias.
+        root = Path(temporary).resolve()
         source_dir = root / "source"
         source_dir.mkdir()
         snapshot = source_dir / "state.json"

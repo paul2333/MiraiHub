@@ -70,6 +70,32 @@ class QimeiLookupReloadTest(unittest.TestCase):
         self._write({UID_A: ROTATED_Q})
         self.assertEqual(self.uskey.qimei_for(UID_A), ROTATED_Q)
 
+    def test_unchanged_legacy_lookups_reuse_validation_until_either_file_changes(self):
+        self._write({UID_A: FIRST_Q}, {FIRST_Q: {"owners": [UID_A], "real": True}})
+        with patch.object(self.qa, "load_state", wraps=self.qa.load_state) as load:
+            self.assertEqual(self.uskey.qimei_for(UID_A), FIRST_Q)
+            self.assertEqual(self.uskey.qimei_for(UID_A), FIRST_Q)
+            self.assertEqual(load.call_count, 1)
+            self._write({UID_A: FIRST_Q},
+                        {FIRST_Q: {"owners": [UID_A, UID_B, UID_C], "real": True}})
+            with self.assertRaises(self.qa.QimeiPoolError):
+                self.uskey.qimei_for(UID_A)
+            self.assertEqual(load.call_count, 2)
+
+    def test_equal_sized_in_place_rotation_with_unchanged_stat_is_observed(self):
+        self._write({UID_A: FIRST_Q}, {FIRST_Q: {"owners": [UID_A], "real": True}})
+        paths = [self.directory / "qimei_table.json", self.directory / "qimei_pool.json"]
+        versions = {path: path.stat() for path in paths}
+        original_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            return versions[path] if path in versions else original_stat(path, *args, **kwargs)
+
+        with patch.object(Path, "stat", new=stat):
+            self.assertEqual(self.uskey.qimei_for(UID_A), FIRST_Q)
+            self._write({UID_A: ROTATED_Q})
+            self.assertEqual(self.uskey.qimei_for(UID_A), ROTATED_Q)
+
     def test_release_after_successful_lookup_restores_derived_fallback(self):
         self._write({UID_A: FIRST_Q}, {FIRST_Q: {"owners": [UID_A], "real": True}})
         self.assertEqual(self.uskey.qimei_for(UID_A), FIRST_Q)

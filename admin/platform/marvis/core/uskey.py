@@ -373,20 +373,20 @@ def _read_table_file(path: str) -> dict:
 
 
 def _qimei_table() -> dict:
-    """每次按当前路径重新加载真值表，并经 qimei_assign 校验「2 号/台」。
+    """按当前路径读取真值表，来源文件未变时复用已验证的状态。
 
     池台账不合法时 `QimeiPoolError` 必须往外抛 —— 那是硬约束被破坏，
     不能当成「读表失败」吞掉，否则带病状态会一路跑下去。
     """
     try:
-        from .qimei_assign import QimeiPoolError, load_state
+        from .qimei_assign import QimeiPoolError, _request_state
     except Exception as exc:  # noqa: BLE001
         if (os.environ.get("QIMEI_SNAPSHOT_PATH") or "").strip():
             raise SidecarError("QIMEI snapshot mode requires the assignment loader") from exc
         logger.warning("qimei_assign 不可用，退回直接读表：%s", exc)
         return _read_table_file(qimei_table_path())
     try:
-        return dict(load_state().table)
+        return dict(_request_state().table)
     except QimeiPoolError:
         raise
     except Exception as exc:  # noqa: BLE001

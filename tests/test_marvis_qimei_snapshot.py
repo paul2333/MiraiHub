@@ -49,7 +49,8 @@ class SnapshotTest(unittest.TestCase):
         self.backend = _load_backend()
         self.tmp = tempfile.TemporaryDirectory(prefix="qimei-snapshot-regression-")
         self.addCleanup(self.tmp.cleanup)
-        self.directory = Path(self.tmp.name)
+        # Match the canonical paths used by the backend on Windows short TEMP paths.
+        self.directory = Path(self.tmp.name).resolve()
         self.path = self.directory / "state.json"
 
     def _raw(self, value):
