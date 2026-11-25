@@ -274,15 +274,16 @@ def key_usage(key_id: int, _: bool = Depends(require_admin), db: Session = Depen
         raise HTTPException(status_code=404, detail="Key 不存在")
     from admin.money import as_float
 
-    # 第 5 轮：NULL / Decimal 统一转 float（以前 credit_limit 为 NULL 时 `> 0` 直接 TypeError）
+    # 第 5 轮：NULL / Decimal 统一转 float（以前 credit_limit 为 NULL 时 `> 0` 直接 TypeError）；
+    # 回包里的四个金额也走同一份 float，`round(Decimal)` 会把 Decimal 原样带进 JSON
     limit, used = as_float(k.credit_limit), as_float(k.credit_used)
     pct = ((used / limit) * 100) if limit > 0 and not k.unlimited else None
     return {
         "id": k.id,
         "name": k.name,
-        "credit_limit": k.credit_limit,
-        "credit_used": round(k.credit_used, 2),
-        "credit_remaining": (round(max(0, k.credit_limit - k.credit_used), 2) if not k.unlimited else None),
+        "credit_limit": limit,
+        "credit_used": round(used, 2),
+        "credit_remaining": (round(max(0, limit - used), 2) if not k.unlimited else None),
         "usage_percent": round(pct, 1) if pct is not None else None,
         "unlimited": bool(k.unlimited),
         "status": k.status,

@@ -652,6 +652,8 @@ async def _bill(task: VideoTask, acc) -> None:
     updated = 0
     if task.usage_log_id:
         def _update():
+            from sqlalchemy import func
+
             from admin import db as db_module
             from admin.models import ApiKey, UsageLog
             # 走模块属性而不是本地名字：测试替换、多进程热更新都依赖这一层间接。
@@ -661,8 +663,11 @@ async def _bill(task: VideoTask, acc) -> None:
                 if row is None:
                     return 0
                 if credits:
+                    # `ApiKey.credit_used or 0` 是对列表达式求布尔 → SQLAlchemy 抛
+                    # TypeError（Boolean value of this clause is not defined），回填永远
+                    # 走 except 分支；NULL 用 SQL 侧的 coalesce 兜
                     db.query(ApiKey).filter(ApiKey.id == task.api_key_id).update(
-                        {ApiKey.credit_used: (ApiKey.credit_used or 0) + abs(credits)},
+                        {ApiKey.credit_used: func.coalesce(ApiKey.credit_used, 0) + abs(credits)},
                         synchronize_session=False)
                     account = db.query(Account).filter(Account.id == task.account_id).first()
                     if account is not None:
