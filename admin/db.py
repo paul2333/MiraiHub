@@ -34,6 +34,41 @@ if engine.dialect.name == "sqlite":
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA synchronous=NORMAL")
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def is_locked_error(exc) -> bool:
+    """是不是 SQLite `database is locked` / MySQL 锁等待超时、死锁（纯函数）。"""
+    text_ = str(getattr(exc, "orig", None) or exc or "").lower()
+    return ("database is locked" in text_ or "database table is locked" in text_
+            or "lock wait timeout" in text_ or "deadlock found" in text_
+            or "sqlite_busy" in text_)
+
+
+def retry_on_locked(fn, *, attempts: int = 3, base_delay: float = 0.2):
+    """执行 `fn()`；遇到锁冲突按 0.2s / 0.4s 退避重试，其余异常原样抛出。
+
+    `fn` 必须自己开、关会话（重试时整段重来），例如记账：
+    `retry_on_locked(lambda: _record_usage_once(...))`。
+    """
+    last = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - 只重试锁冲突
+            if not is_locked_error(exc) or attempt >= attempts - 1:
+                raise
+            last = exc
+            time.sleep(base_delay * (2 ** attempt))
+    raise last
+
+
+def write_session():
+    """写入用的新会话（proxy 记账走这里）。
+
+    fork 版本在 SQLite 且开了 ADMIN_SQLITE_BEGIN_IMMEDIATE 时会先发 BEGIN IMMEDIATE；
+    上游没有对应的 engine 钩子，这里与 SessionLocal() 等价。
+    """
+    return SessionLocal()
 Base = declarative_base()
 
 

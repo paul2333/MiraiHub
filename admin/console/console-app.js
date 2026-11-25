@@ -13703,20 +13703,32 @@ function clearModelSearch() {
 function renderModelPlatformFilter() {
   const host = $("#modelPlatformFilter");
   if (!host) return;
-  const groups = {};
+  // 计数必须跟**表格里真的看得到的那批**一致。
+  // 之前这里数的是全量（Loomy 11 个），而表格在「官方同显」开着时只画 2 个
+  // —— 芯片写 11、列表两行，看起来就像「模型丢了 9 个」。现在改成 `可见/总数`。
+  const officialOnly = _modelDisplay.official_only !== false;
+  const total = {};
+  const visible = {};
   (_modelData || []).forEach(m => {
     const key = m.platform || "workbuddy";
-    groups[key] = (groups[key] || 0) + 1;
+    total[key] = (total[key] || 0) + 1;
+    if (!officialOnly || m.official_visible !== false) visible[key] = (visible[key] || 0) + 1;
   });
-  const keys = Object.keys(groups);
+  const keys = Object.keys(total);
   if (keys.length <= 1) { host.innerHTML = ""; return; }  // 只有一个平台就不必显示
-  const chip = (value, label, count) =>
-    `<button type="button" class="model-platform-chip${samePlatformFamily(value, _modelPlatformFilter) ? " active" : ""}" data-platform-filter="${esc(value)}">${esc(label)}<span>${count}</span></button>`;
-  const totalAll = keys.reduce((sum, key) => sum + groups[key], 0);
-  host.innerHTML = chip("", "全部", totalAll) + keys.map(key => {
-    const sample = (_modelData || []).find(m => (m.platform || "workbuddy") === key) || {};
-    return chip(key, sample.platform_label || key, groups[key]);
-  }).join("");
+  const label = (shown, all) => (shown === all ? String(all) : shown + "/" + all);
+  const chip = (value, text, count, tip) =>
+    `<button type="button" class="model-platform-chip${samePlatformFamily(value, _modelPlatformFilter) ? " active" : ""}" data-platform-filter="${esc(value)}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(text)}<span>${count}</span></button>`;
+  const totalAll = keys.reduce((sum, key) => sum + total[key], 0);
+  const visibleAll = keys.reduce((sum, key) => sum + (visible[key] || 0), 0);
+  host.innerHTML = chip("", "全部", label(visibleAll, totalAll),
+      officialOnly ? "官方同显开着：只列官方名单内的模型，关掉可看全部" : "")
+    + keys.map(key => {
+      const sample = (_modelData || []).find(m => (m.platform || "workbuddy") === key) || {};
+      const shown = visible[key] || 0;
+      return chip(key, sample.platform_label || key, label(shown, total[key]),
+        shown === total[key] ? "" : "总 " + total[key] + " 个，当前按官方同显显示 " + shown + " 个");
+    }).join("");
 }
 
 function renderModelPage(p) {
@@ -15694,7 +15706,12 @@ function scheduleResultSummary(s){
 
   // 后端已经给出人话摘要 —— 优先用它，避免前后端两套口径不一致
   if(obj.summary){
-    const bad = (obj.detail||[]).filter(x=>!x.ok).length;
+    // ⚠️ `detail` 在不同历史版本里**既可能是数组，也可能是字符串/对象**
+    // （早期结果是 `"detail": "3 个账号失败"` 这种）。直接 `.filter` 会抛
+    // TypeError，而这个函数是在 `map()` 里调用的 —— 一行坏数据就能让整张
+    // 定时任务表渲染失败，看起来就是「任务全没了」。这里统一收敛成数组。
+    const detail = Array.isArray(obj.detail) ? obj.detail : [];
+    const bad = detail.filter(x => !x || !x.ok).length;
     const cls = bad ? "text-amber-700" : "text-slate-600";
     const elapsed = obj.elapsed_s ? `<span class="text-slate-400 ml-1">${obj.elapsed_s}s</span>` : "";
     // 摘要按纯文本渲染（表格单元格不解析 markdown）。老版本摘要里带 `**强调**`，
@@ -15982,7 +15999,8 @@ async function runSchedule(id){
       const text = scheduleResultText(result);
       toast(text.message, result.failed > 0 ? "err" : "ok");
       // 有逐账号明细时同时弹窗，便于逐个核对（签到/成长任务最关键）
-      if ((result.detail || []).length) {
+      // `detail` 可能是字符串（老结果），只有数组才画明细表 —— 见 scheduleResultSummary 的注释。
+      if (Array.isArray(result.detail) && result.detail.length) {
         openModal(`<h3>${esc(text.title)}</h3>
           <p class="trae-modal-note">${esc(text.message)}</p>
           ${scheduleDetailTable(result.detail)}`, "max-w-3xl");
@@ -16031,7 +16049,9 @@ function scheduleResultText(result) {
 
 /** 逐账号明细表（签到 / 成长任务 / 刷新余额共用）。 */
 function scheduleDetailTable(detail) {
-  const rows = (detail || []).map(item => `<tr>
+  // 只吃数组：老结果里 detail 是字符串，`.map` 会直接炸掉整个弹窗。
+  const list = Array.isArray(detail) ? detail : [];
+  const rows = list.map(item => `<tr>
     <td class="sentinel-acc">#${esc(String(item.account_id ?? ""))}</td>
     <td>${esc(item.account || "-")}</td>
     <td>${item.ok

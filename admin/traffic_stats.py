@@ -53,6 +53,81 @@ _memory_recent: list[tuple[float, dict]] = []
 #: 内存兜底模式下的「进行中」请求（rid -> item）
 _memory_running: dict[str, dict] = {}
 
+# ---------------------------------------------------------------------------
+# 写入队列（P6）：事件循环上的调用不再同步等 Redis
+# ---------------------------------------------------------------------------
+#
+# `start` / `annotate` / `mark_stage` 由 TimingMiddleware、dispatch 在**事件循环
+# 线程**上调用，每次都是 1~3 个同步 Redis 往返（`socket_timeout=1s`）。单 worker
+# 下它们串行挡住所有流，Redis 抖一下就是全站首字 +1 秒。
+#
+# 现在：只有「已确认在用 Redis」且「调用方在事件循环线程上」时，写操作丢进一个
+# 后台写线程按 FIFO 执行（顺序与原来完全一致）；内存模式 / 工作线程里的调用照旧
+# 同步执行（本来就不阻塞事件循环）。读接口（`snapshot`）在工作线程里会先等队列
+# 排空（最多 0.3 秒），读到的仍是自己刚写的数据。
+# `ADMIN_TRAFFIC_QUEUE=0` 关闭，回到全同步。
+import asyncio as _asyncio  # noqa: E402
+import queue as _queue_mod  # noqa: E402
+
+_QUEUE_ENABLED = (os.getenv("ADMIN_TRAFFIC_QUEUE", "1") or "1").strip() != "0"
+_write_queue: "_queue_mod.Queue" = _queue_mod.Queue(maxsize=20000)
+_writer_thread = None
+_pending = 0
+_pending_cond = threading.Condition()
+
+
+def _on_event_loop() -> bool:
+    try:
+        _asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _offload(fn, *args, **kwargs) -> bool:
+    """能排队就排队（返回 True）；否则调用方同步执行。"""
+    global _writer_thread, _pending
+    if not (_QUEUE_ENABLED and _redis_ready and _redis is not None and _on_event_loop()):
+        return False
+    with _pending_cond:
+        if _writer_thread is None or not _writer_thread.is_alive():
+            _writer_thread = threading.Thread(target=_writer_loop, name="traffic-writer",
+                                              daemon=True)
+            _writer_thread.start()
+        _pending += 1
+    try:
+        _write_queue.put_nowait((fn, args, kwargs))
+        return True
+    except _queue_mod.Full:
+        with _pending_cond:
+            _pending -= 1
+            _pending_cond.notify_all()
+        return False
+
+
+def _writer_loop() -> None:
+    global _pending
+    while True:
+        fn, args, kwargs = _write_queue.get()
+        try:
+            fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001 - 统计写失败不影响任何东西
+            logger.debug("traffic 队列写入失败", exc_info=True)
+        finally:
+            with _pending_cond:
+                _pending -= 1
+                if _pending <= 0:
+                    _pending = 0
+                    _pending_cond.notify_all()
+
+
+def flush(timeout: float = 0.5) -> bool:
+    """等写队列排空（读之前 / 测试用）。事件循环线程上直接返回，绝不阻塞。"""
+    if _on_event_loop():
+        return _pending == 0
+    with _pending_cond:
+        return _pending_cond.wait_for(lambda: _pending <= 0, timeout=max(0.0, timeout))
+
 
 def _client():
     global _redis, _redis_ready
@@ -168,6 +243,17 @@ def start(platform: str, *, model: str = "", path: str = "",
     import uuid as _uuid
 
     rid = _uuid.uuid4().hex[:16]
+    stamp = at if at is not None else time.time()
+    if _offload(_start_impl, rid, platform, model=model, path=path, at=stamp,
+                key_label=key_label, client_ip=client_ip):
+        return rid
+    _start_impl(rid, platform, model=model, path=path, at=stamp,
+                key_label=key_label, client_ip=client_ip)
+    return rid
+
+
+def _start_impl(rid: str, platform: str, *, model: str = "", path: str = "",
+                at: float | None = None, key_label: str = "", client_ip: str = "") -> None:
     try:
         platform = _normalize(platform)
         now = at if at is not None else time.time()
@@ -204,14 +290,13 @@ def start(platform: str, *, model: str = "", path: str = "",
                 pipe.hset(RUNNING_KEY, rid, json.dumps(item, ensure_ascii=False))
                 pipe.expire(RUNNING_KEY, RECENT_TTL)
                 pipe.execute()
-                return rid
+                return
             except Exception:  # noqa: BLE001
                 logger.debug("running 写 Redis 失败", exc_info=True)
         with _lock:
             _memory_running[rid] = item
     except Exception:  # noqa: BLE001
         logger.debug("traffic start 失败", exc_info=True)
-    return rid
 
 
 #: 阶段推进顺序（只允许往后走，不允许回退）
@@ -226,6 +311,12 @@ def mark_stage(rid: str, stage: str) -> None:
     """
     if not rid or stage not in _STAGES:
         return
+    if _offload(_mark_stage_impl, rid, stage):
+        return
+    _mark_stage_impl(rid, stage)
+
+
+def _mark_stage_impl(rid: str, stage: str) -> None:
     try:
         client = _client()
         raw = None
@@ -277,6 +368,12 @@ def annotate(rid: str, **fields) -> None:
     patch = {k: v for k, v in fields.items() if k in allowed and v not in (None, "")}
     if not patch:
         return
+    if _offload(_annotate_impl, rid, patch):
+        return
+    _annotate_impl(rid, patch)
+
+
+def _annotate_impl(rid: str, patch: dict) -> None:
     try:
         client = _client()
         raw = None
@@ -308,6 +405,12 @@ def finish_running(rid: str) -> None:
     """请求结束时清掉 running 占位（`record()` 会写入正式记录）。"""
     if not rid:
         return
+    if _offload(_finish_running_impl, rid):
+        return
+    _finish_running_impl(rid)
+
+
+def _finish_running_impl(rid: str) -> None:
     try:
         client = _client()
         if client is not None:
@@ -404,6 +507,25 @@ def record(platform: str, *, outcome: str, status: int = 0,
 
     `path` 不是对话端点时直接跳过 —— 口径见 `TRACKED_PATHS`。
     """
+    if _offload(_record_impl, platform, outcome=outcome, status=status,
+                elapsed_ms=elapsed_ms, model=model, path=path, error=error,
+                at=(at if at is not None else time.time()), rid=rid,
+                key_label=key_label, client_ip=client_ip, stage=stage):
+        return
+    if _pending:
+        # 同步收尾前先等排队中的 start/annotate 落地，否则短请求可能先 hdel、
+        # 后写 running，留下一条僵尸「进行中」。
+        flush(0.2)
+    _record_impl(platform, outcome=outcome, status=status, elapsed_ms=elapsed_ms,
+                 model=model, path=path, error=error, at=at, rid=rid,
+                 key_label=key_label, client_ip=client_ip, stage=stage)
+
+
+def _record_impl(platform: str, *, outcome: str, status: int = 0,
+                 elapsed_ms: float = 0, model: str = "", path: str = "",
+                 error: str = "", at: float | None = None,
+                 rid: str = "", key_label: str = "", client_ip: str = "",
+                 stage: str = "") -> None:
     try:
         # ⚠️ **先清 running，再做任何过滤**。
         #
@@ -414,7 +536,7 @@ def record(platform: str, *, outcome: str, status: int = 0,
         # 实测：点几次模型列表，面板上就多几条「streaming」，越积越多。
         #
         # `finish_running` 是幂等的（HDEL），放最前面不会重复扣减。
-        finish_running(rid)
+        _finish_running_impl(rid) if rid else None
         platform = _normalize(platform)
         now = at if at is not None else time.time()
         status = int(status or 0)
@@ -554,6 +676,9 @@ def snapshot(window: int = 3600) -> dict:
     """
     win = max(60, int(window))
     key = (_day(), win)
+    # 读自己刚写的：工作线程里先等写队列排空（事件循环线程上不等）
+    if _pending:
+        flush(0.3)
     now = time.time()
     with _snapshot_lock:
         hit = _snapshot_cache.get(key)

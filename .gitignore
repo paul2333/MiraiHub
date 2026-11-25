@@ -352,3 +352,7 @@ desktop/assets/app.icns
 desktop/assets/app.iconset/
 /dist-*/
 /build-*/
+
+# 运行时实例锁 / 守护锁（每个端口一个，按机器生成，不进仓库）
+.workbuddy2api*.lock
+logs/daemon*.lock

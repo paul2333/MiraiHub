@@ -29,9 +29,11 @@ logger = logging.getLogger("desktop.tray")
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_NAME = "WorkBuddy2API"
 
-STATE_LABELS = {"running": "运行中", "starting": "启动中", "stopped": "已停止"}
+STATE_LABELS = {"running": "运行中", "starting": "启动中", "stopped": "已停止",
+                "draining": "正在停止", "stopping": "正在关闭", "failed": "需要处理"}
 # The badge colour tracks service health so the icon reports state at a glance.
-STATE_COLORS = {"running": (66, 192, 142), "starting": (222, 168, 62), "stopped": (110, 118, 129)}
+STATE_COLORS = {"running": (66, 192, 142), "starting": (222, 168, 62), "stopped": (110, 118, 129),
+                "draining": (222, 168, 62), "stopping": (222, 168, 62), "failed": (214, 92, 92)}
 
 try:  # import guard mirrors runtime availability check
     import pystray
@@ -177,9 +179,16 @@ class TrayController:
                     pystray.MenuItem("打开控制台", self._on_open_ui, default=True),
                     pystray.MenuItem("在浏览器中打开", self._on_open_browser),
                     pystray.Menu.SEPARATOR,
-                    pystray.MenuItem("启动服务", self._on_start, enabled=lambda _: self.state == "stopped"),
-                    pystray.MenuItem("停止服务", self._on_stop, enabled=lambda _: self.state != "stopped"),
-                    pystray.MenuItem("重启服务", self._on_restart, enabled=lambda _: self.state == "running"),
+                    # 每个生命周期动作都按**当前阶段**禁用：启动按钮不再任何时刻可点，
+                    # 排空/关闭期间也不会再塞一次新的停止或重启。
+                    pystray.MenuItem("启动服务", self._on_start,
+                                     enabled=lambda _: self._enabled("start")),
+                    pystray.MenuItem("停止服务", self._on_stop,
+                                     enabled=lambda _: self._enabled("stop")),
+                    pystray.MenuItem("重启服务", self._on_restart,
+                                     enabled=lambda _: self._enabled("restart")),
+                    pystray.MenuItem("查看退出进度", self._on_progress,
+                                     enabled=lambda _: self._enabled("progress")),
                     pystray.Menu.SEPARATOR,
                     pystray.MenuItem("打开日志目录", self._on_open_logs),
                     pystray.MenuItem("开机自启", self._on_autostart, checked=lambda _: autostart_enabled()),
@@ -232,10 +241,30 @@ class TrayController:
         was = autostart_enabled()
         set_autostart(not was)
 
+    def _on_progress(self, *_):
+        """「查看退出进度」：唤回窗口并显示非破坏性进度层（不重载页面）。"""
+        opener = getattr(self.api, "open_progress_window", None)
+        self._run(opener if callable(opener) else self.api.open_window)
+
     def _on_quit(self, *_):
-        # Return False from pywebview's closing handler and stop the loop, so the
-        # backend is torn down by api.stop() in the caller's finally block.
+        # 托盘的「退出」是**唯一**开始排空的入口：先关准入，等后端实退，
+        # 再由控制器放行销毁窗口。窗口的 × 只隐藏，不会走到这里。
         self._run(self.api.quit)
+
+    def _enabled(self, action: str) -> bool:
+        """按 api 的当前阶段决定菜单项是否可点（没有 api 能力时按旧状态兜底）。"""
+        allowed = getattr(self.api, "tray_action_enabled", None)
+        if callable(allowed):
+            try:
+                return bool(allowed(action))
+            except Exception:
+                logger.debug("托盘可用性查询失败", exc_info=True)
+        fallback = {"start": self.state == "stopped",
+                    "stop": self.state != "stopped",
+                    "restart": self.state == "running",
+                    "progress": self.state in ("draining", "stopping", "failed"),
+                    "quit": True}
+        return fallback.get(action, action == "quit")
 
     def _run(self, action):
         """Menu callbacks must not block the tray loop."""

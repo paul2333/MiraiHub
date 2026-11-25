@@ -1588,6 +1588,45 @@ def _bind_sticky(sticky_key: str, account) -> None:
         pass
 
 
+#: max_tokens 的参数硬上限（2026-11-24 DSH 定案）：上游严格实例 >132096 直接回
+#: 400 3000101 invalid parameter。DSH 侧配置 maxTokens=228000 时每条请求都撞这条，
+#: 而错误的对外文案只说 invalid parameter，看不出是 token 上限。
+#: 设 0 或负数 = 不截断（保留旧行为）。
+MAX_TOKENS_PARAM_CAP_ENV = "MARVIS_MAX_TOKENS_PARAM_CAP"
+DEFAULT_MAX_TOKENS_PARAM_CAP = 131072
+
+
+def _max_tokens_param_cap() -> int:
+    """max_tokens 截断值；<= 0 表示不截。未设置 / 非法值用默认 131072。"""
+    raw = str(os.environ.get(MAX_TOKENS_PARAM_CAP_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_TOKENS_PARAM_CAP
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TOKENS_PARAM_CAP
+
+
+def _clamp_max_tokens(out: dict) -> int:
+    """把 max_tokens 截到 _max_tokens_param_cap()；截了返回原值，没截返回 0。
+
+    必须在 _normalize_token_limit **之后**调用（那一步才把别名并进 max_tokens）。
+    """
+    cap = _max_tokens_param_cap()
+    if cap <= 0 or not isinstance(out, dict):
+        return 0
+    raw = out.get("max_tokens")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0
+    want = int(raw)
+    if want <= cap:
+        return 0
+    out["max_tokens"] = cap
+    logger.info("Marvis max_tokens 截到上游参数上限 | from=%d to=%d"
+                "（上游实测 >132096 会被严格实例回 3000101）", want, cap)
+    return want
+
+
 def _normalize_token_limit(out: dict) -> None:
     """把 `max_completion_tokens` 并进 `max_tokens`（上游只认后者）。
 
@@ -1642,6 +1681,7 @@ def _prepare_body(body: dict, slot: str) -> dict:
     out = dict(body)
     out["model"] = slot
     _normalize_token_limit(out)
+    _clamp_max_tokens(out)
     messages = out.get("messages")
     if isinstance(messages, list):
         # 先做角色 / content 形态归一，再做内容风控改写。
@@ -1773,6 +1813,15 @@ def _risk_hit_window() -> int:
     """「连续」的时间窗，秒（`MIRAIHUB_MARVIS_RISK_HIT_WINDOW_SECONDS`）。"""
     return _env_positive_int(RISK_HIT_WINDOW_ENV, RISK_HIT_WINDOW_SECONDS)
 
+
+def _cool_seconds(kind: str) -> int:
+    """账号级冷却秒数：**只有认证类失败**才把账号锁一段时间。
+
+    风控（risk_control）走平台级退避（见 note_risk_control）：一次风控只说明
+    这次请求被上游拒了，账号本身还能用；给账号打 10 分钟冷却会让池子迅速枯竭。
+    额度 / 上游业务错误同理，不需要冷却账号。
+    """
+    return 600 if str(kind or "") == "auth" else 0
 
 def note_risk_control() -> float:
     """记一次 4100404 命中，返回**当前**平台退避剩余秒数（0 = 没有触发退避）。
@@ -2326,7 +2375,7 @@ def _attempt(db, request, key, body: dict, realm: str, *, stream: bool):
             shared.note_failure(
                 db, account, kind=exc.kind, detail=exc.detail or exc.message,
                 status=exc.status, model=model, public_platform=PUBLIC,
-                cool_seconds=(600 if exc.kind in ("auth", "risk_control") else 0),
+                cool_seconds=_cool_seconds(exc.kind),
                 zero_balance=(exc.kind == "quota_exceeded"),
                 code=str(exc.code or ""))
             last_error = exc

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>服务暂时不可用</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: #f5f6f8;
+    color: #1f2329;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16181d; color: #e8eaed; }
+    .wb-waiting__retry { background: #2b2f36; border-color: #3c414a; color: #e8eaed; }
+  }
+  .wb-waiting {
+    width: 100%;
+    max-width: 420px;
+    padding: 32px 28px;
+    border-radius: 12px;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, .12);
+    text-align: center;
+  }
+  @media (prefers-color-scheme: dark) { .wb-waiting { background: #1e2127; } }
+  .wb-waiting__title { margin: 0; font-size: 18px; font-weight: 600; line-height: 1.5; }
+  .wb-waiting__hint { margin: 12px 0 0; font-size: 14px; line-height: 1.6; opacity: .72; }
+  .wb-waiting__meta { margin: 8px 0 0; font-size: 13px; line-height: 1.6; opacity: .56; }
+  .wb-waiting__retry {
+    margin-top: 20px;
+    padding: 9px 22px;
+    font-size: 14px;
+    border-radius: 8px;
+    border: 1px solid #d0d5dd;
+    background: #fff;
+    color: #1f2329;
+    cursor: pointer;
+  }
+  .wb-waiting__retry:disabled { cursor: progress; opacity: .6; }
+  .wb-waiting__retry:focus-visible { outline: 2px solid #2f6feb; outline-offset: 2px; }
+</style>
+</head>
+<body>
+<main class="wb-waiting" role="status" aria-live="polite" aria-atomic="true">
+  <p class="wb-waiting__title">服务暂时不可用，正在重新连接</p>
+  <p class="wb-waiting__hint" id="wb-waiting-hint">服务恢复后本页会自动返回管理台，也可以立即重试。</p>
+  <p class="wb-waiting__meta" id="wb-waiting-meta" hidden></p>
+  <button type="button" class="wb-waiting__retry" id="wb-waiting-retry">重新连接</button>
+</main>
+<script src="/__waiting/reconnect.js" defer></script>
+</body>
+</html>

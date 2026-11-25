@@ -142,8 +142,9 @@ def _candidate_models(db) -> list[str]:
     try:
         from admin.routers.models import _get_enabled_models, _get_free_models
 
-        free = sorted(_get_free_models(db))
-        enabled = sorted(_get_enabled_models(db))
+        # 日常活跃只给 WorkBuddy 号跑，候选模型也只取 WorkBuddy 的（D3）
+        free = sorted(_get_free_models(db, platform="workbuddy"))
+        enabled = sorted(_get_enabled_models(db, platform="workbuddy"))
     except Exception as exc:  # noqa: BLE001 - 选模型失败不该让任务挂掉
         _logger.debug("daily_activity 选模型失败: %s", exc)
         return []

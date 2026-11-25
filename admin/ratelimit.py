@@ -27,7 +27,11 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
+import threading
 import time
+from collections import deque
 from threading import Lock
 from typing import Iterable, Optional
 
@@ -200,3 +204,175 @@ def clear_failures(ip: str, username: str = "", fingerprint: Optional[str] = Non
         with _lock:
             _memory_fails.pop(key, None)
             _memory_locked.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# 不锁人的递增延迟 + 登录失败告警（2026-11-24，安全 S4）
+# ---------------------------------------------------------------------------
+#
+# 登录锁定默认关闭之后（ADMIN_LOGIN_RATE_LIMIT=0），在线爆破只剩「每次校验
+# 多久」这一个成本。这里补一层**只延迟、不锁定**的退避：
+#
+#   * 同一 IP、同一 (IP, 用户名) 窗口内每失败一次，下一次尝试的延迟翻倍：
+#     1s → 2s → 4s … 封顶 ADMIN_LOGIN_DELAY_MAX（默认 30s）；
+#   * 延迟按「时间槽」排队：并发打 100 个请求也只能一个槽一个槽地校验，
+#     排到超过上限的直接 429（只影响**这个 IP**，换个 IP 的真管理员不受影响）；
+#   * 等待在 server.login 里用 `asyncio.sleep` 完成，**不占线程池**
+#     （同步 sleep 30 秒会把 40 个线程令牌占光，等于自己给自己 DoS）；
+#   * 登录成功清零；窗口过后自然归零。
+#
+# 告警：全站窗口内失败次数达到阈值时，经预警渠道（admin/alerting.py）发一条
+# 汇总通知，并打 warning 日志。通知在后台线程里发，不拖慢登录响应。
+_logger = logging.getLogger("admin.ratelimit")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+#: 递增延迟基数（秒）；设 0 关闭递增延迟。
+DELAY_BASE = _env_float("ADMIN_LOGIN_DELAY_BASE", 1.0)
+#: 单次延迟封顶（秒），也是「排队等待」的上限，超过直接 429。
+DELAY_MAX = _env_float("ADMIN_LOGIN_DELAY_MAX", 30.0)
+#: 失败计数窗口（秒）。
+DELAY_WINDOW = _env_float("ADMIN_LOGIN_DELAY_WINDOW", 900.0)
+#: 全站窗口内失败多少次触发告警；设 0 关闭告警。
+ALERT_THRESHOLD = int(_env_float("ADMIN_LOGIN_ALERT_THRESHOLD", 10))
+#: 告警统计窗口（秒）。
+ALERT_WINDOW = _env_float("ADMIN_LOGIN_ALERT_WINDOW", 600.0)
+#: 两次告警之间的最小间隔（秒）。
+ALERT_COOLDOWN = _env_float("ADMIN_LOGIN_ALERT_COOLDOWN", 1800.0)
+
+_delay_lock = Lock()
+_delay_fails: dict[str, list[float]] = {}   # key -> 失败时间戳
+_delay_ready: dict[str, float] = {}         # key -> 下一个可用的校验时间槽
+_alert_hits: deque = deque()                # (ts, ip)
+_alert_last = 0.0
+
+
+def _delay_keys(ip: str, username: str) -> list[str]:
+    return [f"d:{ip}", f"d:{_pair_key(ip, username)}"]
+
+
+def delay_for(failures: int) -> float:
+    """第 N 次失败之后下一次尝试应延迟的秒数（纯函数，便于测试）。"""
+    if failures <= 0 or DELAY_BASE <= 0:
+        return 0.0
+    return float(min(DELAY_MAX, DELAY_BASE * (2 ** min(failures - 1, 16))))
+
+
+def _prune_delay(now: float) -> None:
+    if len(_delay_fails) <= 10000 and len(_delay_ready) <= 10000:
+        return
+    for key in list(_delay_fails):
+        fails = [t for t in _delay_fails[key] if now - t < DELAY_WINDOW]
+        if fails:
+            _delay_fails[key] = fails
+        else:
+            _delay_fails.pop(key, None)
+    for key in list(_delay_ready):
+        if _delay_ready[key] <= now:
+            _delay_ready.pop(key, None)
+
+
+def reserve_login_delay(ip: str, username: str = "",
+                        now: Optional[float] = None) -> tuple[float, bool]:
+    """为这次登录尝试预约一个校验时间槽。
+
+    返回 `(需要等待的秒数, 是否排队过长)`。排队过长时调用方应直接 429，
+    **不要**校验密码（否则并发请求就绕过了延迟）。
+    """
+    if DELAY_BASE <= 0:
+        return 0.0, False
+    now = time.time() if now is None else now
+    keys = _delay_keys(ip, username)
+    with _delay_lock:
+        _prune_delay(now)
+        delay = 0.0
+        queued = now
+        for key in keys:
+            fails = [t for t in _delay_fails.get(key, []) if now - t < DELAY_WINDOW]
+            if fails:
+                _delay_fails[key] = fails
+            else:
+                _delay_fails.pop(key, None)
+            delay = max(delay, delay_for(len(fails)))
+            queued = max(queued, _delay_ready.get(key, 0.0))
+        slot = queued + delay
+        wait = max(0.0, slot - now)
+        if wait > DELAY_MAX:
+            return wait, True
+        if delay > 0:
+            for key in keys:
+                _delay_ready[key] = max(_delay_ready.get(key, 0.0), slot)
+    return wait, False
+
+
+def note_login_failure(ip: str, username: str = "", now: Optional[float] = None) -> int:
+    """记一次登录失败（递增延迟 + 告警计数）。返回全站窗口内失败次数。"""
+    global _alert_last
+    now = time.time() if now is None else now
+    with _delay_lock:
+        for key in _delay_keys(ip, username):
+            _delay_fails.setdefault(key, []).append(now)
+        _alert_hits.append((now, ip))
+        while _alert_hits and now - _alert_hits[0][0] > ALERT_WINDOW:
+            _alert_hits.popleft()
+        count = len(_alert_hits)
+        fire = (ALERT_THRESHOLD > 0 and count >= ALERT_THRESHOLD
+                and now - _alert_last >= ALERT_COOLDOWN)
+        if fire:
+            _alert_last = now
+            ips: dict[str, int] = {}
+            for _, hit_ip in _alert_hits:
+                ips[hit_ip] = ips.get(hit_ip, 0) + 1
+    if fire:
+        top = sorted(ips.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        _logger.warning("后台登录失败告警：%d 秒内失败 %d 次，来源 %s",
+                        int(ALERT_WINDOW), count,
+                        ", ".join("%s×%d" % kv for kv in top))
+        _send_login_alert(count, len(ips), top)
+    return count
+
+
+def clear_login_delay(ip: str, username: str = "") -> None:
+    """登录成功：清掉这个 IP / (IP, 用户名) 的递增延迟。"""
+    with _delay_lock:
+        for key in _delay_keys(ip, username):
+            _delay_fails.pop(key, None)
+            _delay_ready.pop(key, None)
+
+
+def reset_login_delay() -> None:
+    """测试 / 运维用：清空递增延迟与告警台账。"""
+    global _alert_last
+    with _delay_lock:
+        _delay_fails.clear()
+        _delay_ready.clear()
+        _alert_hits.clear()
+        _alert_last = 0.0
+
+
+def _send_login_alert(count: int, distinct_ips: int, top: list) -> None:
+    event = {
+        "platform": "admin-login",
+        "platform_label": "后台登录",
+        "kind": "login_failures",
+        "level": "warn",
+        "summary": "%d 分钟内后台登录失败 %d 次（%d 个来源 IP）。"
+                   "如果不是你本人，请检查是否有人在爆破后台密码。"
+                   % (max(1, int(ALERT_WINDOW // 60)), count, distinct_ips),
+        "detail": "来源：" + ", ".join("%s×%d" % kv for kv in top),
+    }
+
+    def _run():
+        try:
+            from admin import alerting
+            alerting.notify(event)
+        except Exception:  # noqa: BLE001 - 告警失败只记日志
+            _logger.warning("后台登录失败告警发送失败", exc_info=True)
+
+    threading.Thread(target=_run, name="login-fail-alert", daemon=True).start()

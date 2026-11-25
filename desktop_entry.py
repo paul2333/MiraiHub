@@ -14,7 +14,13 @@ if __name__ == "__main__":
             sys.stderr = open(os.devnull, "w", encoding="utf-8")
     from desktop.app import backend, run
     if len(sys.argv) == 3 and sys.argv[1] == "--backend":
-        backend(int(sys.argv[2]))
+        # 后端跑在独立进程里，父进程（桌面壳）要靠**退出码**区分两种情况：
+        #   0  —— 正常停止（用户点停止/退出，或收到 SIGTERM）
+        #   75 —— 已受理的计划重启（Web 重启 / 更新），应该开下一代
+        # uvicorn.run() 时代这里永远返回 0，父进程无法分辨；现在由运行器
+        # （admin/managed_worker.py）给出真实退出码，必须原样传给操作系统。
+        code = backend(int(sys.argv[2]))
+        sys.exit(code if isinstance(code, int) and not isinstance(code, bool) else 0)
     elif len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
         # Packaging verification needs the legacy windowed flow, never the tray.
         os.environ["WB_DESKTOP_SMOKE"] = sys.argv[2]
