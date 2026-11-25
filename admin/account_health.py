@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 
@@ -14,6 +15,65 @@ from admin.models import Account, ModelConfig
 from admin.pool import POOL
 
 _logger = logging.getLogger("admin.account_health")
+
+#: `note_auth_failure` 写进 `last_err_msg` 的前缀。`ban_recheck._recheck_platform_auth`
+#: 只复核带这个前缀的停用号，人工停用 / 其它原因停用的号不会被自动恢复。
+AUTH_FAIL_PREFIX = "登录态被上游拒绝"
+
+
+def _env_number(name: str, default: float, low: float, high: float) -> float:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(low, min(high, value))
+
+
+def note_auth_failure(db, account, message: str = "", *, now: datetime | None = None) -> str:
+    """非 WorkBuddy 平台遇到 auth / 401 时的统一处置（修复批次 3 · D7，审查 L-3）。
+
+    原来 Loomy / Qoder 的额度同步只要遇到**一次** `auth` 错误就把账号永久禁用，
+    没有连续计数、没有二次确认、也没有任何自动复核路径 —— 上游一次 401 抖动
+    就能把整个平台的号池打空。这里改成：
+
+      * 连续失败 < 阈值：只冷却（`cool_until`），账号仍是 active，冷却到期自然回池；
+      * 连续失败 ≥ 阈值：停用，`cool_kind=session_dead`，错误文案带 `AUTH_FAIL_PREFIX`，
+        由 `ban_recheck` 定时用该平台自己的健康检查复核，通过即自动恢复；
+      * 人工停用（`manual_disabled`）的号不动。
+
+    阈值 / 冷却时长：`ADMIN_AUTH_FAIL_THRESHOLD`（默认 3）、
+    `ADMIN_AUTH_FAIL_COOLDOWN_SECONDS`（默认 1800）。
+    返回 `"cooldown"` / `"disabled"` / `"manual"`。**不提交**，由调用方 commit。
+    成功调用上游后请调 `clear_auth_failure(account)` 清计数。
+    """
+    if (getattr(account, "cool_kind", "") or "") == "manual_disabled":
+        return "manual"
+    moment = now or datetime.utcnow()
+    threshold = int(_env_number("ADMIN_AUTH_FAIL_THRESHOLD", 3, 1, 50))
+    cooldown = _env_number("ADMIN_AUTH_FAIL_COOLDOWN_SECONDS", 1800, 60, 86400)
+    fails = int(getattr(account, "session_dead_fails", 0) or 0) + 1
+    account.session_dead_fails = fails
+    account.last_err_at = moment
+    account.last_err_msg = ("%s（%d/%d）：%s" % (AUTH_FAIL_PREFIX, fails, threshold,
+                                               str(message or "")[:150]))[:255]
+    account.cool_kind = "session_dead"
+    if fails < threshold:
+        account.cool_until = moment + timedelta(seconds=cooldown)
+        return "cooldown"
+    account.status = "disabled"
+    account.cool_until = None
+    return "disabled"
+
+
+def clear_auth_failure(account) -> None:
+    """上游调用成功后清掉 `note_auth_failure` 的连续计数与冷却（不动人工停用）。"""
+    if (getattr(account, "cool_kind", "") or "") == "manual_disabled":
+        return
+    account.session_dead_fails = 0
+    if (getattr(account, "cool_kind", "") or "") == "session_dead" and account.status == "active":
+        account.cool_kind = ""
+        account.cool_until = None
 
 
 def _error_result(exc: Exception) -> dict:
@@ -55,9 +115,14 @@ def _select_chat_model(db, rows) -> tuple[str, bool]:
     if not model_rows:
         return "", False
 
+    # 只看 WorkBuddy 自己的模型配置（D3）：这条路径只服务默认平台（其它平台走
+    # `_platform_health`），原来跨平台取免费 / 启用清单，别家启用的同名模型会被当成可用。
+    from admin.platform.workbuddy import scoping as wb_scope
+
     free_ids = {row.model_id for row in db.query(ModelConfig).filter(
         ModelConfig.enabled == 1,
         (ModelConfig.credit_multiplier == 0) | (ModelConfig.credit_multiplier.is_(None)),
+        wb_scope.workbuddy_cond(ModelConfig.platform),
     ).all()}
     for row in model_rows:
         model = _model_id(row)
@@ -65,7 +130,7 @@ def _select_chat_model(db, rows) -> tuple[str, bool]:
         if model in free_ids or "x0.00" in credits or "free" in credits:
             return model, True
 
-    enabled_ids = {row.model_id for row in db.query(ModelConfig).filter(ModelConfig.enabled == 1).all()}
+    enabled_ids = wb_scope.enabled_models(db, "workbuddy")
     for row in model_rows:
         model = _model_id(row)
         if model in enabled_ids:
