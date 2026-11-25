@@ -54,6 +54,28 @@ GATEWAY_PATHS = frozenset({
     "/v1/messages/count_tokens", "/v1/models", "/v1/balance",
 })
 
+
+def dedupe_v1_prefix(path: str) -> str:
+    """折叠重复的 `/v1` 前缀：`/v1/v1/messages` → `/v1/messages`。
+
+    ## 为什么必须有这一层
+
+    几乎所有 OpenAI 客户端都按 `base_url + "/v1/chat/completions"` 拼地址。
+    用户把 base_url 填成 `http://host:8790/v1` 时，实际请求就是
+    **`/v1/v1/messages`** —— 它不在 `GATEWAY_PATHS` 里，中间件直接放行，
+    请求落到主应用（默认平台 WorkBuddy），那边没有这个路由 → 404。
+
+    症状非常容易误判：日志里平台列写着 `WorkBuddy`，看起来像「平台选错了」，
+    实际是**路径不对，压根没进平台分派**。这条归一化把「base_url 多写一层
+    `/v1`」这种配置错误挡在网关里，而不是让用户去猜。
+
+    只折叠开头的连续 `/v1` 段，其它路径一个字节都不动。
+    """
+    text = str(path or "")
+    while text.startswith("/v1/v1/"):
+        text = "/v1" + text[len("/v1/v1"):]
+    return text
+
 #: 需要预读 body 的方法（GET/HEAD 永远不读 —— 读了会卡住下游）。
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
@@ -119,6 +141,11 @@ _GENERIC_MODEL_NAMES = frozenset({
 #: 豆包网关 2026-11-15 删除；以后删平台在这里补一行即可。
 RETIRED_PLATFORM_PREFIXES = {
     "doubao-": "doubao",
+    # Amazon Quick（quickwork）2026-11-25 整体下线：它的对话走双向 WebSocket，
+    # 且会话记录留在 AWS 侧，不是模型直连，接了也没意义。
+    # 客户端配置里可能还留着 `quick-fast` 这类名字，这里挡住，
+    # 免得它们落到默认平台去打真上游。
+    "quick-": "awsquick",
 }
 
 #: 平台顺序缓存（秒）。热路径每次请求都算一遍健康度太贵。
@@ -827,6 +854,66 @@ def _platform_canonical(storage: str, model: str) -> str:
     return ""
 
 
+def _platform_owns_model(storage: str, model: str) -> bool:
+    """问平台「这个名字是不是你自己的模型名」（没有钩子一律 False）。
+
+    约定：平台包可提供 `claims_model(name) -> bool`。用于**通用路由名**的归属
+    判定 —— `fast` / `smart` / `auto` 这类名字默认交给默认平台解释，但如果
+    唯一一个平台明确认领了它（例如某个平台的档位名恰好叫 `fast`），
+    就应该路由过去，而不是让默认平台回「模型不存在」。
+    """
+    storage = str(storage or "").lower()
+    if not storage or not model:
+        return False
+    try:
+        mod = __import__("admin.platform.%s.core.endpoints" % storage,
+                         fromlist=["claims_model"])
+        fn = getattr(mod, "claims_model", None)
+        return bool(fn(model)) if callable(fn) else False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _generic_owner_platform(model: str, key, disabled: set[str]):
+    """通用路由名被**恰好一个**平台认领时，返回 `(platform, realm)`。
+
+    ## 为什么需要它
+
+    `fast` / `smart` 在 `_GENERIC_MODEL_NAMES` 里（本意是「交给平台自己解释」）。
+    但有的平台的档位名**就叫** `fast` / `smart` —— 客户端发
+    `model:"smart"` 时不带 `X-Platform`，请求会被判成通用名、不按归属路由，
+    落到默认平台（WorkBuddy），那边回「模型 smart 不存在」。
+
+    这里只认「平台主动声明」的情况（`claims_model` 钩子）：没有钩子的平台
+    一个都不参与，所以既有平台的行为逐字节不变 —— `auto` 依然交给默认平台。
+    """
+    text = str(model or "").strip()
+    if not text:
+        return None
+    owners: list[tuple[str, str]] = []
+    for pid in registry.ids():
+        if _is_disabled(pid, disabled):
+            continue
+        spec = registry.get(pid)
+        if spec is None or not spec.enabled:
+            continue
+        if not _platform_owns_model(spec.storage(), text):
+            continue
+        try:
+            if getattr(_module_of(spec), "dispatch", None) is None:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        owners.append((pid, str(getattr(spec, "realm", "") or "")))
+        if len(owners) > 1:
+            return None      # 多个平台都认领 → 有歧义，交默认平台
+    if len(owners) != 1:
+        return None
+    pid, realm = owners[0]
+    logger.info("通用名被平台认领：%s -> %s", text, pid)
+    return pid, realm
+
+
 def _disabled_model_id(db, storage: str, model: str) -> str:
     """该模型在这个平台上是否**已被禁用**；命中返回它的 model_id。
 
@@ -1257,17 +1344,30 @@ def model_not_found_payload(exc) -> dict:
       * `platforms`：这个模型到底在哪些平台存在（零命中时为空）——
         用户照这个列表去改名字/改平台，而不是反复猜；
       * `available_platforms`：当时可选的平台（未禁用/未停用）。
+
+    模型名属于**已下线平台**时给专门的说明：那类名字（`quick-fast`）没有任何
+    平台会认领，只说「不在清单里」会让用户以为是自己写错了。
     """
+    model = str(getattr(exc, "model", "") or "")
+    retired = _retired_platform_of(model)
+    if retired:
+        return {"error": {
+            "message": "模型 %s 所属的平台（%s）已下线，请改用其它平台的模型"
+                       % (model, retired),
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+            "retired_platform": retired,
+        }}
     declared = list(getattr(exc, "platforms", []) or [])
     available = list(getattr(exc, "available", []) or [])
     where = "、".join(declared) if declared else "没有任何平台登记这个模型"
     avail = "、".join(available) if available else "（无）"
     return {"error": {
         "message": "模型 %s 不在任何平台的模型清单里（%s）；当前可用平台：%s"
-                   % (getattr(exc, "model", ""), where, avail),
+                   % (model, where, avail),
         "type": "invalid_request_error",
         "code": "model_not_found",
-        "model": str(getattr(exc, "model", "") or ""),
+        "model": model,
         "platforms": declared,
         "available_platforms": available,
     }}
@@ -1329,8 +1429,12 @@ def _route_by_model_ownership(model: str, key, disabled: set[str]):
     返回 None = 不接管（通用路由名 auto / default … 交给默认平台自己解释）。
     """
     text = str(model or "").strip()
-    if not text or text.lower() in _GENERIC_MODEL_NAMES:
+    if not text:
         return None
+    if text.lower() in _GENERIC_MODEL_NAMES:
+        # 通用名默认不按归属路由（issue #38）；但如果**恰好一个平台认领**它
+        # （Amazon Quick 的档位就叫 fast/smart），就走那个平台。
+        return _generic_owner_platform(text, key, disabled)
     try:
         with _db() as db:
             declared = _model_membership(db, text)
@@ -1520,9 +1624,19 @@ class PlatformDispatchMiddleware:
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
-        path = scope.get("path") or ""
+        raw_path = scope.get("path") or ""
+        path = dedupe_v1_prefix(raw_path)
         if path not in GATEWAY_PATHS:
             return await self.app(scope, receive, send)
+        if path != raw_path:
+            # 兼容「base_url 多写了一层 /v1」：接管之后把 scope 里的路径
+            # 也换成归一值，下游平台网关 / 日志 / 指标看到的是同一个路径。
+            logger.info("dispatch 兼容重复 /v1 前缀：%s -> %s", raw_path, path)
+            scope = dict(scope)
+            scope["path"] = path
+            raw_path_field = scope.get("raw_path")
+            if isinstance(raw_path_field, (bytes, bytearray)):
+                scope["raw_path"] = path.encode()
 
         request = Request(scope, receive)
         tail = receive

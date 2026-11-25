@@ -17,6 +17,19 @@
 #     --env-file /etc/wb2api/prod.env wb2api:prod
 # ---------------------------------------------------------------------------
 ARG BASE_IMAGE=python:3.12-slim
+
+# ---- 前端构建（admin/ui 源码 → dist）--------------------------------------
+# 生产镜像原来直接 COPY admin，dist 不入库后就不带 v2 控制台，/admin 会静默
+# 退回 v1。这里补一个构建阶段，让白名单构建同样产出 admin/ui/dist。
+FROM node:20-slim AS ui-build
+ARG NPM_REGISTRY=https://registry.npmjs.org
+WORKDIR /ui
+COPY admin/ui/package.json admin/ui/package-lock.json ./
+RUN npm ci --registry=${NPM_REGISTRY}
+COPY admin/ui ./
+RUN npm run build
+
+# ---- 运行时 ---------------------------------------------------------------
 FROM ${BASE_IMAGE}
 
 WORKDIR /app
@@ -39,6 +52,7 @@ RUN pip install -i ${PIP_INDEX_URL} -r requirements.txt
 
 # ---- 服务端代码（白名单）----
 COPY admin ./admin
+COPY --from=ui-build /ui/dist ./admin/ui/dist
 COPY main.py ./main.py
 # 网关协议适配层：/v1/* 的请求体转换与响应投影
 COPY converter.py responses_adapter.py responses_projection.py \
@@ -54,7 +68,9 @@ COPY desktop/__init__.py desktop/common.py desktop/version.json ./desktop/
 COPY desktop/assets ./desktop/assets
 
 # 运行期数据目录（数据库、日志、备份）必须挂卷，不能写进镜像层。
-RUN mkdir -p /app/logs /app/backups && chown -R app:app /app
+# /app/run 留给单 worker 运行器的私有控制目录（生命周期 IPC）：不在卷里，
+# 也不会被备份/导出带走。
+RUN mkdir -p /app/logs /app/backups /app/run && chown -R app:app /app
 VOLUME ["/app/logs", "/app/backups"]
 
 USER 10001:10001
@@ -65,6 +81,11 @@ EXPOSE 8790
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
   CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8790/api/app/version', timeout=4).status==200 else 1)"
 
-CMD ["python3", "-m", "uvicorn", "admin.server:app", \
+# 入口统一走单 worker 的 managed runner：先封口再排空，归零才停监听。
+# 生产镜像原本就关闭代理头信任（容器只绑回环，由宿主机 nginx 反代），
+# 运行器默认不信任代理头，所以这里不加代理头开关。
+# 控制目录 0700 由运行器自己创建；容器内升级 CLI 用同一个控制目录连 IPC。
+# 状态报告 can_restart=false：容器部署没有重启所有者，由平台替换进程。
+CMD ["python3", "-m", "admin.managed_worker", \
      "--host", "127.0.0.1", "--port", "8790", \
-     "--no-proxy-headers", "--log-level", "info"]
+     "--control-dir", "/app/run/lifecycle", "--log-level", "info"]

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -144,14 +144,27 @@ def list_platforms(_: bool = Depends(require_admin), db: Session = Depends(get_d
     # 都可能可用（见 shared.realm_domain_cond），所以按区计数时也计入，
     # 否则平台卡显示 0、账号池页却有号 —— 2026-11-07 的 Qoder 误报就是这样。
     unknown: dict[str, int] = {}
-    for platform_id, realm in db.query(Account.platform, Account.domain).all():
+    # 可用账号数（status=active）与上面同一套口径，给顶栏平台选择器判断
+    # 「全部禁用 / 0 可用」时不再显示绿点（ui_review_round3 A4）。
+    active_counts: dict[str, int] = {}
+    active_realm: dict[str, int] = {}
+    active_unknown: dict[str, int] = {}
+    for platform_id, realm, status in db.query(
+            Account.platform, Account.domain, Account.status).all():
         pid = platform_id or registry.DEFAULT_PLATFORM
+        is_active = (status or "").lower() == "active"
         counts[pid] = counts.get(pid, 0) + 1
+        if is_active:
+            active_counts[pid] = active_counts.get(pid, 0) + 1
         if realm:
             key = "%s:%s" % (pid, realm)
             realm_counts[key] = realm_counts.get(key, 0) + 1
+            if is_active:
+                active_realm[key] = active_realm.get(key, 0) + 1
         else:
             unknown[pid] = unknown.get(pid, 0) + 1
+            if is_active:
+                active_unknown[pid] = active_unknown.get(pid, 0) + 1
     items = []
     for spec in specs:
         payload = _serialize(spec)
@@ -163,11 +176,15 @@ def list_platforms(_: bool = Depends(require_admin), db: Session = Depends(get_d
                      + unknown.get(storage, 0))
             realms = {realm.key: (count if realm.key == spec.realm else 0)
                       for realm in spec.realms}
+            active = (active_realm.get("%s:%s" % (storage, spec.realm), 0)
+                      + active_unknown.get(storage, 0))
         else:
             count = counts.get(storage, 0)
             realms = {realm.key: realm_counts.get("%s:%s" % (storage, realm.key), 0)
                       for realm in spec.realms}
+            active = active_counts.get(storage, 0)
         payload["account_count"] = count
+        payload["active_count"] = active
         payload["realm_counts"] = realms
         items.append(payload)
     return {
@@ -207,7 +224,8 @@ def set_current(body: CurrentIn, _: bool = Depends(require_admin),
     return {"ok": True, "platform": spec.id, "realm": realm, "raw": value}
 
 @router.get("/export-all")
-def export_all_platforms(mode: str = "backup", platform: str = "",
+def export_all_platforms(request: Request, mode: str = "plain", platform: str = "",
+                         include_secrets: int = 0,
                          _: bool = Depends(require_admin),
                          db: Session = Depends(get_db)):
     """导出账号（默认**全部平台**；`?platform=` 指定落库平台名单平台导出）。
@@ -234,19 +252,19 @@ def export_all_platforms(mode: str = "backup", platform: str = "",
     import json as _json
     from datetime import datetime as _dt
 
-    TOKEN_KEYS = ("token", "accesstoken", "access_token", "refreshtoken",
-                  "refresh_token", "session", "sessionkey", "session_key",
-                  "apikey", "api_key", "secret", "password", "cookie")
-    _SENSITIVE = {k.lower() for k in TOKEN_KEYS}
+    from admin import export_guard
+
+    # 2026-11-24 第 3 轮（S-4）：默认改成脱敏（原默认 backup = 全部明文凭证）；
+    # 完整备份要 mode=backup（或 include_secrets=1）+ 二次确认头，见 admin/export_guard.py。
+    # 脱敏改为**递归**：原来只看第一层键，`auth_json` 里嵌套的
+    # {"auth": {"accessToken": ...}} 原样漏出；且原来保留前 6 位，现在整值打码。
+    full = export_guard.guard_secret_export(
+        request, "export-all platform=%s" % (str(platform or "").strip().lower() or "all"),
+        export_guard.wants_secrets(str(mode).lower() == "backup", include_secrets))
+    mode = "backup" if full else "plain"
 
     def _sanitize(record: dict) -> dict:
-        out = {}
-        for key, value in record.items():
-            if key.lower() in _SENSITIVE and isinstance(value, str) and value:
-                out[key] = value[:6] + "…"
-            else:
-                out[key] = value
-        return out
+        return export_guard.sanitize(record)
 
     items: dict[str, dict] = {}
     # 一次拉全表再按平台分组：账号量级在几千内，比按平台逐个查询更快也更简单。

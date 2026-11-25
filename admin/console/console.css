@@ -153,21 +153,30 @@ body {
    统计卡片优化：现代卡片设计
    ========================================================================== */
 .stat-grid {
-  gap:0;
+  /* 5 张卡片进来时旧的「flex + border-left」会在换行处留半截竖线，
+     看起来就是「乱」。改成 grid + 1px gap 当分隔线：列数按宽度自适应，
+     换行、折行都整齐，也不依赖兄弟选择器。 */
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(172px, 1fr));
+  gap:1px;
+  background:var(--border);
   border:1px solid var(--border);
   border-radius:12px;
   overflow:hidden;
-  margin-bottom:32px;
+  margin-bottom:24px;
   box-shadow:0 1px 3px rgba(15,23,42,.03);
 }
 .stat, .stat.is-warn, .stat.is-danger, .stat.is-brand {
   background:var(--surface);
   border:0;
   border-radius:0;
-  padding:20px 22px;
+  padding:18px 20px;
+  min-width:0;
   transition:background .15s ease;
 }
-.stat + .stat { border-left:1px solid var(--border); }
+/* grid 方案下分隔线由 gap 负责，兄弟选择器的竖线全部取消 ——
+   否则换行后第一格里会多出一条悬空的线。 */
+.stat + .stat { border-left:0; }
 .stat::after { display:none; }
 .stat .stat-label {
   font-size:12px;
@@ -178,19 +187,29 @@ body {
 }
 .stat .stat-label i { display:none; }
 .stat .stat-value {
-  font-size:28px;
-  margin:10px 0 7px;
+  font-size:26px;
+  margin:9px 0 6px;
   font-weight:600;
   font-variant-numeric:tabular-nums;
   letter-spacing:-0.02em;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
 }
 .stat.is-warn .stat-value { color:var(--warn); }
 .stat.is-danger .stat-value { color:var(--danger); }
 .stat.is-brand .stat-value { color:var(--brand); }
 .stat .stat-sub {
-  line-height:1.6;
+  line-height:1.5;
   font-size:12px;
   color:var(--fg-muted);
+  /* 副标题经常是「总 10.00 h · Quick Lite (free trial)」这种长串：
+     允许在必要处断词，但别把格子撑变形。 */
+  overflow-wrap:anywhere;
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
 }
 .ui-icon { width:17px; height:17px; display:inline-block; flex-shrink:0; vertical-align:middle; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
 /* 内联 SVG 图标（lucide，数据取自官方客户端 bundle）。
@@ -555,7 +574,7 @@ button:focus-visible, summary:focus-visible { outline:2px solid var(--brand-ink)
    现在：统一 32px 高、6px 间距、组间 1px 竖线、主按钮只有一个。 */
 .platform-head-actions {
   display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end;
-  gap:6px 10px; min-width:0;
+  gap:6px 10px; min-width:0; margin-bottom: 10px;
   /* 关键：`margin-left:auto`。.page-head 是 flex-wrap 容器，按钮组一旦
      比剩余宽度宽就会整体换到第二行 —— 没有这个 auto margin 时，
      单独占一行的元素会贴在**最左**（用户截图里按钮"掉到左边"就是这个）。
@@ -1569,7 +1588,8 @@ button[data-tooltip], a[data-tooltip], [role="button"][data-tooltip] { cursor: p
 }
 @media (max-width:640px) {
   .app-body { padding:22px 16px 32px; }
-  .stat { padding:16px; }
+  .stat-grid { grid-template-columns:repeat(auto-fit, minmax(148px, 1fr)); }
+  .stat { padding:14px 16px; }
   .stat .stat-value { font-size:23px; }
   .stat-grid { margin-bottom:24px; }
   .page-head h1 { font-size:24px; }
@@ -2865,8 +2885,8 @@ tbody tr:hover > th { background:transparent!important; }
   color:var(--fg-subtle);
 }
 
-/* 表格卡片：与统计卡、分页器统一留白 */
-#panel-ip .card { border-radius:10px; }
+/* 表格卡片：与统计卡、分页器统一留白（圆角走全局 --ux-radius，不再单开一档 10px） */
+#panel-ip .card { border-radius:var(--ux-radius); }
 #panel-ip .tbl tbody td { padding:13px 12px; }
 
 /* 筛选栏：标签与控件之间留一档 */

@@ -66,7 +66,15 @@ class StatsDashboardTests(unittest.TestCase):
     def setUp(self):
         # 统计缓存是进程级共享的：不清会把上一个用例的结果带进来。
         stats_cache._l1.clear()
+        from admin.models import AccountModelCooldown, UsageRollup, UsageRollupState
+
         db = self.session_factory()
+        # 汇总表是 `usage_logs` 的缓存：只删原表不删汇总，上一个用例写进去的
+        # 行会留在汇总里（`ensure_coverage` 认为窗口没缺口就不重算），
+        # 下一个用例就凭空多出一个模型 —— 这类脏数据极难反查，一律清干净。
+        db.query(UsageRollup).delete()
+        db.query(UsageRollupState).delete()
+        db.query(AccountModelCooldown).delete()
         db.query(UsageLog).delete()
         db.commit()
         now = datetime.utcnow()
@@ -275,6 +283,132 @@ class StatsDashboardTests(unittest.TestCase):
         self.assertTrue(zero["free"])
         self.assertIsNone(zero["success_rate"])
         self.assertTrue(by_key)
+
+    # ── 模型广场的时段状态轴 ────────────────────────────────────────────────
+    #
+    # 卡片底部那一排小方块就是「一格 = 一段时间」。锁四件事：
+    #   1. 格子的边界落在**北京时间整点**（用户说的「8 点那格」必须真是 8 点）；
+    #   2. 状态是算出来的，不是写死的三色：成功率分档 + 无流量时看冷却记录；
+    #   3. 窗口不能因为凑整被偷偷拉长（24 小时就是 24 小时）；
+    #   4. 格宽随窗口自适应，格数始终落在 24~31 之间。
+
+    def test_market_bucket_size_is_adaptive(self):
+        from admin.routers.stats import _market_bucket_size
+
+        self.assertEqual(_market_bucket_size(24), 1)
+        self.assertEqual(_market_bucket_size(48), 2)
+        self.assertEqual(_market_bucket_size(72), 3)
+        self.assertEqual(_market_bucket_size(168), 6)
+
+    def test_market_grid_aligns_to_local_hours_and_keeps_window_length(self):
+        from admin.routers.stats import _market_grid
+
+        now = datetime(2026, 11, 20, 12, 30)          # UTC ⇒ 北京 20:30
+        grid = _market_grid(now, 24, 1)
+        self.assertEqual(len(grid), 25)               # 20:00 起切到 21:00，25 格整
+        self.assertEqual((grid[0][0] + timedelta(hours=8)).strftime("%H:%M"), "20:00")
+        self.assertEqual((grid[-1][1] + timedelta(hours=8)).strftime("%H:%M"), "21:00")
+        # 每格正好一小时，且首尾相接
+        for index in range(len(grid) - 1):
+            self.assertEqual(grid[index][1], grid[index + 1][0])
+            self.assertEqual(grid[index][1] - grid[index][0], timedelta(hours=1))
+        # 3 小时档切出来的是 18:00 / 21:00 / 00:00 这种本地整档，不是 17:00
+        hours3 = _market_grid(now, 72, 3)
+        self.assertEqual((hours3[0][0] + timedelta(hours=8)).strftime("%H:%M"), "18:00")
+        self.assertEqual(len(hours3), 25)
+
+    def test_market_timeline_states_follow_requests_and_cooldown(self):
+        """一格一个状态：有流量按成功率分档，没流量才看冷却记录。"""
+        from admin.models import AccountModelCooldown  # 只在用例里用
+
+        end = datetime(2026, 11, 20, 12, 30)          # UTC ⇒ 北京 20:30
+        start_of_day = datetime(2026, 11, 20, 0, 0)   # UTC ⇒ 北京 08:00
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def utcnow(cls):
+                return end
+
+        db = self.session_factory()
+        try:
+            # 北京 08:00–09:00：两次成功 → up
+            for minute in (10, 20):
+                db.add(UsageLog(model="axis-model", platform="workbuddy",
+                                created_at=start_of_day + timedelta(minutes=minute),
+                                error_kind="", credits=1, total_tokens=100,
+                                latency_ms=1000, ttfb_ms=300))
+            # 北京 09:00–10:00：只有失败 → down（不是「无样本」）
+            for minute in (5, 15, 25):
+                db.add(UsageLog(model="axis-model", platform="workbuddy",
+                                created_at=start_of_day + timedelta(hours=1, minutes=minute),
+                                error_kind="server"))
+            # 北京 11:00–12:00：200 次里 2 次失败 = 99% → warn
+            for index in range(200):
+                db.add(UsageLog(model="axis-model", platform="workbuddy",
+                                created_at=start_of_day + timedelta(hours=3, minutes=index % 60),
+                                error_kind="server" if index < 2 else "",
+                                credits=0.5, total_tokens=20, latency_ms=900, ttfb_ms=300))
+            # 北京 13:00 起一个账号进了 model_daily 冷却：那一格没请求也要标 off
+            db.add(AccountModelCooldown(account_id=1, model="axis-model",
+                                        kind="model_daily", until=end + timedelta(hours=4),
+                                        updated_at=start_of_day + timedelta(hours=5)))
+            db.commit()
+        finally:
+            db.close()
+
+        with patch.object(stats_routes, "datetime", FixedDatetime):
+            response = self.client.get("/api/stats/model-market", params={"hours": 24})
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        buckets = data["buckets"]
+        self.assertEqual(len(buckets), 25)
+        self.assertEqual(len(buckets), len(buckets and data["items"][0]["timeline"]))
+
+        # 标签必须落在本地整点，且第一格带完整区间
+        self.assertEqual(buckets[0]["label"], "20:00")
+        self.assertIn("20:00–21:00", buckets[0]["tip"])
+        self.assertEqual(buckets[-1]["label"], "20:00")
+        self.assertAlmostEqual(buckets[-1]["coverage"], 0.5, places=2)  # 20:30 截断
+        self.assertAlmostEqual(buckets[1]["coverage"], 1.0, places=3)
+
+        item = next(row for row in data["items"] if "axis-model" in row["models"])
+        cells = {buckets[index]["label"]: item["timeline"][index]
+                 for index in range(len(buckets))}
+        self.assertEqual(cells["08:00"]["state"], "up")
+        self.assertEqual(cells["08:00"]["requests"], 2)
+        self.assertAlmostEqual(cells["08:00"]["success_rate"], 1.0)
+        self.assertEqual(cells["09:00"]["state"], "down")
+        self.assertEqual(cells["09:00"]["success_rate"], 0.0)
+        self.assertEqual(cells["11:00"]["state"], "warn")
+        # 13:00 那一格没有请求、但有冷却记录 ⇒ off（确定性不可用）
+        self.assertEqual(cells["13:00"]["requests"], 0)
+        self.assertEqual(cells["13:00"]["cooling"], 1)
+        self.assertEqual(cells["13:00"]["state"], "off")
+        # 没有请求也没有冷却记录的格 ⇒ idle（没流量 ≠ 坏了）
+        self.assertEqual(cells["07:00"]["state"], "idle")
+
+        self.assertEqual(item["measured_cells"], 3)
+        self.assertAlmostEqual(item["uptime"], 2 / 3, places=4)
+        self.assertEqual(item["cells"]["down"], 1)
+
+    def test_market_timeline_never_invents_unavailable_cells(self):
+        """没有冷却记录时，空白格只能是 idle —— 不能把「没人用」画成「坏了」。"""
+        data = self.client.get("/api/stats/model-market", params={"hours": 24}).json()
+        for item in data["items"]:
+            self.assertEqual(item["cells"]["off"], 0)
+            self.assertTrue(all(cell["state"] != "off" for cell in item["timeline"]))
+            self.assertEqual(len(item["timeline"]), len(data["buckets"]))
+        # 窗口请求数必须等于各格之和（格与卡片不能各算一套）
+        for item in data["items"]:
+            self.assertEqual(item["requests"], sum(cell["requests"] for cell in item["timeline"]))
+
+    def test_market_explicit_bucket_hours(self):
+        """允许显式指定格宽：7 天也能按 1 小时铺（前端要钻细节时用）。"""
+        data = self.client.get("/api/stats/model-market",
+                               params={"hours": 168, "bucket_hours": 1}).json()
+        self.assertEqual(data["bucket_hours"], 1)
+        self.assertGreaterEqual(len(data["buckets"]), 168)
+        self.assertLessEqual(len(data["buckets"]), 170)
 
 
 if __name__ == "__main__":

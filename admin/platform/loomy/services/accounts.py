@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
@@ -43,6 +45,17 @@ from admin.platform.loomy.core import client, endpoints
 logger = logging.getLogger("admin.platform.loomy.accounts")
 PLATFORM = endpoints.PLATFORM
 QUOTA_TTL = 60
+
+#: 「账号 × 模型」能力快照的保鲜期（秒）。
+#:
+#: 上游的模型目录是**按号**的：实测同一个池子里 10 个号只有
+#: `spark-x2.6-*`，只有 1 个号有 `DeepSeek-V4.1-Flash`。而 Loomy 对
+#: 「这个号没有这个模型」**不报错**，而是用默认模型冒充回包 —— 于是网关
+#: 只能「连上去 → 等首帧 → 发现回包 model 不对 → 换号」，每个错号白等
+#: 一次首包（实测 3~40 秒）。缓存这张表就是为了**在建连之前**把错号排掉。
+#:
+#: 30 分钟：上游改目录不频繁，但也不能永久缓存（活动送的号会变）。
+MODEL_TTL_SECONDS = 1800
 #: 402（积分不足）的号冷却多久。Loomy 的当日额度**每天重置**，
 #: 10 分钟后重试一次足以发现「是不是刚好跨天了」，又不至于空转。
 QUOTA_COOL_SECONDS = 600
@@ -69,6 +82,190 @@ def quota_is_fresh(account: Account) -> bool:
     if synced is None:
         return False
     return (datetime.utcnow() - synced).total_seconds() < QUOTA_TTL
+
+
+# ---------------------------------------------------------------------------
+# 「账号 × 模型」能力快照
+#
+# 存进 `Account.credits_snapshot` 的 JSON（键 `model_ids` / `models_synced_at`），
+# 不新开表：这张表只有几十行、只由本次新增的 sync_models 写，
+# 用现有字段既不用迁移，也不会和 `apply_quota` 的合并逻辑打架。
+# ---------------------------------------------------------------------------
+def _snapshot_of(account: Account) -> dict:
+    try:
+        snapshot = json.loads(getattr(account, "credits_snapshot", "") or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
+def model_ids_of(account: Account) -> set[str]:
+    """这个号**实测能用**的模型 id 集合（没同步过 = 空集）。
+
+    空集 ≠ 「什么都不能用」，而是「不知道」—— 调用方必须区分这两种情况，
+    否则第一次部署就会把所有号都排掉。判断「知不知道」用
+    `models_synced_at()`。
+    """
+    ids = _snapshot_of(account).get("model_ids")
+    if not isinstance(ids, list):
+        return set()
+    return {str(item).strip() for item in ids if str(item or "").strip()}
+
+
+def models_synced_at(account: Account) -> float:
+    """能力快照的写入时刻（unix 秒；0 = 从没同步过）。"""
+    try:
+        return float(_snapshot_of(account).get("models_synced_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def models_snapshot_fresh(account: Account,
+                          ttl: float = MODEL_TTL_SECONDS) -> bool:
+    stamp = models_synced_at(account)
+    return bool(stamp) and (time.time() - stamp) < ttl
+
+
+def remember_models(account: Account, model_ids) -> None:
+    """把一次 `/models` 的真实结果写进快照（**不提交**，由调用方 commit）。"""
+    snapshot = _snapshot_of(account)
+    clean = []
+    for item in model_ids or []:
+        text = str(item or "").strip()
+        if text and text not in clean:
+            clean.append(text)
+    snapshot["model_ids"] = clean[:200]
+    snapshot["models"] = len(clean)
+    snapshot["models_synced_at"] = int(time.time())
+    account.credits_snapshot = json.dumps(snapshot, ensure_ascii=False)[:20000]
+
+
+def forget_model(account: Account, model: str) -> bool:
+    """从快照里删掉一个模型（上游静默替换时调用）。
+
+    返回是否真的删掉了 —— 用于判断「这次失败有没有带来新知识」，
+    没有新知识就不必再写库。
+    """
+    text = str(model or "").strip()
+    if not text:
+        return False
+    snapshot = _snapshot_of(account)
+    ids = snapshot.get("model_ids")
+    if not isinstance(ids, list):
+        return False
+    remaining = [item for item in ids if str(item or "").strip() != text]
+    if len(remaining) == len(ids):
+        return False
+    snapshot["model_ids"] = remaining
+    snapshot["models"] = len(remaining)
+    snapshot["models_synced_at"] = int(time.time())
+    account.credits_snapshot = json.dumps(snapshot, ensure_ascii=False)[:20000]
+    return True
+
+
+def sync_models(db: Session, *, realm: str = "", account_ids=None,
+                workers: int = 8, limit: int | None = None) -> dict:
+    """逐号拉一次 `/models`，把**真实目录**写进能力快照。
+
+    为什么要逐号拉（而不是像「模型数」那样整池拉一次）：模型目录是
+    **按号**的 —— 同一个池子里有的号只有 `spark-x2.6-*`，有的号有全套
+    `DeepSeek-V4.1-Flash`。只拉一次等于拿一个号的能力代表整池，
+    请求就会持续被派到根本不能服务的号上。
+
+    `/models` 不消耗积分，代价只有 RTT；池子几十个号时按 8 并发跑。
+    每个线程独立 Session（SQLAlchemy Session 不是线程安全的）。
+    """
+    query = db.query(Account.id).filter(Account.platform == PLATFORM,
+                                        Account.status == "active")
+    if realm:
+        query = query.filter(Account.domain == realm)
+    if account_ids:
+        query = query.filter(Account.id.in_([int(i) for i in account_ids]))
+    ids = [int(row[0]) for row in query.order_by(Account.id.asc()).all()]
+    if limit:
+        ids = ids[:int(limit)]
+    if not ids:
+        return {"ok": True, "synced": 0, "failed": 0,
+                "models": {}, "note": "没有 active 账号"}
+
+    def _one(account_id: int) -> tuple[int, list, str]:
+        from admin.db import SessionLocal
+
+        session = SessionLocal()
+        try:
+            account = (session.query(Account)
+                       .filter(Account.id == account_id).first())
+            if account is None:
+                return account_id, [], "账号不存在"
+            data = ensure_token(session, account)
+            models = client.fetch_models(
+                token_of(data), realm_of(account), account_id)
+            model_ids = [str((m or {}).get("id") or "").strip()
+                         for m in models if isinstance(m, dict)]
+            remember_models(account, model_ids)
+            session.commit()
+            return account_id, [m for m in model_ids if m], ""
+        except client.UpstreamError as exc:
+            try:
+                session.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return account_id, [], str(exc.message or exc.kind)
+        except Exception as exc:  # noqa: BLE001 - 单号失败不影响整批
+            try:
+                session.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return account_id, [], repr(exc)[:200]
+        finally:
+            session.close()
+
+    synced = failed = 0
+    catalog: dict[str, int] = {}
+    errors: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(int(workers), 16))) as pool:
+        for account_id, model_ids, error in pool.map(_one, ids):
+            if error:
+                failed += 1
+                errors[account_id] = error
+                continue
+            synced += 1
+            for model_id in model_ids:
+                catalog[model_id] = catalog.get(model_id, 0) + 1
+    logger.info("Loomy 模型目录同步：%d 个号成功 / %d 失败，模型 %d 个",
+                synced, failed, len(catalog))
+    return {"ok": True, "synced": synced, "failed": failed,
+            "models": catalog, "errors": errors}
+
+
+#: 后台同步的节流（避免每个请求都踢一次全量同步）。
+_model_sync_lock = threading.Lock()
+_model_sync_last: dict[str, float] = {}
+
+
+def schedule_model_sync(realm: str = "",
+                        ttl: float = MODEL_TTL_SECONDS) -> bool:
+    """需要时**后台**跑一次全池模型同步（不阻塞请求）。返回是否真的踢了。"""
+    key = realm or "all"
+    now = time.time()
+    with _model_sync_lock:
+        if now - _model_sync_last.get(key, 0.0) < ttl:
+            return False
+        _model_sync_last[key] = now
+
+    def _run() -> None:
+        from admin.db import SessionLocal
+
+        session = SessionLocal()
+        try:
+            sync_models(session, realm=realm)
+        except Exception:  # noqa: BLE001 - 后台任务不能把异常抛给调用方
+            logger.exception("Loomy 后台模型同步失败")
+        finally:
+            session.close()
+
+    threading.Thread(target=_run, name="loomy-model-sync", daemon=True).start()
+    return True
 
 
 def ensure_token(db: Session, account: Account) -> dict:
@@ -194,6 +391,18 @@ def apply_quota(account: Account, quota: dict) -> None:
         "models": int(fetched_models) if fetched_models is not None
                   else previous_models,
     })
+    # 模型**id 清单**（不是数量）：选号要靠它判断「这个号到底能不能服务
+    # 请求的模型」。只有真的探到目录时才写，避免把未知写成「什么都没有」。
+    fetched_ids = quota.get("model_ids")
+    if isinstance(fetched_ids, (list, tuple, set)):
+        clean_ids = []
+        for item in fetched_ids:
+            text = str(item or "").strip()
+            if text and text not in clean_ids:
+                clean_ids.append(text)
+        snapshot["model_ids"] = clean_ids[:200]
+        snapshot["models"] = len(clean_ids)
+        snapshot["models_synced_at"] = int(time.time())
     account.credits_snapshot = json.dumps(snapshot, ensure_ascii=False)[:20000]
 
 
@@ -231,6 +440,8 @@ def sync_quota(db: Session, account: Account, *,
         try:
             models = client.fetch_models(token, realm, account.id)
             quota["models"] = len(models)
+            quota["model_ids"] = [str((m or {}).get("id") or "").strip()
+                                  for m in models if isinstance(m, dict)]
         except client.UpstreamError:
             quota.setdefault("models", 0)
     from admin import account_health

@@ -150,6 +150,18 @@ BANNED_BIZ_CODES = frozenset({"100003"})
 MODEL_MISS_COOL_SECONDS = _env_int("LOOMY_MODEL_MISS_COOL_SECONDS", 3600)
 
 
+#: 「先回字节」策略下，等上游建连的**快路径窗口**（秒）。
+#:
+#: 窗口内建连完成 → 走原来的路径，错误还能用真实 HTTP 状态码表达；
+#: 超过窗口 → 先把响应头 + 一帧心跳发出去，再边等边转。
+#:
+#: 4 秒的依据：快失败（没有可用号 / 401 / 402 / 429）实测都在 1~2 秒内
+#: 出结果；上游正常首帧则普遍 >4 秒，本来就需要心跳兜住。
+#: 2.5 秒是 2026-11-20 实测后的取值：404/402/无号都在 1.5 秒内返回，
+#: 再长只是让「已经慢的请求」更晚看到第一帧心跳。
+EARLY_OPEN_WAIT_S = float(os.getenv("LOOMY_EARLY_OPEN_WAIT", "2.5") or 2.5)
+
+
 def _model_mismatch(requested: str, served: str) -> bool:
     """上游回包的模型是否与请求的不是同一个（归一 key 对比）。
 
@@ -197,12 +209,97 @@ def _note_model_not_served(db, account, model: str, served: str) -> None:
             row.kind = "model_not_served"
             row.reason = reason
             row.hits = int(row.hits or 0) + 1
+        # 冷却只是「一时」的，能力快照才是「一直」的：顺手把该模型从这个号
+        # 的清单里划掉，下一个请求在建连**之前**就会跳过它，不用再白等一次首包。
+        loomy_accounts.forget_model(account, model)
         db.commit()
     except Exception:  # noqa: BLE001 - 冷却写失败不影响响应
         try:
             db.rollback()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _prefilter_by_model(db, realm: str, model: str, exclude: set[int]) -> None:
+    """按「账号 × 模型」能力快照把**不可能服务**的号提前排掉。
+
+    ## 为什么必须放在建连之前
+
+    Loomy 对「这个号没有这个模型」不报错，而是拿默认模型顶包：
+    2026-11-20 实测池子里 11 个 active 号只有 1 个有 `DeepSeek-V4.1-Flash`，
+    其余 10 个一律回 `spark-x2.6-low`。网关只能「连上去 → 等首帧 →
+    发现回包 model 不对 → 换号」，而**每个错号的首包要 3~25 秒**。
+
+    于是 8 次尝试 = 客户端那边几分钟零字节。用户看到的就是
+    「对话发送到上游，超时、没有任何响应」—— 而账号本身是好的：
+    同一个号在官方客户端里（它只会列出该号真实拥有的模型）一直能用。
+
+    有了快照，错号在选号阶段就被排除，请求直达能服务的号；
+    一个号都服务不了时直接 404 + 可用模型清单，不再让客户端干等。
+    """
+    from admin.model_alias import canonical_key
+    from admin.models import Account
+
+    if not model:
+        return
+    try:
+        rows = (db.query(Account)
+                .filter(Account.platform == loomy_accounts.PLATFORM,
+                        Account.status == "active")
+                .all())
+    except Exception:  # noqa: BLE001 - 快照读失败不能影响主链路
+        logger.debug("Loomy 能力快照查询失败", exc_info=True)
+        return
+    if not rows:
+        return
+    realm_cond = str(realm or "")
+    if realm_cond:
+        rows = [row for row in rows
+                if not getattr(row, "domain", "") or row.domain == realm_cond]
+
+    target = canonical_key(model)
+    catalog: set[str] = set()
+    capable: list = []
+    unknown: list = []
+    for row in rows:
+        ids = loomy_accounts.model_ids_of(row)
+        if not ids:
+            unknown.append(row)
+            continue
+        catalog.update(ids)
+        if any(canonical_key(name) == target for name in ids):
+            capable.append(row)
+
+    if not capable and not catalog:
+        # 目录一次都没同步过：无从判断，保持原行为，同时后台补一次同步。
+        loomy_accounts.schedule_model_sync(realm_cond)
+        return
+
+    complete = not unknown  # 所有 active 号都有目录 = 结论可信
+    if not capable:
+        loomy_accounts.schedule_model_sync(realm_cond)
+        if complete:
+            available = ", ".join(sorted(catalog)[:12]) or "（上游目录为空）"
+            raise shared.PlatformRejected(
+                404,
+                "Loomy 上游当前没有账号提供模型 %s。可用模型：%s"
+                % (model, available),
+                kind="invalid_request_error", code="model_not_found")
+        # 还有号没同步过：不能断言「没有」，让请求继续试
+        return
+
+    capable_ids = {int(row.id or 0) for row in capable}
+    others = [row for row in rows if int(row.id or 0) not in capable_ids]
+    if capable_ids - exclude:
+        # 有能服务的号：连「目录未知」的号也不试 —— 白等一次首包就是几秒到几十秒。
+        for row in others:
+            exclude.add(int(row.id or 0))
+    else:
+        # 能服务的号本轮都已被排掉（上一个请求刚失败过）：只放「目录未知」的号
+        # 进来兜底，明确不服务的号仍然不碰。
+        for row in others:
+            if loomy_accounts.model_ids_of(row):
+                exclude.add(int(row.id or 0))
 
 
 def _maybe_disable(db, account, exc: "client.UpstreamError") -> bool:
@@ -607,6 +704,8 @@ def _attempt(db, request, key, body: dict, realm: str):
     """
     model = str(body.get("model") or "")
     exclude: set[int] = set()
+    # 建连之前按能力快照排号（错号只会被上游静默换成默认模型，白等首包）
+    _prefilter_by_model(db, realm, model, exclude)
     last_error: client.UpstreamError | None = None
     #: 触发退避的上游失败次数（只统计 upstream_error / network），
     #: 用来算退避时长 —— **按序号算，不累加**。
@@ -1035,6 +1134,9 @@ def _open_stream(db, request, key, body: dict, realm: str, stats: dict,
     没拿到可用账号，调用方据此返回上游错误或 503。
     """
     exclude: set[int] = set()
+    # **建连之前**按能力快照排号：错号连上去也只会被上游静默换成默认模型，
+    # 而每个错号要先等一次首包（实测 3~25 秒）。
+    _prefilter_by_model(db, realm, model, exclude)
     account = None
     chunks = None
     last_error = None
@@ -1271,7 +1373,25 @@ class _StreamLease:
 
 
 async def _forward_stream(body: dict, request):
-    """Forward SSE with explicit ownership before its first byte is consumed."""
+    """Forward SSE with explicit ownership before its first byte is consumed.
+
+    ## 建连窗口也必须吐字节（2026-11-25 实测）
+
+    原实现 `await owner.submit(owner.open)` 要等**上游响应头**到达才返回，
+    这之前一个字节都发不出去。实测 `spark-x2.6-low`：
+
+        响应头到达 52.91s → 首个字节 52.92s → 客户端 53 秒零字节
+
+    `_StreamLease.stream()` 里的心跳（`with_pings` / `PING_INTERVAL_S`）
+    是**读帧阶段**的心跳，`owner.open()` 没返回它根本没机会跑。于是
+    「上游慢」直接退化成「客户端超时」。
+
+    修法：给 `open()` 加一个 `EARLY_OPEN_WAIT_S` 窗口。
+
+      · 窗口内建连完成 → 与原来完全一致（错误还能用真实 HTTP 状态码表达）；
+      · 超窗口 → 先把响应头 + 一帧心跳发出去，再边心跳边等 —— 客户端从
+        第一秒起就能收到字节，idle 计时器不会把它掐掉。
+    """
 
     # **强制要 usage 尾帧**：客户端没带 `stream_options.include_usage` 时
     # 上游不发 usage —— `_bill` 记到 0 token，客户端的「消耗积分」
@@ -1281,22 +1401,82 @@ async def _forward_stream(body: dict, request):
         body = {**body, "stream_options": {"include_usage": True}}
 
     owner = _StreamLease(body, request)
+    resp_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     try:
-        failure = await asyncio.shield(owner.submit(owner.open))
-        if failure is not None:
-            await owner.aclose()
-            return failure
-        resp_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-        if owner.served_model and _model_mismatch(owner.model, owner.served_model):
-            # 替换幸存（所有号都不提供该模型）：响应头明示真正服务的模型。
-            resp_headers["x-upstream-substituted-model"] = owner.served_model
-        return bridge.owned_stream_response(owner.stream(), owner, headers=resp_headers)
+        pending = owner.submit(owner.open)
+        done, _ = await asyncio.wait({pending}, timeout=EARLY_OPEN_WAIT_S)
+        if done:
+            failure = pending.result()
+            if failure is not None:
+                await owner.aclose()
+                return failure
+            if owner.served_model and _model_mismatch(owner.model, owner.served_model):
+                # 替换幸存（所有号都不提供该模型）：响应头明示真正服务的模型。
+                resp_headers["x-upstream-substituted-model"] = owner.served_model
+            return bridge.owned_stream_response(
+                owner.stream(), owner, headers=resp_headers)
+
+        # ---- 慢路径：立刻回字节，边心跳边等上游 ----
+        #
+        # `owner.stream()` 第一步就是 `self.submit(self.read)`，而 `read()`
+        # 依赖 `open()` 填好的 `self.frames`。所以这里不能直接用它 —— 先发
+        # 心跳，等 `pending` 落地后再把 owner.stream() 接进来。
+        #
+        # 注意 `bridge.with_pings` 是**同步**生成器（服务同步迭代器），
+        # 这里流是异步的，心跳得自己写：与 `_StreamLease.stream()`
+        # 同一个节拍（`bridge.PING_INTERVAL_S`），行为保持一致。
+        async def heartbeat_then_stream():
+            beats = 0
+            while True:
+                try:
+                    done, _ = await asyncio.wait(
+                        {pending}, timeout=max(0.05, bridge.PING_INTERVAL_S))
+                except asyncio.CancelledError:
+                    raise
+                if done:
+                    break
+                beats += 1
+                yield bridge.CHAT_PING
+            if beats:
+                logger.info("Loomy 慢路径建连完成（建连期发了 %d 帧心跳）", beats)
+            failure = pending.result()
+            if failure is not None:
+                # 响应头已经发出去了，只能表达成流内错误帧。
+                payload = {"error": {"message": "上游建连失败",
+                                     "type": "upstream_error"}}
+                yield ("data: %s\n\n" % json.dumps(payload, ensure_ascii=False)).encode()
+                yield b"data: [DONE]\n\n"
+                await owner.aclose()
+                return
+            if owner.served_model and _model_mismatch(owner.model, owner.served_model):
+                logger.info("Loomy 慢路径替换模型 acc=%s %r -> %r",
+                            owner.account.id if owner.account else "?",
+                            owner.model, owner.served_model)
+            async for piece in owner.stream():
+                yield piece
+
+        # 第一帧**立刻**发（不能等一个心跳周期）：客户端的第一秒就要有字节。
+        return StreamingResponse(
+            _prepend_ping(heartbeat_then_stream()),
+            media_type="text/event-stream",
+            headers=resp_headers)
     except BaseException as original:
         try:
             await owner.aclose()
         except BaseException as cleanup:
             raise original from cleanup
         raise
+
+
+async def _prepend_ping(source):
+    """先吐一帧心跳，再接上 `source`。
+
+    慢路径下响应头刚刚定下来，客户端还没收到任何字节；先给一帧是让它
+    立刻知道「链路活着」，而不是等满一个 `PING_INTERVAL_S` 周期。
+    """
+    yield bridge.CHAT_PING
+    async for piece in source:
+        yield piece
 
 
 def _sse_from_chunks(chunks, model: str, holder: dict):

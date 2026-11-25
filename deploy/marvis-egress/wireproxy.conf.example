@@ -1,0 +1,14 @@
+# 由 refresh_exits.sh / mk_exit.py 生成，不要手写提交（含 WARP 私钥）。
+# 形态参考：
+[Interface]
+Address = 172.16.0.2/32, 2606:4700:110:xxxx::/128
+PrivateKey = <wgcf generate 产生的私钥>
+DNS = 1.1.1.1, 1.0.0.1
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+Endpoint = 188.114.98.224:2408
+AllowedIPs = 0.0.0.0/0, ::/0
+
+[HTTP]
+BindAddress = 0.0.0.0:42001

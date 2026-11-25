@@ -1,0 +1,4 @@
+# 运行期资产：私钥、profile、二进制、日志都不进 git
+exits/
+logs/
+bin/

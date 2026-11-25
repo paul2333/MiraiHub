@@ -16,7 +16,8 @@ from admin.pool import POOL
 
 _logger = logging.getLogger("admin.account_health")
 
-#: 停用文案前缀：非 WorkBuddy 平台连续 auth 失败达到阈值后写进 last_err_msg。
+#: `note_auth_failure` 写进 `last_err_msg` 的前缀。`ban_recheck._recheck_platform_auth`
+#: 只复核带这个前缀的停用号，人工停用 / 其它原因停用的号不会被自动恢复。
 AUTH_FAIL_PREFIX = "登录态被上游拒绝"
 
 
@@ -114,9 +115,14 @@ def _select_chat_model(db, rows) -> tuple[str, bool]:
     if not model_rows:
         return "", False
 
+    # 只看 WorkBuddy 自己的模型配置（D3）：这条路径只服务默认平台（其它平台走
+    # `_platform_health`），原来跨平台取免费 / 启用清单，别家启用的同名模型会被当成可用。
+    from admin.platform.workbuddy import scoping as wb_scope
+
     free_ids = {row.model_id for row in db.query(ModelConfig).filter(
         ModelConfig.enabled == 1,
         (ModelConfig.credit_multiplier == 0) | (ModelConfig.credit_multiplier.is_(None)),
+        wb_scope.workbuddy_cond(ModelConfig.platform),
     ).all()}
     for row in model_rows:
         model = _model_id(row)
@@ -124,7 +130,7 @@ def _select_chat_model(db, rows) -> tuple[str, bool]:
         if model in free_ids or "x0.00" in credits or "free" in credits:
             return model, True
 
-    enabled_ids = {row.model_id for row in db.query(ModelConfig).filter(ModelConfig.enabled == 1).all()}
+    enabled_ids = wb_scope.enabled_models(db, "workbuddy")
     for row in model_rows:
         model = _model_id(row)
         if model in enabled_ids:
