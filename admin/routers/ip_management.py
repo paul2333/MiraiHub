@@ -23,7 +23,7 @@ from admin.models import BlockedIP, IPRequestBucket, UsageLog, ClientIdentity, C
 from admin.client_ip import normalize_ip, request_ip
 from admin.ip_activity import flush
 from admin.money import money_avg
-from admin.security import audit_secret_access, require_admin
+from admin.security import require_admin
 
 
 router = APIRouter(prefix="/api/ip", tags=["ip-management"])
@@ -482,10 +482,9 @@ def batch_delete_blocked(body: BlockedBatchDeleteIn, request: Request,
     db.commit()
     invalidate_ip_cache()
     missing = sorted({int(i) for i in body.ids} - set(deleted)) if body.ids else []
-    audit_secret_access(request, "ip_block_batch_delete",
-                        "deleted=%d active=%d prefix=%s ids=%s" % (
-                            len(deleted), active, prefix or "-",
-                            ",".join(str(i) for i in deleted[:20]) + ("…" if len(deleted) > 20 else "")))
+    _logger.warning("IP 封禁批量删除 | ip=%s deleted=%d failed=%d"
+                   % (request.client.host if request.client else "?",
+                      result.get("deleted", 0), result.get("failed", 0)))
     return {"ok": True, "deleted": len(deleted), "deleted_ids": deleted,
             "active_deleted": active, "not_found_ids": missing}
 
