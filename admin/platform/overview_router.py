@@ -43,14 +43,62 @@ router = APIRouter(prefix="/api/overview", tags=["overview"])
 _OK_KINDS = ("", "success")
 
 #: 本地时区偏移（小时）。usage_logs.created_at 存 UTC。
+#: 仅作兼容保留；实际切日统一走 `rollup.local_day_start()`（环境变量
+#: ADMIN_STATS_TZ_OFFSET_HOURS，默认 8），与看板 `window=day`、模型限额同一来源（N5）。
 _LOCAL_OFFSET = 8
 
 
 def _day_start(days_back: int = 0) -> datetime:
     """本地时区「今天 0 点」对应的 UTC 时间（naive，与库里的值可直接比较）。"""
-    now = datetime.now(timezone.utc) + timedelta(hours=_LOCAL_OFFSET)
-    local_midnight = datetime(now.year, now.month, now.day) - timedelta(days=days_back)
-    return local_midnight - timedelta(hours=_LOCAL_OFFSET)
+    from admin import rollup as rollup_mod
+
+    return rollup_mod.local_day_start(days_back)
+
+
+def _usage_scope(db: Session, platform: str, realm: str):
+    """概览用量的平台条件（与 `/api/stats/usage`、`/api/logs` 同一口径，N5 / P1-8）。
+
+    返回 `None`（不过滤）、`[]`（必然为空）或一个 SQL 条件：
+      * 不带区：`platform 列 ∈ {落库名, 对外 id}` **并上** `account_id ∈ 该平台账号`
+        —— 原来只按 account_id，无号 503 / 准入拒绝这类 `account_id=0` 的失败
+        请求在概览里统统看不到，和日志页对不上；
+      * 带区：该区账号 + platform 列恰好写着该区对外 id 的行（落库名是两区合计，
+        并进来区筛选就失效）。
+    """
+    if not platform:
+        return None
+    from sqlalchemy import or_
+
+    specs = [spec for spec in registry.all_platforms(enabled_only=False)
+             if str(spec.storage() or "").lower() == platform]
+    ids = platform_scope.account_ids(db, platform, realm) or []
+    if realm:
+        values = {str(spec.id).lower() for spec in specs
+                  if (spec.realm or "") == realm and str(spec.id).lower() != platform}
+    else:
+        values = {platform} | {str(spec.id).lower() for spec in specs}
+    clauses = []
+    if values:
+        clauses.append(UsageLog.platform.in_(sorted(values)))
+    if ids:
+        clauses.append(UsageLog.account_id.in_(ids))
+    if not clauses:
+        return []
+    return or_(*clauses)
+
+
+def _scoped(query, scope_ids):
+    """把 `scope_ids`（None / 账号 id 列表 / SQL 条件）套到用量查询上。
+
+    返回 `(query, empty)`；`empty=True` 表示必然没有结果，调用方直接给空值。
+    """
+    if scope_ids is None:
+        return query, False
+    if isinstance(scope_ids, (list, tuple, set)):
+        if not scope_ids:
+            return query, True
+        return query.filter(UsageLog.account_id.in_(list(scope_ids))), False
+    return query.filter(scope_ids), False
 
 
 def _window(db: Session, since: datetime, scope_ids=None) -> dict:
@@ -65,12 +113,11 @@ def _window(db: Session, since: datetime, scope_ids=None) -> dict:
         func.coalesce(func.sum(case((ok, UsageLog.cached_tokens), else_=0)), 0),
         func.coalesce(func.sum(case((ok, UsageLog.credits), else_=0)), 0),
     ).filter(UsageLog.created_at >= since)
-    if scope_ids is not None:
-        if not scope_ids:
-            return {"requests": 0, "ok_requests": 0, "prompt_tokens": 0,
-                    "completion_tokens": 0, "total_tokens": 0,
-                    "cached_tokens": 0, "credits": 0.0}
-        query = query.filter(UsageLog.account_id.in_(scope_ids))
+    query, empty = _scoped(query, scope_ids)
+    if empty:
+        return {"requests": 0, "ok_requests": 0, "prompt_tokens": 0,
+                "completion_tokens": 0, "total_tokens": 0,
+                "cached_tokens": 0, "credits": 0.0}
     row = query.one()
     return {
         "requests": int(row[0] or 0),
@@ -110,12 +157,11 @@ def _cache_hit(db: Session, since: datetime, scope_ids=None) -> dict:
         func.count(UsageLog.id),
     ).filter(UsageLog.created_at >= start,
              func.coalesce(UsageLog.error_kind, "").in_(_OK_KINDS))
-    if scope_ids is not None:
-        if not scope_ids:
-            return {"cached_tokens": 0, "prompt_tokens": 0, "miss_tokens": 0,
-                    "rate": None, "samples": 0,
-                    "note": "当前平台没有流量", "by_platform": []}
-        row = row.filter(UsageLog.account_id.in_(scope_ids))
+    row, empty = _scoped(row, scope_ids)
+    if empty:
+        return {"cached_tokens": 0, "prompt_tokens": 0, "miss_tokens": 0,
+                "rate": None, "samples": 0,
+                "note": "当前平台没有流量", "by_platform": []}
     prompt, cached, samples = row.one()
     prompt = int(prompt or 0)
     cached = int(cached or 0)
@@ -173,10 +219,9 @@ def _cache_hit_by_platform(db: Session, since: datetime, scope_ids=None,
         func.coalesce(func.sum(UsageLog.cached_tokens), 0),
         func.count(UsageLog.id),
     ).filter(UsageLog.created_at >= since, ok)
-    if scope_ids is not None:
-        if not scope_ids:
-            return []
-        query = query.filter(UsageLog.account_id.in_(scope_ids))
+    query, empty = _scoped(query, scope_ids)
+    if empty:
+        return []
     try:
         rows = query.group_by(UsageLog.platform).all()
     except Exception:  # noqa: BLE001 - 分组失败不该让整张卡空白
@@ -283,11 +328,29 @@ def _account_monitor(db: Session, scope_ids=None, platform: str = "") -> dict:
     rows = query.all()
 
     # 哨兵信号（按账号聚合）。只覆盖有信号的号，通常是个位数量。
+    #
+    # 两个坑（2026-11-24 修）：
+    #   * `sentinel.by_account()` 返回的是 `{account_id: item}` 字典，原来按列表
+    #     遍历拿到的是 int 键，`item.get` 抛 AttributeError 被吞掉 —— 监测面板
+    #     上的哨兵业务码**从来没显示过**；
+    #   * 哨兵事件按**对外 id** 记（`trae-cn` / `qoder-intl`），这里拿到的是落库名
+    #     （`trae`），要展开成该落库名下的每个对外 id 分别查。
     signal_map: dict[int, dict] = {}
     try:
         from admin import sentinel
-        for item in sentinel.by_account(platform) or []:
-            signal_map[int(item.get("account_id") or 0)] = item
+
+        targets = [""]
+        if platform:
+            targets = sorted({str(spec.id).lower()
+                              for spec in registry.all_platforms(enabled_only=False)
+                              if str(spec.storage() or "").lower() == platform}
+                             | {platform})
+        for target in targets:
+            found = sentinel.by_account(target) or {}
+            values = found.values() if isinstance(found, dict) else found
+            for item in values:
+                if isinstance(item, dict):
+                    signal_map.setdefault(int(item.get("account_id") or 0), item)
     except Exception:  # noqa: BLE001 - 哨兵不可用不影响监测
         signal_map = {}
 
@@ -446,7 +509,8 @@ def overview(days: int = Query(default=1, ge=1, le=30),
         if _full is not None:
             return _usage_section(_full)
 
-    scope_ids = platform_scope.account_ids(db, platform, realm)
+    # 用量口径与 stats/logs 统一（platform 列 ∪ 账号归属）；账号类聚合仍按账号表。
+    scope_ids = _usage_scope(db, platform, realm)
 
     today_start = _day_start(0)
     month_start = _day_start(29)
@@ -464,6 +528,8 @@ def overview(days: int = Query(default=1, ge=1, le=30),
             "window": dict(window, days=days),
             "cache": cache_hit,
             "sections": "usage",
+            "windows": _windows_meta(today_start, window_start, month_start, days),
+            "scopes": _scopes_meta(platform),
             "now": datetime.utcnow().isoformat() + "Z",
         }
         _cache_put(_ck, payload, _ttl_for(days))
@@ -513,7 +579,8 @@ def overview(days: int = Query(default=1, ge=1, le=30),
     # 反面教材（实测过、不要回去）：把三个窗口用 CASE 合成一次扫描，
     # MySQL 上是 **1335ms**，比分开查的 494ms 还慢一倍 —— 因为小窗口本来
     # 只扫几千行，合成后每行都要过 18 个聚合表达式。
-    today = _window(db, today_start, scope_ids)
+    # 「今日」口径下 window 与 today 是同一个区间：直接复用，不再扫第二遍（R1 6.4）。
+    today = dict(window) if window_start == today_start else _window(db, today_start, scope_ids)
     # `window` / `cache_hit` 已经在上面算过（局部刷新共用同一段）；
     # 命中缓存时 `window` 是从缓存里取的 dict，这里补一次 days 字段。
     window = dict(window, days=days)
@@ -523,7 +590,8 @@ def overview(days: int = Query(default=1, ge=1, le=30),
     else:
         month = _cached_month(db, month_start, scope_ids,
                               platform=platform, realm=realm)
-    monitor = _account_monitor(db, scope_ids, platform)
+    # 账号监测按**账号表**收窄：这里要的是账号 id 列表，不是用量条件
+    monitor = _account_monitor(db, platform_scope.account_ids(db, platform, realm), platform)
     # ---- 模型 / Key 计数 ----
     model_query = db.query(func.count(ModelConfig.id)).filter(ModelConfig.enabled == 1)
     if platform:
@@ -559,10 +627,51 @@ def overview(days: int = Query(default=1, ge=1, le=30),
         "cache": cache_hit,
         "monitor": monitor,
         "sections": "all",
+        "windows": _windows_meta(today_start, window_start, month_start, days),
+        "scopes": _scopes_meta(platform),
         "now": datetime.utcnow().isoformat() + "Z",
     }
     _cache_put(_ck, payload, _ttl_for(days))
     return payload
+
+
+def _iso(value: datetime) -> str:
+    return value.isoformat() + "Z"
+
+
+def _windows_meta(today_start: datetime, window_start: datetime,
+                  month_start: datetime, days: int) -> dict:
+    """显式写出概览每段数字的时间窗（N5：一个页面三种口径，前端要能标注）。
+
+    全部是**服务器配置时区的自然日**（默认 Asia/Shanghai 00:00 起，见
+    `rollup.local_offset()`），与 `/api/stats/dashboard?window=day` 同口径；
+    `start` 是对应的 UTC 时刻。
+    """
+    from admin import rollup as rollup_mod
+
+    return {
+        "kind": "natural_day",
+        "tz": rollup_mod.local_tz_name(),
+        "tz_offset_minutes": int(rollup_mod.local_offset().total_seconds() // 60),
+        "today": {"start": _iso(today_start), "days": 1},
+        "window": {"start": _iso(window_start), "days": int(days)},
+        "month": {"start": _iso(month_start), "days": 30},
+        "dashboard_hint": "/api/stats/dashboard?days=%d&window=day" % int(days),
+    }
+
+
+def _scopes_meta(platform: str) -> dict:
+    """每块数据的作用域：`platform` = 跟随 X-Platform；`gateway` = 全网关（N5）。
+
+    前端 `platformScoped` 以这里为准：`keys` 是全局计数，流量带
+    （`/api/stats/dashboard`）与哨兵（`/api/sentinel/*`）也是全网关口径。
+    """
+    scoped = "platform" if platform else "gateway"
+    return {
+        "accounts": scoped, "usage": scoped, "cache": scoped, "monitor": scoped,
+        "models": scoped, "keys": "gateway",
+        "traffic": "gateway", "sentinel": "gateway",
+    }
 
 
 def _usage_section(full: dict) -> dict:
@@ -578,6 +687,8 @@ def _usage_section(full: dict) -> dict:
         "platform_label": full.get("platform_label", ""),
         "window": full.get("window") or {},
         "cache": full.get("cache") or {},
+        "windows": full.get("windows") or {},
+        "scopes": full.get("scopes") or {},
         "sections": "usage",
         "now": full.get("now") or datetime.utcnow().isoformat() + "Z",
     }
