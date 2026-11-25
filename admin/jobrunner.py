@@ -292,13 +292,7 @@ class JobRunner:
 
         # 锁外取租约：try_admit 自己带锁，别在持有 JobRunner 锁时跨锁。
         lease = take_job_lease(parent=parent_lease)
-        if lease is None and admission_closed():
-            # 只有**真正封口**（draining / stopping / stopped / failed）才拒绝派发。
-            # 注意 `try_admit` 只在 PHASE_READY 放行，所以「还没走完启动」
-            # （starting，测试进程与 lifespan 完成前都处在这个阶段）也会拿到
-            # None —— 那不是封口，不能把任务判死：以前这样做的后果是
-            # `/api/accounts/export-async` 永远返回一个 failed 的 Job 且已被
-            # 移出注册表，随后 `/job/{id}` 一律 404「任务不存在或已过期」。
+        if lease is None:
             with self._lock:
                 if self._jobs.get(key) is job:
                     self._jobs.pop(key, None)
