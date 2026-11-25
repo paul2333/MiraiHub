@@ -192,9 +192,18 @@ def _is_free_model(db: Session, platform: str, model_id: str) -> bool:
     return (target, model_id) in _get_free_models_scoped(db)
 
 
-def _is_model_allowed(db: Session, model_id: str) -> bool:
-    """检查模型是否在白名单内。没有任何配置时放行全部（向后兼容）。"""
-    configs = db.query(ModelConfig).all()
+def _is_model_allowed(db: Session, model_id: str, platform: str = "") -> bool:
+    """检查模型是否在白名单内。没有任何配置时放行全部（向后兼容）。
+
+    `platform`：给了就只看该平台的配置（`ModelConfig.platform`）。各平台
+    共用一张模型表、但配置行按平台分开，不给参数时是「任一行启用即算允许」，
+    在某个平台自己的入口里必须按平台收窄 —— 否则 A 平台启用的模型会被
+    当成 B 平台也允许（`routers/proxy.py` 的 workbuddy 选模型就走这条）。
+    """
+    query = db.query(ModelConfig)
+    if platform:
+        query = query.filter(ModelConfig.platform == platform)
+    configs = query.all()
     if not configs:
         return True  # 未配置任何模型规则，放行
     enabled = {m.model_id for m in configs if m.enabled == 1}
