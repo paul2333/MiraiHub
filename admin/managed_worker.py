@@ -50,6 +50,37 @@ EXIT_FAILURE = 1
 _ACTIVE: "ManagedWorker | None" = None
 
 
+def _run_with_loop_factory(coro, factory):
+    """`asyncio.run(coro, loop_factory=...)`，兼容 Python < 3.12。
+
+    `loop_factory` 是 3.12 才加的 kwarg。本仓库要跑在 3.10 / 3.11 上
+    （生产机就是 3.10），直接传会 TypeError：
+
+        run() got an unexpected keyword argument 'loop_factory'
+
+    于是 worker 永远 ready 不了（`test_lifecycle_resume` 就是这么挂的）。
+    低版本走"自己建循环 + asyncio.run"等价路径：语义一致 —— 新建事件循环、
+    设成当前循环、跑完关掉。
+    """
+    if factory is None:
+        return asyncio.run(coro)
+    try:
+        return asyncio.run(coro, loop_factory=factory)
+    except TypeError:
+        # 3.12 以下：手动建循环
+        loop = factory()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:  # noqa: BLE001 - 收尾失败不覆盖退出结果
+                pass
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
 def active_runner() -> "ManagedWorker | None":
     """返回本进程正在运行的运行器（没有则 None）。值不是凭据。"""
     return _ACTIVE
@@ -113,7 +144,8 @@ class ManagedWorker:
         global _ACTIVE
         _ACTIVE = self
         try:
-            return asyncio.run(self.serve(), loop_factory=self.config.get_loop_factory())
+            return _run_with_loop_factory(
+                self.serve(), self.config.get_loop_factory())
         except SystemExit as exc:
             code = exc.code
             logger.info("Uvicorn 以 SystemExit(%r) 结束", code)
