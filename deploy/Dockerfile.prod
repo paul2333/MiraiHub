@@ -17,6 +17,19 @@
 #     --env-file /etc/wb2api/prod.env wb2api:prod
 # ---------------------------------------------------------------------------
 ARG BASE_IMAGE=python:3.12-slim
+
+# ---- 前端构建（admin/ui 源码 → dist）--------------------------------------
+# 生产镜像原来直接 COPY admin，dist 不入库后就不带 v2 控制台，/admin 会静默
+# 退回 v1。这里补一个构建阶段，让白名单构建同样产出 admin/ui/dist。
+FROM node:20-slim AS ui-build
+ARG NPM_REGISTRY=https://registry.npmjs.org
+WORKDIR /ui
+COPY admin/ui/package.json admin/ui/package-lock.json ./
+RUN npm ci --registry=${NPM_REGISTRY}
+COPY admin/ui ./
+RUN npm run build
+
+# ---- 运行时 ---------------------------------------------------------------
 FROM ${BASE_IMAGE}
 
 WORKDIR /app
@@ -39,6 +52,7 @@ RUN pip install -i ${PIP_INDEX_URL} -r requirements.txt
 
 # ---- 服务端代码（白名单）----
 COPY admin ./admin
+COPY --from=ui-build /ui/dist ./admin/ui/dist
 COPY main.py ./main.py
 # 网关协议适配层：/v1/* 的请求体转换与响应投影
 COPY converter.py responses_adapter.py responses_projection.py \
