@@ -37,3 +37,16 @@ def request_ip(request) -> str:
             except ValueError:
                 pass
     return str(peer)
+
+
+def is_trusted_proxy(ip: str) -> bool:
+    """该地址是否在可信代理列表里（IP 或 CIDR，与 request_ip 同一份配置）。
+
+    server._is_https 只在对端是可信代理时才采信 X-Forwarded-Proto。
+    """
+    try:
+        peer = ipaddress.ip_address(normalize_ip(ip))
+    except (ValueError, AttributeError):
+        return False
+    trusted = getattr(settings, 'TRUSTED_PROXY_IPS', os.getenv('ADMIN_TRUSTED_PROXY_IPS', '127.0.0.1,::1'))
+    return any(peer in network for network in _proxy_networks(trusted))
