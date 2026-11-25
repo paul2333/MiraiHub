@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily refresh of Marvis WARP egress IPs
+
+[Timer]
+OnCalendar=*-*-* 04:37:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

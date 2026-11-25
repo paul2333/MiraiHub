@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh Marvis WARP egress IPs (rotate Cloudflare endpoint)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/marvis-egress/refresh_exits.sh
