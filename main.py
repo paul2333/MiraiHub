@@ -283,17 +283,254 @@ def _remove_pidfile() -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# 单实例锁 / 子进程回收
+#
+# 真实事故：每「重启」一次就多留一个 main.py 主管，老主管并不知情，继续在
+# 自己的主循环里重生 uvicorn。现场抓到 12 个主管同时抢 8790：
+#     uvicorn 起 → bind [Errno 10048] → 退出(code=3) → 主管判「崩溃」
+#     → 60s 后再起 → …
+# 而且每个 uvicorn 都要跑完整个 startup（建表 / 预热 SSL / 拉起线程 / 探客户端
+# 版本）才走到 bind 那一步，于是进程数暴涨、CPU 打满、admin.log 被 10048 刷屏。
+#
+# 两道保险都要有：
+#   1. 单实例锁  → 同一端口只有一个主管；后来的接管（结束整棵树）前一个；
+#   2. Job Object → 主管一死（哪怕被 Stop-Process 强杀、收不到 SIGTERM），
+#      uvicorn 立刻被 OS 回收，不会变成占着端口的孤儿。Windows 上
+#      `start_new_session=True` 是**无效参数**（CPython 内部名就叫
+#      unused_start_new_session），所以不能指望它做进程组隔离。
+# ---------------------------------------------------------------------------
+
+#: 锁文件：由内核区域锁持有，进程一死自动释放，不会残留「假锁」。
+#: **按端口分文件** —— 同一项目允许在不同端口上各跑一个实例（调试常用
+#: `--port 8791`），它们不该互相抢锁、互相接管。
+_LOCKFILE = ROOT / ".workbuddy2api.lock"   # 仅作默认值，实际按端口生成
+_lock_fh = None          # 必须持有到进程结束：句柄一关，锁就没了
+_JOB_HANDLE = None
+
+#: 连续崩溃多少次后停止自动重启（真 bug 不该变成无限重启）
+_MAX_CRASHES = 6
+
+
+def _lockfile_for(port: int) -> Path:
+    return _LOCKFILE.with_name(f"{_LOCKFILE.stem}.{port}{_LOCKFILE.suffix}")
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否还活着（任何异常都当作「不活着」）。"""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        out = _run_quiet(["tasklist", "/FI", f"PID eq {pid}", "/NH"], timeout=10.0)
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+#: 锁区占文件前 8 字节，pid 从第 8 字节开始写。
+#: 这样别的进程（以及守护脚本 / 手工排查）可以**跳过锁区**读出持有者 pid，
+#: 而不是被「读整个文件」挡在权限错误上 —— 实测踩过：独占锁让
+#: `_lock_holder_pid()` 永远拿不到 pid，于是「接管旧主管」退化成了「等 25s 超时退出」。
+_LOCK_PAD = 8
+
+
+def _lock_holder_pid(lockfile: Path):
+    """锁文件里记录的持有者 pid（读不到返回 None）。
+
+    只读第 8 字节之后的区域：前 8 字节是锁区，读它会被内核拒掉。
+    """
+    try:
+        fd = os.open(str(lockfile), os.O_RDONLY)
+    except Exception:
+        return None
+    try:
+        # 注意：**不能用 os.pread** —— 它是 Unix-only，Windows 上直接 AttributeError，
+        # 被 except 吞掉之后「读不到持有者 pid」就变成了静默常态。
+        os.lseek(fd, _LOCK_PAD, os.SEEK_SET)
+        raw = os.read(fd, 64).decode("utf-8", "replace").strip().strip("\x00")
+        return int(raw.split()[0]) if raw else None
+    except Exception:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def _try_lock_once(lockfile: Path) -> bool:
+    """非阻塞拿单实例锁；成功后把本进程 pid 写进锁文件。
+
+    用**文件区域锁**而不是 `O_EXCL` 建文件：后者在被强杀时会把锁文件留在原地，
+    下次启动就误以为「已有实例在跑」。区域锁由内核持有，进程一死立即释放。
+    """
+    global _lock_fh
+    try:
+        fd = os.open(str(lockfile), os.O_RDWR | os.O_CREAT, 0o644)
+        fh = os.fdopen(fd, "r+", encoding="utf-8", errors="replace")
+    except Exception:
+        return True          # 锁文件建不出来（只读盘等）不该阻止启动：退化为无锁
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return False
+    _lock_fh = fh
+    try:
+        fh.seek(0)
+        fh.truncate()
+        # 前 8 字节留空当锁区，pid 写在后面 —— 别人能读出持有者，读锁区则会被拒
+        fh.write("\0" * _LOCK_PAD + f"{os.getpid()}\n")
+        fh.flush()
+    except Exception:
+        pass
+    return True
+
+
+def _ensure_single_instance(port: int) -> None:
+    """同一端口只允许一个主管；已有主管则接管（结束整棵树）后启动。
+
+    这就是「`python main.py` 再跑一次 = 重启」的实现：新进程拿到锁之后，
+    旧主管的**整棵树**（含它的 uvicorn）都已经被结束，不可能再重生。
+    此前只杀 uvicorn、不杀主管，正是重启风暴的根源。
+    """
+    lockfile = _lockfile_for(port)
+    if _try_lock_once(lockfile):
+        _log(f"[main] 已获得单实例锁（{lockfile.name}, pid {os.getpid()}）")
+        return
+
+    holder = _lock_holder_pid(lockfile)
+    if holder and holder != os.getpid() and _pid_alive(holder):
+        cmd = _cmdline_of(holder)
+        # 这个锁只有 main.py 会拿，所以「活着的持有者」基本就是本项目主管；
+        # 但仍要认一下解释器 —— 锁文件被别的东西写坏时，不能顺手杀掉无关进程。
+        #
+        # 为什么不能只用 `_looks_like_our_service()` 判：daemon 用
+        # `Start-Process -WorkingDirectory <root> -ArgumentList "main.py"` 拉起，
+        # 命令行里只有相对路径 `main.py`，**不含项目根目录**，严格判据认不出来 ——
+        # 于是「再跑一次 = 重启」会退化成「exit(3) 拒绝启动」。
+        if _is_python_exe(_first_token(cmd)) or _looks_like_our_service(cmd):
+            _log(f"[main] 检测到已在运行的主管 pid {holder}，按「重启」处理：先结束整棵树…")
+            _terminate_tree(holder)
+        else:
+            _log(f"❌ 实例锁被 pid {holder} 持有，但命令行不像本项目：{cmd[:160]}")
+            _log(f"    → 若确认它是残留，删掉锁文件后重试：{lockfile}")
+            sys.exit(3)
+    else:
+        # 锁被占但读不到持有者（旧格式 / 内容损坏）：按命令行兜底清理本项目进程。
+        # 宁可多收一次自己人，也别卡在「等 25s 然后放弃」—— 那是最难解释的启动失败。
+        cands = _our_related_pids()
+        if cands:
+            _log(f"[main] 锁被占用且读不到持有者，按命令行清理本项目进程：{cands}")
+            for _pid in cands:
+                _terminate_tree(_pid)
+        else:
+            _log(f"[main] 锁文件残留（持有者 pid {holder} 已不在），重新获取…")
+
+    deadline = time.time() + 25.0
+    while time.time() < deadline:
+        if _try_lock_once(lockfile):
+            _log(f"[main] 已接管实例锁（pid {os.getpid()}）")
+            return
+        time.sleep(0.5)
+    _log(f"❌ 25s 内拿不到实例锁（{lockfile}），本次不启动。")
+    _log("    → 确认没有别的 main.py 在跑；必要时手动删除该锁文件。")
+    sys.exit(3)
+
+
+def _init_job_object():
+    """Windows：建一个 KILL_ON_JOB_CLOSE 的 Job —— 主管一死，子进程立刻被回收。"""
+    global _JOB_HANDLE
+    if os.name != "nt" or _JOB_HANDLE is not None:
+        return _JOB_HANDLE
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _EXTENDED(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BASIC),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        h = kernel32.CreateJobObjectW(None, None)
+        if not h:
+            return None
+        info = _EXTENDED()
+        info.BasicLimitInformation.LimitFlags = 0x2000      # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(h, 9, ctypes.byref(info),
+                                                ctypes.sizeof(info)):
+            kernel32.CloseHandle(h)
+            return None
+        _JOB_HANDLE = h
+    except Exception:
+        _JOB_HANDLE = None
+    return _JOB_HANDLE
+
+
+def _assign_to_job(proc) -> None:
+    """把子进程放进 Job（Windows）。失败不影响启动。"""
+    h = _init_job_object()
+    if not h or proc is None:
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.AssignProcessToJobObject(h, int(proc._handle))
+    except Exception:
+        pass
+
+
 def _kill_children(procs: list) -> None:
-    """结束所有子进程（含其进程组），确保不留孤儿占着端口。"""
+    """结束所有子进程**及其子孙**，确保不留孤儿占着端口。"""
     for _tag, p in procs:
         try:
             if p.poll() is not None:
                 continue
-            # 子进程以 start_new_session=True 启动，自成进程组 → 整组结束
-            try:
-                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-            except Exception:
-                p.terminate()
+            if os.name == "nt":
+                # /T 连子孙一起收；必须带 /F —— 控制台进程对不带 /F 的
+                # taskkill 通常不响应（会回一句 could not be terminated）。
+                _run_quiet(["taskkill", "/PID", str(p.pid), "/T", "/F"], timeout=20.0)
+            else:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                except Exception:
+                    p.terminate()
         except Exception:
             pass
     # 给一点时间优雅退出，仍存活则强杀
@@ -304,7 +541,10 @@ def _kill_children(procs: list) -> None:
             p.wait(timeout=remain)
         except Exception:
             try:
-                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                if os.name == "nt":
+                    _run_quiet(["taskkill", "/PID", str(p.pid), "/T", "/F"], timeout=15.0)
+                else:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
             except Exception:
                 try:
                     p.kill()
@@ -794,6 +1034,9 @@ def main() -> None:
     # 端口自检：已有实例在跑就明确退出，绝不反复撞端口（线上重启风暴的根因）。
     # 本项目的旧实例会被自动接管（等价于重启）；别人的进程默认不碰，除非 --restart/--force。
     _check_host, _check_port = _resolve_host_port(args)
+    # 单实例锁必须**先于**端口自检：没有它，每次「重启」都会多留一个主管，
+    # 十几个主管各自重生 uvicorn 抢同一个端口 = 无限重启 + 进程爆炸。
+    _ensure_single_instance(_check_port)
     _ensure_port_free(_check_host, _check_port,
                       force=bool(args.restart or args.force))
 
@@ -848,6 +1091,9 @@ def main() -> None:
                 start_new_session=True,
                 text=True, bufsize=1, env=os.environ.copy(),
             )
+        # 塞进 Job：主管一死，这个 uvicorn 会被 OS 立即回收（Windows），
+        # 不会留下占着 8790 的孤儿
+        _assign_to_job(p)
         procs.append((tag, p))
         _launch_specs[tag] = (cmd, port, host, logfile)
         _started_at[tag] = time.monotonic()
@@ -878,7 +1124,8 @@ def main() -> None:
     _log(f"       托管网关   : http://{admin_host}:{admin_port}/v1/chat/completions  (带 Key 配额)")
     _log("[main] 按 Ctrl+C 停止。")
 
-    # 主循环：子进程异常退出则整体退出，避免孤儿进程
+    # 主循环：子进程异常退出则重生 —— 但三种情况必须停手，否则就是重启风暴
+    exit_code = 0
     while not stop.is_set():
         for tag, p in list(procs):
             rc = p.poll()
@@ -888,12 +1135,35 @@ def main() -> None:
             # 子进程退出后自动重生（web 端「重启服务」依赖这个：退出 uvicorn
             # → 这里重新拉起。exe/apk 没有 systemd，之前退出 = 整个服务死）。
             # 崩溃退避：存活 <60s 视为崩溃，连续崩溃指数退避 1→60s；
-            # 稳定运行满 5 分钟计数清零 —— 真 bug 死循环不会刷爆 CPU/日志。
+            # 稳定运行满 5 分钟计数清零。
             if ran < 60:
                 _crashes[tag] = _crashes.get(tag, 0) + 1
             else:
                 _crashes[tag] = 0
             n = _crashes.get(tag, 1)
+
+            # ① 端口已被**另一个实例**占着 —— 重生只会再撞一次 10048。
+            #    事故原型：主管 A 的 uvicorn 被主管 B 接管杀掉，A 不知情，
+            #    每 60s 重生一次，全部 bind 失败，日志被 Errno 10048 刷爆。
+            others = [x for x in _listener_pids(admin_port)
+                      if x not in {q.pid for _t, q in procs}]
+            if others:
+                _log(f"[main] ⚠️ {tag} 已退出 (code={rc})，但端口 {admin_port} "
+                     f"正被 pid {others} 占用 ——")
+                _log("[main]     说明另一个实例已经在服务，本进程不再重生，退出。")
+                exit_code = 4
+                stop.set()
+                break
+
+            # ② 连续崩溃到上限 —— 别再转下去（真 bug 不该变成无限重启）
+            if n > _MAX_CRASHES:
+                _log(f"[main] ❌ {tag} 连续 {n} 次异常退出（code={rc}），已停止自动重启。")
+                _log("[main]    排查：logs/admin.log、logs/service.err.log；"
+                     "修好后重新运行 python main.py")
+                exit_code = 5
+                stop.set()
+                break
+
             backoff = min(60.0, 2.0 ** (n - 1)) if n > 1 else 1.0
             _log(f"[main] ⚠️ {tag} 已退出 (code={rc}, 存活 {ran:.0f}s)"
                  f"{'，判定为崩溃' if ran < 60 else ''}，{backoff:.0f}s 后自动重启（第 {n} 次）…")
@@ -911,6 +1181,9 @@ def main() -> None:
     _kill_children(procs)
     _remove_pidfile()
     _log("[main] 已停止。")
+    if exit_code:
+        # 4 = 端口被别的实例占着（本进程主动让位）；5 = 连续崩溃熔断
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@
 - 请求数则统计全部调用（含失败），用于反映真实负载。
 """
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -147,7 +148,7 @@ def _model_pool_stats_agg(db: Session, model: str):
         usable = (a.status == "active" and not cooling and row is None
                   and not _looks_login_dead(a, now)
                   and (free or (a.balance_remain or 0) > 0)
-                  and not POOL.inflight.full(POOL.key_for(a), POOL.limit_for(a)))
+                  and not POOL.inflight.full(a.uid or "", settings.MAX_IN_FLIGHT))
         entry = {"id": a.id, "name": a.name or a.uid or f"#{a.id}",
                  "uid": (a.uid or "")[:12], "status": a.status,
                  "usable": usable, "cooling": cooling,
@@ -910,40 +911,143 @@ def dashboard_stats(
     )
 
 
+#: 模型广场时段状态的阈值。前端配色与图例只认这几个状态名，不再自己判一遍。
+#:   up   绿 —— 这一格有成功调用，成功率 ≥ 99.5%
+#:   warn 黄 —— 有调用但成功率 97%~99.5%，抖过
+#:   down 红 —— 有调用但成功率 < 97%，这一格基本用不了
+#:   off  红描边 —— 这一格没有请求、但有账号在冷却（确定性不可用）
+#:   idle 灰 —— 没有请求也没有冷却记录（没流量 ≠ 坏了）
+_MARKET_UP_RATE = 0.995
+_MARKET_WARN_RATE = 0.97
+#: 中国没有夏令时，固定 +08:00 就是准确值（与 model_limits.CN_TIME 同口径）。
+_CN_OFFSET = timedelta(hours=8)
+
+
+def _market_bucket_size(hours: int) -> int:
+    """一格多宽：始终铺 24~29 格，且只用 1/2/3/4/6 小时整档。
+
+    为什么不让 7 天也按 1 小时铺 168 格：卡片上的色块最小约 3px，168 格在
+    300px 宽的卡里会糊成一条渐变带，反而看不出「几点坏了」—— 状态轴的意义
+    是「一眼找到坏的那格」，不是把原始小时数全倒出来。
+    """
+    for limit, size in ((24, 1), (48, 2), (72, 3), (96, 4), (168, 6)):
+        if hours <= limit:
+            return size
+    return 6
+
+
+def _market_grid(end: datetime, hours: int, bucket_hours: int):
+    """按**北京时间**切格，返回 `[(start_utc, end_utc)]`（旧→新，半开区间）。
+
+    为什么要换时区：格子边界必须落在本地整点。直接按 UTC 切，3 小时档会得到
+    17:00 / 20:00 这类标签，用户没法把它和「早上 8 点那格」对上。
+    """
+    step = timedelta(hours=bucket_hours)
+    local_end = end + _CN_OFFSET
+    anchor = local_end.replace(minute=0, second=0, microsecond=0)
+    anchor = anchor.replace(hour=(anchor.hour // bucket_hours) * bucket_hours)
+    align_end = anchor + step
+    # ⚠️ 两端必须在**同一个时区系**里相减：混用本地时间与 UTC 会凭空多出 8 小时，
+    # 24 小时窗口切成 33 格 —— 这个坑第一版就踩了（格数看起来像「多出来一段」）。
+    local_start = end - timedelta(hours=hours) + _CN_OFFSET
+    span = align_end - local_start
+    count = max(1, int(math.ceil(span.total_seconds() / step.total_seconds())))
+    first = align_end - step * count
+    return [((first + step * i) - _CN_OFFSET,
+             (first + step * (i + 1)) - _CN_OFFSET) for i in range(count)]
+
+
+def _market_bucket_text(lo: datetime, hi: datetime, bucket_hours: int):
+    """一格的短标签 + 完整区间（都按北京时间显示）。"""
+    local_lo = lo + _CN_OFFSET
+    local_hi = hi + _CN_OFFSET
+    if bucket_hours >= 24:
+        return local_lo.strftime("%m-%d"), local_lo.strftime("%m-%d") + " 全天"
+    label = local_lo.strftime("%H:%M")
+    left = local_lo.strftime("%m-%d %H:%M")
+    right = (local_hi.strftime("%H:%M") if local_hi.date() == local_lo.date()
+             else local_hi.strftime("%m-%d %H:%M"))
+    return label, left + "–" + right
+
+
+def _cell_coverage(lo: datetime, hi: datetime, start: datetime, end: datetime) -> float:
+    """一格有多少落在统计窗口里（0~1）。
+
+    首尾两格常常是「半格」：窗口起点落在 18:57，第一格 18:00–19:00 只有 3 分钟
+    有数据。前端据此把那格画淡，不让人误以为它也统计满了一小时。
+    """
+    span = (hi - lo).total_seconds()
+    if span <= 0:
+        return 0.0
+    inner = (min(hi, end) - max(lo, start)).total_seconds()
+    return round(max(0.0, min(1.0, inner / span)), 4)
+
+
+def _market_slot() -> dict:
+    return {"requests": 0, "successes": 0, "tokens": 0, "credits": 0.0,
+            "latency_sum": 0, "latency_count": 0,
+            "ttfb_sum": 0, "ttfb_count": 0, "tps_sum": 0.0, "tps_count": 0}
+
+
 @router.get("/model-market")
 def model_market(hours: int = Query(default=24, ge=1, le=168),
+                 bucket_hours: int = Query(default=0, ge=0, le=24),
                  _: bool = Depends(require_admin),
                  db: Session = Depends(get_db)):
     """模型广场：**每个模型一张卡**要的全部数字（参考 new-api 的模型广场）。
 
-    卡片上要的是「这东西现在能不能用、多少钱、快不快」。数据来源三处：
+    卡片上要的是「这东西现在能不能用、多少钱、快不快」。数据来源四处：
 
       · 近 N 小时用量 —— 小时汇总表（`usage_rollups`），只读几行；
+      · 时段状态轴 —— 同一批小时行按格折叠，一格一个状态（见 `_MARKET_*`）；
       · 定价 —— `model_configs.credit_multiplier`（0 = 免费）；
       · 可用性 —— 活跃账号数 − 该模型当前处于冷却的账号数。
 
-    返回按**归一后的模型**聚合（同一个模型在多平台是同一个模型，价格与可用性
-    分平台列在 `platforms` 里），前端据此画卡片/列表。
+    **状态轴的判据**：先用真实请求说话（有流量就按成功率给 up/warn/down），
+    只有「这一格没有请求」时才用冷却记录区分 off（确定不可用）与 idle（没流量）。
+    冷却表没有开始时间，用 `updated_at` 当起点，所以它只做兜底、不做主证据。
+
+    `bucket_hours` 显式指定格的宽度；不传就按窗口自动挑（24h→1 格 1 小时，
+    7 天→6 小时），保证格数落在 24 上下。
     """
     from admin import rollup as rollup_mod
     from admin.model_alias import canonical_key, display_name
 
     hours = max(1, min(int(hours or 24), 168))
-    end = datetime.utcnow()
-    start = end - timedelta(hours=hours)
+    step = int(bucket_hours or 0) or _market_bucket_size(hours)
+    step = max(1, min(step, 24))
+    now = datetime.utcnow()
+    grid = _market_grid(now, hours, step)
+    grid_start = grid[0][0]
+    # 统计窗口仍然是正好 `hours` 小时；网格只负责「把窗口切成整点的格」。
+    # 两端那格因此可能只覆盖一部分（partial），这是刻意的：宁可标出来，
+    # 也不要为了凑整把窗口偷偷拉长一小时（卡片上「24h 请求」必须真的 24h）。
+    start = max(grid_start, now - timedelta(hours=hours))
+    end = min(now, grid[-1][1])
+    slots = len(grid)
+    labels_for = [_market_bucket_text(lo, hi, step) for lo, hi in grid]
 
     def _compute():
         labels = platform_labels(db)
         model_labels = _model_display_map(db)
+
+        def _pull(covered):
+            # `iter_buckets` 是生成器：异常可能发生在**迭代时**（不是创建时），
+            # 所以在 list() 外面兜住，才能真正退回原表。
+            return list(rollup_mod.iter_buckets(db, start, end, covered))
+
         try:
             rollup_mod.ensure_coverage(db, budget=0.4)
             covered = rollup_mod.coverage(db)
-            rows = rollup_mod.window_rows(db, start, end, covered)
+            rows = _pull(covered)
             source = "rollup"
         except Exception as exc:  # noqa: BLE001 - 汇总层故障时退回原表
             logger.warning("模型广场读汇总表失败，降级原表：%s", exc)
-            covered = (None, None)
-            rows = rollup_mod.window_rows(db, start, end, covered)
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            rows = _pull((None, None))
             source = "raw"
 
         # 定价（同模型可能多个平台不同价，全部列出来）
@@ -966,40 +1070,43 @@ def model_market(hours: int = Query(default=24, ge=1, le=168),
         from admin.models import Account, AccountModelCooldown
 
         active: dict[str, int] = {}
-        now = datetime.utcnow()
+        reference = datetime.utcnow()
         for platform, count in db.query(Account.platform, func.count(Account.id)).filter(
                 Account.status == "active",
-                or_(Account.cool_until.is_(None), Account.cool_until <= now)).group_by(
+                or_(Account.cool_until.is_(None), Account.cool_until <= reference)).group_by(
                 Account.platform).all():
             active[(platform or "").lower()] = int(count or 0)
         exhausted: dict[str, int] = {}
         for model_name, count in db.query(
                 AccountModelCooldown.model, func.count(AccountModelCooldown.id)).filter(
-                AccountModelCooldown.until > now).group_by(
+                AccountModelCooldown.until > reference).group_by(
                 AccountModelCooldown.model).all():
             exhausted[model_name or ""] = int(count or 0)
 
+        # ── 按格折叠 ────────────────────────────────────────────────────────
         items: dict[str, dict] = {}
-        for (plat, mid), values in rows.items():
+        for hour, plat, mid, values in rows:
             key = canonical_key(mid, model_labels.get(mid) or "")
-            entry = items.setdefault(key, {
-                "key": key,
-                "name": display_name(key, model_labels.get(mid) or mid or "未知模型"),
-                "requests": 0, "successes": 0, "tokens": 0, "credits": 0.0,
-                "latency_sum": 0, "latency_count": 0,
-                "ttfb_sum": 0, "ttfb_count": 0, "completion_tokens": 0,
-                "tps_sum": 0.0, "tps_count": 0,
-                "platforms": set(), "models": set(),
-            })
-            for name in ("requests", "successes", "tokens", "credits",
-                         "latency_sum", "latency_count", "ttfb_sum",
-                         "ttfb_count", "completion_tokens", "tps_sum", "tps_count"):
-                entry[name] += values.get("total_tokens" if name == "tokens" else name) or 0
+            entry = items.get(key)
+            if entry is None:
+                entry = items[key] = {
+                    "key": key,
+                    "name": display_name(key, model_labels.get(mid) or mid or "未知模型"),
+                    "slots": [_market_slot() for _ in range(slots)],
+                    "platforms": set(), "models": set(),
+                }
+            pos = int((hour - grid_start).total_seconds() // (step * 3600))
+            if 0 <= pos < slots:
+                slot = entry["slots"][pos]
+                for name in ("requests", "successes", "latency_sum", "latency_count",
+                             "ttfb_sum", "ttfb_count", "tps_sum", "tps_count",
+                             "credits", "tokens"):
+                    slot[name] += values.get("total_tokens" if name == "tokens" else name) or 0
             entry["platforms"].add(plat)
             entry["models"].add(mid)
 
         # 已配置但窗口内没有流量的模型也要出现在广场里（显示「0 次调用」），
-# 否则用户会以为「这个模型没被收录」。
+        # 否则用户会以为「这个模型没被收录」。
         for key, prices in pricing.items():
             if key in items:
                 continue
@@ -1007,22 +1114,73 @@ def model_market(hours: int = Query(default=24, ge=1, le=168),
             items[key] = {
                 "key": key,
                 "name": display_name(key, model_labels.get(first) or first or "未知模型"),
-                "requests": 0, "successes": 0, "tokens": 0, "credits": 0.0,
-                "latency_sum": 0, "latency_count": 0,
-                "ttfb_sum": 0, "ttfb_count": 0, "completion_tokens": 0,
-                "tps_sum": 0.0, "tps_count": 0,
+                "slots": [_market_slot() for _ in range(slots)],
                 "platforms": {item["platform"] for item in prices},
                 "models": {item["model_id"] for item in prices},
             }
 
+        # 冷却记录 → 每格「几个账号在冷却」。只在无流量的格子上用（见 _compute 注释）。
+        cooling: dict[str, list] = {}
+        cool_rows = db.query(AccountModelCooldown.model,
+                             AccountModelCooldown.updated_at,
+                             AccountModelCooldown.until).filter(
+            AccountModelCooldown.until > start).all()
+        for mid, since, until in cool_rows:
+            key = canonical_key(mid or "", model_labels.get(mid) or "")
+            arr = cooling.get(key)
+            if arr is None:
+                arr = cooling[key] = [0] * slots
+            lo = since or ((until or start) - timedelta(hours=1))
+            hi = until or end
+            for pos, (b_lo, b_hi) in enumerate(grid):
+                if lo < b_hi and hi > b_lo:
+                    arr[pos] += 1
+
         out = []
         for key, entry in items.items():
-            req = int(entry["requests"])
-            ok = int(entry["successes"])
             prices = pricing.get(key, [])
             platforms = sorted(entry["platforms"])
             capacity = sum(active.get(plat, 0) for plat in platforms) if platforms else 0
             blocked = sum(exhausted.get(mid, 0) for mid in entry["models"])
+            cool_cells = cooling.get(key) or [0] * slots
+
+            timeline = []
+            total = _market_slot()
+            counts = {"ok": 0, "warn": 0, "down": 0, "off": 0, "idle": 0}
+            for pos, (b_lo, b_hi) in enumerate(grid):
+                slot = entry["slots"][pos]
+                for name, value in slot.items():
+                    total[name] += value
+                req = int(slot["requests"])
+                ok = int(slot["successes"])
+                rate = (ok / req) if req else None
+                cool = int(cool_cells[pos])
+                if req:
+                    state = ("up" if rate >= _MARKET_UP_RATE
+                             else "warn" if rate >= _MARKET_WARN_RATE else "down")
+                    counts["ok" if state == "up" else ("warn" if state == "warn" else "down")] += 1
+                elif cool:
+                    state = "off"
+                    counts["off"] += 1
+                else:
+                    state = "idle"
+                    counts["idle"] += 1
+                timeline.append({
+                    "state": state,
+                    "requests": req,
+                    "success_rate": round(rate, 4) if rate is not None else None,
+                    "avg_latency_ms": (int(round(slot["latency_sum"] / slot["latency_count"]))
+                                       if slot["latency_count"] else 0),
+                    "tokens": int(slot["tokens"]),
+                    "credits": round(float(slot["credits"]), 4),
+                    "cooling": cool,
+                    "coverage": _cell_coverage(b_lo, b_hi, start, end),
+                    "partial": b_lo < start or b_hi > end,
+                })
+
+            measured = counts["ok"] + counts["warn"] + counts["down"]
+            req = int(total["requests"])
+            ok = int(total["successes"])
             out.append({
                 "key": key,
                 "name": entry["name"],
@@ -1031,20 +1189,30 @@ def model_market(hours: int = Query(default=24, ge=1, le=168),
                 "models": sorted(entry["models"]),
                 "requests": req,
                 "success_rate": round(ok / req, 4) if req else None,
-                "tokens": int(entry["tokens"]),
-                "credits": round(float(entry["credits"]), 4),
-                "avg_latency_ms": (int(round(entry["latency_sum"] / entry["latency_count"]))
-                                   if entry["latency_count"] else 0),
-                "avg_ttfb_ms": (int(round(entry["ttfb_sum"] / entry["ttfb_count"]))
-                                if entry["ttfb_count"] else 0),
-                "tps": (round(entry["tps_sum"] / entry["tps_count"], 2)
-                        if entry["tps_count"] else 0.0),
+                "tokens": int(total["tokens"]),
+                "credits": round(float(total["credits"]), 4),
+                "avg_latency_ms": (int(round(total["latency_sum"] / total["latency_count"]))
+                                   if total["latency_count"] else 0),
+                "avg_ttfb_ms": (int(round(total["ttfb_sum"] / total["ttfb_count"]))
+                                if total["ttfb_count"] else 0),
+                "tps": (round(total["tps_sum"] / total["tps_count"], 2)
+                        if total["tps_count"] else 0.0),
                 "pricing": prices,
                 "free": bool(prices) and all(item["free"] for item in prices),
                 "min_multiplier": min((item["multiplier"] for item in prices), default=0.0),
                 "active_accounts": capacity,
                 "exhausted_accounts": blocked,
                 "available": bool(prices) and (capacity - blocked > 0),
+                # `available` 需要「有定价」才成立（没定价就没法说它「能用」）。
+                # 前端要区分「没配置价格」和「账号都不可用」，所以单列一个配置位。
+                "configured": bool(prices),
+                # 时段状态轴：一格一个状态，长度 = `buckets` 的长度。
+                "timeline": timeline,
+                "cells": counts,
+                # 可用率 = 有流量的格里「没掉到 97% 以下」的占比（分母只含有流量的格）。
+                "uptime": (round((counts["ok"] + counts["warn"]) / measured, 4)
+                           if measured else None),
+                "measured_cells": measured,
             })
 
         out.sort(key=lambda item: (-item["requests"], item["name"]))
@@ -1052,13 +1220,20 @@ def model_market(hours: int = Query(default=24, ge=1, le=168),
             "window_hours": hours,
             "start": start.isoformat() + "Z",
             "end": end.isoformat() + "Z",
+            # 状态轴的格定义：前端只消费这一份，不自己再推一遍时间边界。
+            "bucket_hours": step,
+            "buckets": [{"label": labels_for[i][0], "tip": labels_for[i][1],
+                         "start": lo.isoformat() + "Z", "end": hi.isoformat() + "Z",
+                         "coverage": _cell_coverage(lo, hi, start, end),
+                         "partial": lo < start or hi > end}
+                        for i, (lo, hi) in enumerate(grid)],
             "source": source,
             "items": out,
             "total": len(out),
             "available_models": sum(1 for item in out if item["available"]),
         }
 
-    key = _shared_cache_key("model_market", (hours,))
+    key = _shared_cache_key("model_market", (hours, step))
     return _shared_cached(key, _compute, ttl=30.0)
 
 

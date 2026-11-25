@@ -210,6 +210,23 @@ def refresh(acc_id: int, _: bool = Depends(require_admin),
         raise HTTPException(404, detail=str(exc)) from exc
 
 
+@router.post("/models/sync")
+def sync_models(realm: str = "", limit: int | None = None,
+                _: bool = Depends(require_admin),
+                db: Session = Depends(get_db)):
+    """重新拉一遍每个号的 `/models`，刷新「账号 × 模型」能力快照。
+
+    Loomy 的模型目录是**按号**的：同一个池子里有的号只有 `spark-x2.6-*`，
+    有的号才有 `DeepSeek-V4.1-Flash`。而它对「这个号没有这个模型」不报错，
+    而是拿默认模型顶包 —— 网关只能靠快照在**建连之前**把错号排掉，
+    否则每个错号都要白等一次首包（实测 3~25 秒）。
+
+    网关侧也有 30 分钟自动刷新；这个接口用于「刚开通了某个模型，想马上生效」。
+    """
+    return loomy_accounts.sync_models(
+        db, realm=_realm_or_400(realm), limit=limit)
+
+
 @router.post("/accounts/{acc_id}/test")
 def test(acc_id: int, _: bool = Depends(require_admin),
          db: Session = Depends(get_db)):
