@@ -656,6 +656,26 @@ def _platform_runner(task: str, schedule):
         return None
 
 
+def _schedule_realm(schedule) -> str:
+    """任务绑定的区（N-9，纯函数）：`cn` / `intl` / `""`（不限区）。
+
+    优先读 `schedules.realm` 列（2026-11-24 新增）；任务直接绑在区级对外 id
+    （`trae-intl` / `qoder-cn`）上时从 platform 推断；`domain` 是历史写法，只作兜底。
+    """
+    if schedule is None:
+        return ""
+    bound = str(getattr(schedule, "realm", "") or "").strip().lower()
+    if not bound:
+        plat = str(getattr(schedule, "platform", "") or "").strip().lower()
+        if plat.endswith("-intl"):
+            bound = "intl"
+        elif plat.endswith("-cn"):
+            bound = "cn"
+    if not bound:
+        bound = str(getattr(schedule, "domain", "") or "").strip().lower()
+    return bound if bound in ("cn", "intl") else ""
+
+
 def register_task(name: str, runner) -> None:
     """供平台模块登记自己的任务执行器。
 
@@ -1200,8 +1220,14 @@ def growth_eligible(accounts):
 
     判据与 `converter.ClientManager.is_enterprise()` 一致：读落库的
     `enterprise_id`，不额外发请求。
+
+    同时过滤掉**非 WorkBuddy 账号**（修复批次 3 · D2）：签到 / 成长任务 /
+    猫猫旅行都是 WorkBuddy 专属玩法，调用方漏了平台条件时这里兜底。
     """
-    return [a for a in accounts if not (getattr(a, "enterprise_id", "") or "").strip()]
+    from admin.platform.workbuddy import scoping as wb_scope
+
+    return [a for a in accounts
+            if not (getattr(a, "enterprise_id", "") or "").strip() and wb_scope.is_workbuddy(a)]
 
 
 def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
@@ -1387,7 +1413,8 @@ def run_trae_checkin(db, schedule: "Schedule | None" = None) -> dict:
     if schedule is not None:
         # 任务若绑定了 Trae 国际版，直接说明「该平台不支持签到」，
         # 而不是打一次必然失败的上游请求。
-        realm = str(getattr(schedule, "domain", "") or "cn") or "cn"
+        #
+        realm = _schedule_realm(schedule) or "cn"
     if realm == "intl":
         return {"task": "trae_checkin", "ok": True, "total": 0,
                 "claimed": 0, "skipped_already": 0, "failed": 0, "credit": 0,
@@ -1489,7 +1516,69 @@ def _checkin_summary(r: dict) -> str:
 
 
 
+#: 单个任务执行异常后的退避（分钟）。原来异常冒到 `_loop` 后 next_run_at 不推进，
+#: 15 秒后同一个任务再次到期、再次全量执行 —— 对上游是热循环（审查 C-3）。
+_FAILURE_BACKOFF_MINUTES = 5
+
+
 def _run_one(s: Schedule, db, now: datetime):
+    """认领 → 复核仍到期 → 执行（修复批次 3 · D6）。
+
+    认领见 `admin.schedule_claim`：手动执行、多 worker、换代重叠时同一个任务
+    只会有一处在跑。任何异常都在这里记日志、回滚、按 `_FAILURE_BACKOFF_MINUTES`
+    推后 next_run_at，不再冒到 `_loop` 里被静默吞掉、也不再拖垮本轮后面的任务。
+    """
+    from admin import schedule_claim
+
+    sid = s.id
+    task = s.task
+    try:
+        claim = schedule_claim.try_claim(sid, source="scheduler")
+    except Exception:  # noqa: BLE001 - 认领失败（多半是库不可用）就跳过本轮
+        _logger.exception("定时任务认领失败，本轮跳过 id=%s task=%s", sid, task)
+        return
+    if claim is None:
+        _logger.info("定时任务正在别处执行，本轮跳过 id=%s task=%s", sid, task)
+        return
+    try:
+        # 重新读一次：别的进程 / 手动执行可能刚跑完、已把 next_run_at 推后。
+        # 先 commit 结束当前事务 —— MySQL REPEATABLE READ 下才能读到别人刚提交的值。
+        try:
+            db.commit()
+            db.refresh(s)
+        except Exception:  # noqa: BLE001 - 任务被删了 / 读失败：本轮不跑
+            _logger.info("定时任务复核读取失败，本轮跳过 id=%s task=%s", sid, task, exc_info=True)
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if not s.enabled or (s.next_run_at is not None and s.next_run_at > now):
+            return
+        _run_one_body(s, db, now)
+    except Exception as exc:  # noqa: BLE001 - 单个任务失败不影响调度循环
+        _logger.exception("定时任务执行异常 id=%s task=%s（%d 分钟后重试）",
+                          sid, task, _FAILURE_BACKOFF_MINUTES)
+        try:
+            db.rollback()
+            row = db.get(Schedule, sid)
+            if row is not None:
+                row.last_result = json.dumps(
+                    {"ok": False, "error": _short_error(exc)}, ensure_ascii=False)[:2000]
+                row.last_run_at = now
+                row.next_run_at = datetime.utcnow() + timedelta(minutes=_FAILURE_BACKOFF_MINUTES)
+                db.commit()
+        except Exception:  # noqa: BLE001
+            _logger.exception("定时任务异常结果落库失败 id=%s", sid)
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        claim.release()
+
+
+def _run_one_body(s: Schedule, db, now: datetime):
     from admin.pool import POOL
     if POOL.waf.active() and s.task != "keepalive_tokens":
         s.next_run_at = now + timedelta(seconds=max(15, POOL.waf.remaining()))
@@ -1558,6 +1647,14 @@ def _run_one(s: Schedule, db, now: datetime):
         result = run_task(s.task, db, s)
         s.last_result = _dump_result(result)
     except Exception as e:  # 单个任务失败不影响调度循环
+        _logger.exception("定时任务失败 id=%s task=%s", s.id, s.task)
+        # 任务内部可能把会话留在失败状态（如 IntegrityError），紧接着的 commit
+        # 会抛 PendingRollbackError。先探一下：会话健康就保留任务已做的写入
+        # （与原行为一致），坏了才回滚。
+        try:
+            db.flush()
+        except Exception:  # noqa: BLE001
+            db.rollback()
         s.last_result = json.dumps(
             {"ok": False, "error": _short_error(e)}, ensure_ascii=False)[:2000]
     s.last_run_at = now
@@ -1571,38 +1668,86 @@ def _run_one(s: Schedule, db, now: datetime):
 _last_platform_seed = 0.0
 
 
+#: 调度循环每轮之间的等待（秒）。
+_ROUND_SLEEP = 15.0
+#: 封口后跳过派发时的等待：比正常轮询短一些，恢复（若有）能更快接上。
+_CLOSED_SLEEP = 5.0
+
+
+def _scheduler_round(db) -> dict:
+    """调度器的一轮：封口后跳过新派发；真派发时整轮持有 job 租约。
+
+    为什么必须这样切（优雅退出任务 2）：
+
+    * **封口后跳过新派发**：服务已经在排空，再起一批上游任务只会让排空永远
+      等不到零；而且这一批会与新实例抢同一个号池。
+    * **只在真正派发的那一轮取 job 租约**：租约覆盖「已经开始的有限写入」，
+      写完（含异常）立刻释放，于是 wait_empty() 会等它，但不会因为
+      「调度线程一直活着」而永远等不到零 —— 常驻循环本身绝不算一个 Job。
+    * 取租约与封口之间还有竞态窗口：take_job_lease() 返回 None 时本轮
+      什么都不做（绝不运行没被计数的工作）。
+
+    返回 {"due": 到期数, "dispatched": 实际派发数, "reason": idle|closed|ok}，
+    测试与诊断都读这三个字段。
+    """
+    from admin import jobrunner
+
+    if jobrunner.admission_closed():
+        return {"due": 0, "dispatched": 0, "reason": "closed"}
+
+    now = datetime.utcnow()
+    global _last_platform_seed
+    if time.monotonic() - _last_platform_seed > 900:
+        _last_platform_seed = time.monotonic()
+        try:
+            ensure_platform_schedules(db)
+        except Exception:  # noqa: BLE001 - 兜底失败不能停调度
+            _logger.exception("平台定时任务兜底补种失败")
+    schedules = db.query(Schedule).filter(Schedule.enabled == 1).all()
+    # 先启动独立的成长巡检线程，再执行原有同步任务。旧的一次性
+    # 成长任务可能很长，不能让它拖延已经到期的每日活跃巡检。
+    schedules.sort(key=lambda s: s.task != "run_growth_plan")
+    due = [s for s in schedules if s.next_run_at is None or s.next_run_at <= now]
+    if not due:
+        return {"due": 0, "dispatched": 0, "reason": "idle"}
+
+    lease = jobrunner.take_job_lease()
+    if lease is None:
+        _logger.info("调度轮次遇封口，跳过 %d 个到期任务", len(due))
+        return {"due": len(due), "dispatched": 0, "reason": "closed"}
+    try:
+        for s in due:
+            _run_one(s, db, now)
+    finally:
+        jobrunner.release_job_lease(lease)
+    return {"due": len(due), "dispatched": len(due), "reason": "ok"}
+
+
 def _loop():
     while True:
+        from admin import jobrunner
+
+        if jobrunner.admission_closed():
+            # 封口后跳过新派发：也不再为「只是看一眼有没有到期」去开数据库会话。
+            time.sleep(_CLOSED_SLEEP)
+            continue
         db = None
         try:
             db = SessionLocal()
-            now = datetime.utcnow()
-            global _last_platform_seed
-            if time.monotonic() - _last_platform_seed > 900:
-                _last_platform_seed = time.monotonic()
-                try:
-                    ensure_platform_schedules(db)
-                except Exception:  # noqa: BLE001 - 兜底失败不能停调度
-                    _logger.exception("平台定时任务兜底补种失败")
-            schedules = db.query(Schedule).filter(Schedule.enabled == 1).all()
-            # 先启动独立的成长巡检线程，再执行原有同步任务。旧的一次性
-            # 成长任务可能很长，不能让它拖延已经到期的每日活跃巡检。
-            schedules.sort(key=lambda s: s.task != "run_growth_plan")
-            for s in schedules:
-                if s.next_run_at is None or s.next_run_at <= now:
-                    _run_one(s, db, now)
+            _scheduler_round(db)
         except Exception:
-            # 数据库短暂不可用（如 MySQL 重启）时静默跳过本轮，下一轮再试。
+            # 数据库短暂不可用（如 MySQL 重启）时跳过本轮，下一轮再试。
             # 原先的写法在 `SessionLocal()` 本身抛异常时会引用未赋值的 db，
             # 让异常从 except 块里再次抛出并终止调度线程。
-            pass
+            # 必须留日志（审查 C-3）：原来 `pass` 一行不留，任务整轮中断无从排查。
+            _logger.warning("调度轮次异常，下一轮重试", exc_info=True)
         finally:
             if db is not None:
                 try:
                     db.close()
                 except Exception:
                     pass
-        time.sleep(15)
+        time.sleep(_ROUND_SLEEP)
 
 
 def seed_defaults(db):
@@ -1658,10 +1803,19 @@ def ensure_growth_plan_schedule(db):
 
 def start_growth_plan(schedule, db):
     """独立后台线程执行，立即运行按钮和调度循环均无需等待整批账号。"""
+    from admin import jobrunner
     from admin.growth_plan import _Lease, run_growth_plan
+
+    # 这份工作会脱离请求/调度轮次跑到线程里，所以租约要在**启动线程之前**取。
+    # 已封口时返回 None：本轮不派发（已经开始的巡检自己跑完并释放）。
+    job_lease = jobrunner.take_job_lease()
+    if job_lease is None:
+        return {"task": "run_growth_plan", "ok": True, "deferred": True,
+                "summary": "服务正在排空，本轮不派发成长巡检"}
     lease = _Lease(db)
     if not lease.acquire():
         # 不覆盖正在执行的进度；略延后其它同类型任务，避免每15秒重复调度。
+        jobrunner.release_job_lease(job_lease)
         if schedule.next_run_at is None or schedule.next_run_at <= datetime.utcnow():
             schedule.next_run_at = datetime.utcnow() + timedelta(minutes=1)
             db.commit()
@@ -1680,40 +1834,49 @@ def start_growth_plan(schedule, db):
     except Exception:
         db.rollback()
         lease.release()
+        jobrunner.release_job_lease(job_lease)
         raise
 
-    def worker():
-        with SessionLocal() as worker_db:
-            worker_lease = _Lease(worker_db)
-            worker_lease.value = lease_value
+    def worker(job_lease):
+        # 线程边界**显式接收**租约：谁启动线程谁交出所有权，线程自己在 finally
+        # 里释放 —— 正常结束与异常都走同一条路径。
+        try:
+            with SessionLocal() as worker_db:
+                worker_lease = _Lease(worker_db)
+                worker_lease.value = lease_value
 
-            def progress(result):
+                def progress(result):
+                    row = worker_db.get(Schedule, sid)
+                    if row:
+                        row.last_result = _dump_result(result)
+                        worker_db.commit()
+
+                try:
+                    result = run_growth_plan(worker_db, progress=progress, lease=worker_lease)
+                except Exception as exc:
+                    worker_db.rollback()
+                    worker_lease.release()
+                    result = {"ok": False, "error": f"成长巡检失败（{type(exc).__name__}）"}
                 row = worker_db.get(Schedule, sid)
                 if row:
+                    # 刷新以保留执行期间用户修改的间隔/启停配置。
+                    worker_db.refresh(row)
                     row.last_result = _dump_result(result)
+                    finished = datetime.utcnow()
+                    row.next_run_at = (finished + timedelta(minutes=1) if result.get("pending")
+                                       else next_run_at(row, finished))
                     worker_db.commit()
+        finally:
+            jobrunner.release_job_lease(job_lease)
 
-            try:
-                result = run_growth_plan(worker_db, progress=progress, lease=worker_lease)
-            except Exception as exc:
-                worker_db.rollback()
-                worker_lease.release()
-                result = {"ok": False, "error": f"成长巡检失败（{type(exc).__name__}）"}
-            row = worker_db.get(Schedule, sid)
-            if row:
-                # 刷新以保留执行期间用户修改的间隔/启停配置。
-                worker_db.refresh(row)
-                row.last_result = _dump_result(result)
-                finished = datetime.utcnow()
-                row.next_run_at = (finished + timedelta(minutes=1) if result.get("pending")
-                                   else next_run_at(row, finished))
-                worker_db.commit()
-
-    thread = threading.Thread(target=worker, daemon=True, name="wb-growth-plan")
+    thread = threading.Thread(target=worker, args=(job_lease,), daemon=True,
+                              name="wb-growth-plan")
     try:
         thread.start()
     except Exception:
+        # 线程没起来：进程内租约与数据库租约都在同一条所有权上，就地释放。
         lease.release()
+        jobrunner.release_job_lease(job_lease)
         schedule.last_result = _dump_result({"ok": False, "error": "成长巡检线程启动失败"})
         db.commit()
         raise
@@ -2274,6 +2437,7 @@ def start_scheduler():
         if _scheduler_started:
             return
         _scheduler_started = True
+    db = None
     try:
         db = SessionLocal()
         seed_defaults(db)
@@ -2301,9 +2465,14 @@ def start_scheduler():
         db.commit()
         from admin.growth_center import import_last_run
         import_last_run(db)
-        db.close()
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 - 播种失败不能挡住调度线程，但必须留痕
+        _logger.exception("定时任务播种 / 补种失败（调度线程照常启动）")
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
     t = threading.Thread(target=_loop, daemon=True, name="wb-scheduler")
     t.start()
 

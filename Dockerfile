@@ -21,4 +21,13 @@ COPY desktop/assets ./desktop/assets
 
 EXPOSE 8790 8787
 
-CMD ["python3", "-m", "uvicorn", "admin.server:app", "--host", "0.0.0.0", "--port", "8790"]
+# 入口统一走单 worker 的 managed runner（admin/managed_worker.py）。
+# 为什么不再直接 uvicorn：计划升级/重启要先**封口**（拒绝新业务）、等已受理的
+# 请求与后台任务归零，再让 Uvicorn 正常关闭；直接跑 uvicorn 的默认
+# graceful shutdown 秒表会在长流没跑完时强断。
+# --control-dir：容器内的私有控制目录，供同容器内的升级 CLI / 平台脚本访问 IPC
+# （放在容器本地临时目录，不挂卷、不进镜像层；状态报告 can_restart=false，
+#  由平台执行进程替换）。
+CMD ["python3", "-m", "admin.managed_worker", \
+     "--host", "0.0.0.0", "--port", "8790", \
+     "--proxy-headers", "--control-dir", "/tmp/wb2api-lifecycle"]
