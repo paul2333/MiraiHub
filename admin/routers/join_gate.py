@@ -57,13 +57,32 @@ def _public_base(request: Request) -> str:
     configured = (os.getenv("ADMIN_PUBLIC_BASE_URL") or "").strip().rstrip("/")
     if configured:
         return configured
-    host = (request.headers.get("x-forwarded-host")
+    # X-Forwarded-* 只采信可信代理发来的（2026-11-24 第 3 轮，S-8c）。
+    trusted = _from_trusted_proxy(request)
+    host = ((request.headers.get("x-forwarded-host") if trusted else "")
             or request.headers.get("host") or "").strip()
-    proto = (request.headers.get("x-forwarded-proto")
+    proto = ((request.headers.get("x-forwarded-proto") if trusted else "")
              or request.url.scheme or "https").strip()
     if not host:
         return str(request.base_url).rstrip("/")
     return f"{proto}://{host}"
+
+
+def _from_trusted_proxy(request: Request) -> bool:
+    try:
+        from admin.client_ip import is_trusted_proxy
+        return bool(is_trusted_proxy(request.client.host if request.client else ""))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_https(request: Request) -> bool:
+    """Cookie 的 Secure 判定：X-Forwarded-Proto 只信可信代理（与 server._is_https 同口径）。"""
+    if request.url.scheme == "https":
+        return True
+    if (request.headers.get("x-forwarded-proto") or "").lower() != "https":
+        return False
+    return _from_trusted_proxy(request)
 
 
 @router.get("/api/join/gate/status")
@@ -140,8 +159,7 @@ def ticket_exchange(body: ExchangeIn, request: Request,
         _logger.warning("join 票据兑换失败 ip=%s", client_ip_from_request(request))
         raise HTTPException(status_code=404, detail="页面不存在")
 
-    https = (request.url.scheme == "https"
-             or (request.headers.get("x-forwarded-proto") or "").lower() == "https")
+    https = _is_https(request)
     response = JSONResponse({"ok": True})
     response.set_cookie(
         key=join_gate.COOKIE_NAME, value=cookie_value, httponly=True,
