@@ -1588,6 +1588,45 @@ def _bind_sticky(sticky_key: str, account) -> None:
         pass
 
 
+#: max_tokens 的参数硬上限（2026-11-24 DSH 定案）：上游严格实例 >132096 直接回
+#: 400 3000101 invalid parameter。DSH 侧配置 maxTokens=228000 时每条请求都撞这条，
+#: 而错误的对外文案只说 invalid parameter，看不出是 token 上限。
+#: 设 0 或负数 = 不截断（保留旧行为）。
+MAX_TOKENS_PARAM_CAP_ENV = "MARVIS_MAX_TOKENS_PARAM_CAP"
+DEFAULT_MAX_TOKENS_PARAM_CAP = 131072
+
+
+def _max_tokens_param_cap() -> int:
+    """max_tokens 截断值；<= 0 表示不截。未设置 / 非法值用默认 131072。"""
+    raw = str(os.environ.get(MAX_TOKENS_PARAM_CAP_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_TOKENS_PARAM_CAP
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TOKENS_PARAM_CAP
+
+
+def _clamp_max_tokens(out: dict) -> int:
+    """把 max_tokens 截到 _max_tokens_param_cap()；截了返回原值，没截返回 0。
+
+    必须在 _normalize_token_limit **之后**调用（那一步才把别名并进 max_tokens）。
+    """
+    cap = _max_tokens_param_cap()
+    if cap <= 0 or not isinstance(out, dict):
+        return 0
+    raw = out.get("max_tokens")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0
+    want = int(raw)
+    if want <= cap:
+        return 0
+    out["max_tokens"] = cap
+    logger.info("Marvis max_tokens 截到上游参数上限 | from=%d to=%d"
+                "（上游实测 >132096 会被严格实例回 3000101）", want, cap)
+    return want
+
+
 def _normalize_token_limit(out: dict) -> None:
     """把 `max_completion_tokens` 并进 `max_tokens`（上游只认后者）。
 
@@ -1642,6 +1681,7 @@ def _prepare_body(body: dict, slot: str) -> dict:
     out = dict(body)
     out["model"] = slot
     _normalize_token_limit(out)
+    _clamp_max_tokens(out)
     messages = out.get("messages")
     if isinstance(messages, list):
         # 先做角色 / content 形态归一，再做内容风控改写。
