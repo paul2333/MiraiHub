@@ -272,7 +272,11 @@ def key_usage(key_id: int, _: bool = Depends(require_admin), db: Session = Depen
     k = db.query(ApiKey).filter(ApiKey.id == key_id).first()
     if not k:
         raise HTTPException(status_code=404, detail="Key 不存在")
-    pct = ((k.credit_used / k.credit_limit) * 100) if k.credit_limit > 0 and not k.unlimited else None
+    from admin.money import as_float
+
+    # 第 5 轮：NULL / Decimal 统一转 float（以前 credit_limit 为 NULL 时 `> 0` 直接 TypeError）
+    limit, used = as_float(k.credit_limit), as_float(k.credit_used)
+    pct = ((used / limit) * 100) if limit > 0 and not k.unlimited else None
     return {
         "id": k.id,
         "name": k.name,

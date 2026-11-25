@@ -285,7 +285,10 @@ def check_quota(key: ApiKey) -> None:
     """超额则直接拒绝，提示『积分已耗尽』。"""
     if key.status != "active":
         raise HTTPException(status_code=403, detail={"error": {"message": "API Key 已停用", "type": "key_disabled"}})
-    if not key.unlimited and key.credit_used >= key.credit_limit:
+    # 第 5 轮：金额列在 MySQL 上是 DECIMAL；NULL / Decimal 统一按 float 比较（NULL 以前 TypeError → 500）
+    from admin.money import as_float
+
+    if not key.unlimited and as_float(key.credit_used) >= as_float(key.credit_limit):
         raise HTTPException(
             status_code=402,
             detail={"error": {"message": "当前 API Key 的额度已用完，请调整此 Key 的限额或联系管理员", "type": "quota_exceeded", "code": "key_quota_exceeded", "source": "gateway"}},

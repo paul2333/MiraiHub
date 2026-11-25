@@ -601,7 +601,9 @@ def _fetch_real_credits(log_id: int, account_id: int, auth_json: str, model: str
                 log = db.query(UsageLog).filter(UsageLog.id == log_id).with_for_update().first()
                 if log is None:
                     return
-                delta = real - log.credits
+                # 第 5 轮：log.credits 可能为 NULL（旧行）/ Decimal（MySQL 丢类型时），统一转 float
+                from admin.money import as_float
+                delta = real - as_float(log.credits)
                 if abs(delta) < 0.0001:
                     return
                 log.credits = real

@@ -20,6 +20,7 @@ from admin.ip_access import invalidate_ip_cache
 from admin.models import BlockedIP, IPRequestBucket, UsageLog, ClientIdentity, ClientIdentitySeen, RequestAudit
 from admin.client_ip import normalize_ip, request_ip
 from admin.ip_activity import flush
+from admin.money import money_avg
 from admin.security import require_admin
 
 
@@ -101,7 +102,8 @@ def _activity_counts(db: Session, start: datetime):
               .group_by(combined.c.ip).subquery())
     usage = (db.query(UsageLog.client_ip.label("ip"),
                       func.sum(UsageLog.credits).label("credits"),
-                      func.avg(UsageLog.credits).label("avg_credits"),
+                      # 第 5 轮：func.avg 不继承列类型，MySQL DECIMAL 上会回 Decimal → 标成 Money
+                      money_avg(UsageLog.credits).label("avg_credits"),
                       func.avg(UsageLog.total_tokens).label("avg_tokens"),
                       func.count(UsageLog.total_tokens).label("known_usage"),
                       func.sum(UsageLog.total_tokens).label("tokens"))
