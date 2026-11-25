@@ -376,14 +376,29 @@ def _client():
         return _redis
 
 
-def reset() -> None:
+def reset(platform: str = "") -> None:
     """清空内存状态并重连。
 
     同时清掉 Redis 里的明细 —— 只清内存的话，`reset()` 之后读到的还是
     Redis 里的旧事件（表现是「清空后计数不为 0」）。测试与「清空信号」
     按钮都依赖这个语义。
+
+    `platform` 非空时**只清这一个平台**（精确键 `wb:sentinel:<platform>:events`）。
+    原来「清空 qoder 的信号」走前缀匹配，会把 `qoder-intl` 一起清掉；而且接口
+    最后还无条件调用了一次不带参数的 `reset()`，等于每次都清全部平台。
     """
     global _redis, _redis_ready
+    target = str(platform or "").strip().lower()
+    if target:
+        client = _client()
+        if client is not None:
+            try:
+                client.delete(_key(target, "events"))
+            except Exception:  # noqa: BLE001 - 清不掉也不该崩
+                logger.debug("哨兵清理 Redis 失败 platform=%s", target, exc_info=True)
+        with _lock:
+            _memory.pop(target, None)
+        return
     client = _client()
     if client is not None:
         try:
