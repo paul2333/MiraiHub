@@ -1,0 +1,17 @@
+[Unit]
+Description=Marvis WARP egress exit %i (wireproxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/marvis-egress/exits/%i
+ExecStart=/opt/marvis-egress/bin/wireproxy -c /opt/marvis-egress/exits/%i/wireproxy.conf
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/marvis-egress/logs/%i-wireproxy.log
+StandardError=append:/opt/marvis-egress/logs/%i-wireproxy.log
+
+[Install]
+WantedBy=multi-user.target
