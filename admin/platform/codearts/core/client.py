@@ -273,9 +273,98 @@ def _classify(status: int, payload: str) -> UpstreamError:
                          kind="bad_request", detail=payload[:800])
 
 
+_OPENER = None
+
+
+def _upstream_opener():
+    """进程内复用的 opener（P3）。
+
+    原来每个请求都 `build_opener(ProxyHandler({}))`；现在建一次复用，并走
+    `upstream_http.build_opener(False)`：共享 TLS 上下文 + 建连短超时
+    （ADMIN_UPSTREAM_CONNECT_TIMEOUT，默认 10s）。`trust_env=False` 时装的就是
+    `ProxyHandler({})`，代理语义与原来完全一致（硬禁系统代理）。
+    """
+    global _OPENER
+    if _OPENER is None:
+        try:
+            from admin.upstream_http import build_opener as _build
+
+            _OPENER = _build(False)
+        except Exception:  # noqa: BLE001 - 独立脚本里没有 admin 包时退回原写法
+            _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _OPENER
+
+
+#: 长连接池里的平台名（开关 `ADMIN_URLLIB_KEEPALIVE_CODEARTS` / 总开关 `ADMIN_URLLIB_KEEPALIVE`）。
+KEEPALIVE_PLATFORM = "codearts"
+
+
+def _open_upstream(request, *, timeout: float, account_id: int = 0, keepalive: bool = False):
+    """对话请求走按账号长连接池（r3 第 1 项，默认关）；不适用时走原 opener。
+
+    池里建连失败抛 `ConnectError`（OSError，按原网络错误处理）；请求写出后失败抛
+    `http_keepalive.DeliveryUnknown`，调用方必须**不换号、不重发**。
+    """
+    if keepalive and account_id:
+        try:
+            from admin import http_keepalive
+        except Exception:  # noqa: BLE001 - 独立脚本里没有 admin 包
+            http_keepalive = None
+        if http_keepalive is not None and http_keepalive.enabled(KEEPALIVE_PLATFORM):
+            resp = http_keepalive.open_request(KEEPALIVE_PLATFORM, request, timeout=timeout,
+                                               account=int(account_id), proxy=None,
+                                               trust_env=False)
+            if resp is not None:
+                return resp
+    return _upstream_opener().open(request, timeout=timeout)
+
+
+def _delivery_unknown(exc, account_id: int) -> "UpstreamError":
+    """交付未知：不进哨兵、不换号（kind 不在 `retryable()` 列表里）。"""
+    logger.warning("CodeArts 上游交付未知（不换号、不重发）acc=%s phase=%s detail=%s",
+                   account_id, getattr(exc, "phase", ""), getattr(exc, "detail", "")[:160])
+    return UpstreamError("上游交付状态未知：请求已发出，连接在收到响应前中断",
+                         status=502, kind="delivery_unknown",
+                         detail=str(getattr(exc, "detail", "") or exc)[:200])
+
+
+def _is_delivery_unknown(exc) -> bool:
+    return type(exc).__name__ == "DeliveryUnknown"
+
+
+class _ChunkStream:
+    """`chat_stream` 的返回值：可迭代，且**没开始迭代也能 close**。
+
+    以前返回裸生成器：生成器从未启动时 close() 不执行它的 finally，已经打开的
+    上游响应只能等 GC。中继兜底（`protocol_bridge.guard_unstarted`）要能立即关掉它。
+    """
+
+    __slots__ = ("_gen", "_response")
+
+    def __init__(self, gen, response):
+        self._gen = gen
+        self._response = response
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._gen)
+
+    def close(self) -> None:
+        try:
+            self._gen.close()
+        finally:
+            try:
+                self._response.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def request_json(cred: dict, path: str, *, method: str = "GET",
                  body: dict | None = None, account_id: int = 0,
-                 agent_type: str = "", timeout: float = 60.0) -> dict:
+                 agent_type: str = "", timeout: float = 60.0,
+                 keepalive: bool = False) -> dict:
     """签名并发一次请求，返回解析后的 JSON。
 
     `body` 会被**只序列化一次**：签名用的字节与实际发送的字节必须是同一份，
@@ -292,9 +381,9 @@ def request_json(cred: dict, path: str, *, method: str = "GET",
                           str(cred.get("access_key") or ""),
                           str(cred.get("secret_key") or ""))
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(request, timeout=timeout) as response:
+        with _open_upstream(request, timeout=timeout, account_id=account_id,
+                            keepalive=keepalive) as response:
             text = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -307,6 +396,8 @@ def request_json(cred: dict, path: str, *, method: str = "GET",
                       status=error.status, detail=error.detail)
         raise error from exc
     except Exception as exc:  # noqa: BLE001 - 网络层
+        if _is_delivery_unknown(exc):
+            raise _delivery_unknown(exc, account_id) from exc
         note_sentinel(account_id, "network", detail=str(exc)[:200])
         raise UpstreamError("网络失败", kind="network",
                             detail=str(exc)[:200]) from exc
@@ -333,7 +424,8 @@ def chat_completions(cred: dict, body: dict, *, account_id: int = 0) -> dict:
     payload = normalize_body(dict(body))
     payload["stream"] = False
     return request_json(cred, endpoints.CHAT, method="POST", body=payload,
-                        account_id=account_id, timeout=DEFAULT_TIMEOUT)
+                        account_id=account_id, timeout=DEFAULT_TIMEOUT,
+                        keepalive=True)
 
 
 def chat_stream(cred: dict, body: dict, *, account_id: int = 0,
@@ -353,10 +445,10 @@ def chat_stream(cred: dict, body: dict, *, account_id: int = 0,
                           str(cred.get("secret_key") or ""))
     request = urllib.request.Request(url, data=text.encode("utf-8"),
                                      headers=headers, method="POST")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     started = time.perf_counter()
     try:
-        response = opener.open(request, timeout=DEFAULT_TIMEOUT)
+        response = _open_upstream(request, timeout=DEFAULT_TIMEOUT,
+                                  account_id=account_id, keepalive=True)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -368,6 +460,8 @@ def chat_stream(cred: dict, body: dict, *, account_id: int = 0,
                       status=error.status, detail=error.detail)
         raise error from exc
     except Exception as exc:  # noqa: BLE001
+        if _is_delivery_unknown(exc):
+            raise _delivery_unknown(exc, account_id) from exc
         note_sentinel(account_id, "network", detail=str(exc)[:200])
         raise UpstreamError("网络失败", kind="network",
                             detail=str(exc)[:200]) from exc
@@ -422,7 +516,7 @@ def chat_stream(cred: dict, body: dict, *, account_id: int = 0,
             except Exception:  # noqa: BLE001
                 pass
 
-    return generator()
+    return _ChunkStream(generator(), response)
 
 
 # ---------------------------------------------------------------------------

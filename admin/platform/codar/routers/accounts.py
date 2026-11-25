@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from admin.db import get_db
@@ -223,9 +223,13 @@ def usage(limit: int = 50, _: bool = Depends(require_admin),
 
 
 @router.get("/export")
-def export_accounts(mode: str = "backup", realm: str = "",
+def export_accounts(request: Request, mode: str = "plain", realm: str = "",
                     _: bool = Depends(require_admin), db=Depends(get_db)):
-    """导出：`backup` 含令牌；`plain` 是脱敏清单（可直接贴进 issue）。"""
+    """导出：`backup` 含令牌（需二次确认）；`plain`（默认）是脱敏清单（可直接贴进 issue）。"""
+    from admin import export_guard
+    full = export_guard.guard_secret_export(request, "codar export",
+                                            export_guard.wants_secrets(mode == "backup"))
+    mode = "backup" if full else "plain"
     rows = codar_accounts.accounts_for(db, realm)
     accounts = []
     for row in rows:

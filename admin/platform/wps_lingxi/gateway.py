@@ -326,7 +326,7 @@ async def _forward(body: dict, request) -> JSONResponse:
             db.commit()
         except Exception:  # noqa: BLE001
             db.rollback()
-        _bill(key, account, str(body.get("model") or ""), result,
+        await asyncio.to_thread(_bill, key, account, str(body.get("model") or ""), result,
               request=request, started=started)
         return JSONResponse(result)
     finally:
@@ -350,9 +350,8 @@ def _open_stream_sync(cookie, run, body, model, account_id, started, stats):
 
 
 async def _forward_stream(body: dict, request):
+    from admin import http_shared
     from admin.db import SessionLocal
-
-    from starlette.concurrency import run_in_threadpool
 
     realm = _realm(request)
     db = SessionLocal()
@@ -361,11 +360,6 @@ async def _forward_stream(body: dict, request):
     upstream_model = protocol.normalize_model(model)
     stats: dict = {}
     translate = protocol.FrameTranslator(model or upstream_model)
-    exclude: set[int] = set()
-    account = None
-    gen = None
-    first = None
-    last_error = None
     started = time.perf_counter()
 
     try:
@@ -378,51 +372,80 @@ async def _forward_stream(body: dict, request):
         db.close()
         return _fail(client.UpstreamError(str(exc)[:200], kind="fatal"))
 
-    for _ in range(MAX_ATTEMPTS):
-        account = shared.select_account(
-            db, storage=STORAGE, realm=realm, key=key, model=model,
-            exclude_ids=exclude)
-        if account is None:
-            break
-        if not shared.lease(account):
-            exclude.add(account.id)
-            continue
-        cookie = lingxi_accounts.cookie_of(account)
-        try:
-            if not cookie:
-                raise client.UpstreamError("账号缺少 Cookie，请重新导入",
-                                           status=401, kind="auth")
-            retried = False
-            while True:
-                run = client.ensure_run(cookie, upstream_model,
-                                        messages=body.get("messages"))
-                try:
-                    gen, first = await run_in_threadpool(
-                        _open_stream_sync, cookie, run, payload,
-                        upstream_model, int(account.id or 0), started, stats)
-                    break
-                except client.UpstreamError as exc:
-                    if retried or exc.kind == "audit" \
-                            or not client.looks_stale(exc.message):
-                        raise
-                    retried = True
-                    client.forget_run(cookie, upstream_model)
-            break
-        except client.UpstreamError as exc:
-            shared.release(account)
-            shared.note_failure(
-                db, account, kind=exc.kind, detail=exc.detail or exc.message,
-                status=exc.status, model=model, public_platform=PUBLIC,
-                cool_seconds=_COOL.get(exc.kind, 0))
-            last_error = exc
-            exclude.add(account.id)
-            if exc.kind in _NO_ROTATE:
+    def _attempts():
+        """选号 → 建会话 / run → 建连读首帧，失败换号。整段在工作线程里跑（P1）。
+
+        原来选号、`ensure_run`（两次上游 POST，带重试和退避 sleep）、记失败都在
+        事件循环上，只有首帧那一步进了 `run_in_threadpool`（还占 anyio 令牌）。
+        """
+        exclude: set[int] = set()
+        account = None
+        gen = None
+        first = None
+        last_error = None
+        for _ in range(MAX_ATTEMPTS):
+            account = shared.select_account(
+                db, storage=STORAGE, realm=realm, key=key, model=model,
+                exclude_ids=exclude)
+            if account is None:
                 break
-        except Exception as exc:  # noqa: BLE001
-            shared.release(account)
-            logger.exception("灵犀流式调用失败 acc=%s", account.id)
-            last_error = client.UpstreamError(str(exc)[:300], kind="network")
-            exclude.add(account.id)
+            if not shared.lease(account):
+                exclude.add(account.id)
+                continue
+            cookie = lingxi_accounts.cookie_of(account)
+            try:
+                if not cookie:
+                    raise client.UpstreamError("账号缺少 Cookie，请重新导入",
+                                               status=401, kind="auth")
+                retried = False
+                while True:
+                    run = client.ensure_run(cookie, upstream_model,
+                                            messages=body.get("messages"))
+                    try:
+                        gen, first = _open_stream_sync(
+                            cookie, run, payload, upstream_model,
+                            int(account.id or 0), started, stats)
+                        break
+                    except client.UpstreamError as exc:
+                        if retried or exc.kind == "audit" \
+                                or not client.looks_stale(exc.message):
+                            raise
+                        retried = True
+                        client.forget_run(cookie, upstream_model)
+                break
+            except client.UpstreamError as exc:
+                shared.release(account)
+                shared.note_failure(
+                    db, account, kind=exc.kind, detail=exc.detail or exc.message,
+                    status=exc.status, model=model, public_platform=PUBLIC,
+                    cool_seconds=_COOL.get(exc.kind, 0))
+                last_error = exc
+                exclude.add(account.id)
+                if exc.kind in _NO_ROTATE:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                shared.release(account)
+                logger.exception("灵犀流式调用失败 acc=%s", account.id)
+                last_error = client.UpstreamError(str(exc)[:300], kind="network")
+                exclude.add(account.id)
+        return account, gen, first, last_error
+
+    def _abandon(result) -> None:
+        """等待方已取消（断连 / 超时 / 排空）：关上游、还租约、关 Session。"""
+        account_, gen_, _first, _err = result
+        if gen_ is not None:
+            try:
+                gen_.close()
+            except Exception:  # noqa: BLE001
+                pass
+            shared.release(account_)
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    account, gen, first, last_error = await http_shared.run_blocking(
+        _attempts, on_orphan=_abandon)
 
     if gen is None:
         db.close()
@@ -433,23 +456,45 @@ async def _forward_stream(body: dict, request):
             kind="server_error", code="no_available_account",
             headers={"Retry-After": "3"})
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     holder: dict = {}
 
-    async def agen():
-        nonlocal first
+    async def _executor_frames():
+        # 开关 ADMIN_STREAM_OFFLOAD=0 时的旧写法：每帧一次默认执行器里的 next()
+        while True:
+            nxt = await loop.run_in_executor(None, lambda: next(gen, _SENTINEL))
+            if nxt is _SENTINEL:
+                return
+            yield nxt
+
+    def _finish(usage: dict) -> None:
+        """收尾（同步 DB：放到线程里做，不占事件循环）。"""
         try:
-            pending = first
-            first = None
-            while True:
-                if pending is not None:
-                    frame, pending = pending, None
-                else:
-                    nxt = await loop.run_in_executor(
-                        None, lambda: next(gen, _SENTINEL))
-                    if nxt is _SENTINEL:
-                        break
-                    frame = nxt
+            shared.release(account)
+            shared.note_success(account)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            _bill(key, account, model, {"usage": usage},
+                  request=request, started=started, stats=stats)
+        finally:
+            db.close()
+
+    async def agen():
+        # 异步桥：读上游在独立线程里，不占 anyio 令牌；客户端断开时桥在下一帧
+        # 到达后停止读取并 close(gen)（原来 `gen.close()` 撞上正在执行的 next()
+        # 会抛 "generator already executing" 被吞掉，上游一直读到结束）。
+        frames = (http_shared.aiter_sync(gen) if http_shared.stream_offload_enabled()
+                  else _executor_frames())
+        try:
+            if first is not None:
+                for chunk in translate.feed(first):
+                    yield chunk
+            async for frame in frames:
                 if frame is None:
                     continue
                 for chunk in translate.feed(frame):
@@ -472,22 +517,21 @@ async def _forward_stream(body: dict, request):
             stats.setdefault("total_ms",
                              int((time.perf_counter() - started) * 1000))
             try:
+                await frames.aclose()       # 置停止位；生产线程会 close(gen)
+            except BaseException:  # noqa: BLE001 - 取消期间 aclose 也可能被取消
+                pass
+            # 桥没启动过（首帧就出错 / 客户端在首帧时断开）时由这里关；生产线程
+            # 正在 next() 时会抛 ValueError（已在执行），交给桥在下一帧后关。
+            try:
                 gen.close()
             except Exception:  # noqa: BLE001
                 pass
+            usage = dict(holder.get("usage") or translate.usage or {})
+            # 不 await：取消期间（anyio 取消域）任何 await 都会立刻再被取消
             try:
-                shared.release(account)
-                shared.note_success(account)
-                db.commit()
-            except Exception:  # noqa: BLE001
-                try:
-                    db.rollback()
-                except Exception:  # noqa: BLE001
-                    pass
-            _bill(key, account, model,
-                  {"usage": holder.get("usage") or translate.usage or {}},
-                  request=request, started=started, stats=stats)
-            db.close()
+                loop.run_in_executor(None, _finish, usage)
+            except RuntimeError:            # 事件循环 / 执行器已关闭（进程退出）
+                _finish(usage)
 
     return StreamingResponse(
         agen(), media_type="text/event-stream",
@@ -611,7 +655,7 @@ async def messages(request):
         except Exception:  # noqa: BLE001
             db.rollback()
         result["model"] = model or result.get("model")
-        _bill(key, account, model, result, request=request, started=started)
+        await asyncio.to_thread(_bill, key, account, model, result, request=request, started=started)
 
         if not body.get("stream"):
             return JSONResponse(protocol.openai_to_anthropic(result, model))
@@ -671,7 +715,7 @@ async def responses(request):
             db.commit()
         except Exception:  # noqa: BLE001
             db.rollback()
-        _bill(key, account, model, result, request=request, started=started)
+        await asyncio.to_thread(_bill, key, account, model, result, request=request, started=started)
 
         final = protocol.openai_to_responses(result, model)
         if not body.get("stream"):
@@ -731,7 +775,7 @@ async def list_models(request):
     try:
         shared.authenticate(db, request, platform=PUBLIC)
         realm = _realm(request)
-        account = shared.select_account(
+        account = await asyncio.to_thread(shared.select_account,
             db, storage=STORAGE, realm=realm,
             key=shared.key_row(db, request))
         fallback = shared.catalog_from_db(db, STORAGE)
@@ -742,7 +786,7 @@ async def list_models(request):
             if cookie:
                 try:
                     models = client.catalog_of(
-                        client.fetch_plans(cookie, lingxi_accounts.base_of(account)))
+                        await asyncio.to_thread(client.fetch_plans, cookie, lingxi_accounts.base_of(account)))
                 except client.UpstreamError as exc:
                     note = "上游目录拉取失败：%s" % exc.message
         else:
@@ -777,14 +821,14 @@ async def balance(request):
     db = SessionLocal()
     try:
         shared.authenticate(db, request, platform=PUBLIC)
-        account = shared.select_account(
+        account = await asyncio.to_thread(shared.select_account,
             db, storage=STORAGE, realm=realm,
             key=shared.key_row(db, request))
         if account is None:
             return JSONResponse({"platform": PUBLIC, "realm": realm,
                                  "error": "no_account"}, status_code=200)
         try:
-            result = lingxi_accounts.sync_quota(db, account)
+            result = await asyncio.to_thread(lingxi_accounts.sync_quota, db, account)
         except client.UpstreamError as exc:
             return JSONResponse({"platform": PUBLIC, "realm": realm,
                                  "error": exc.message}, status_code=200)

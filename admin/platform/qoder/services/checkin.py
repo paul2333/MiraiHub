@@ -121,10 +121,14 @@ def sync_account_quota(db: Session, account: Account) -> dict:
         raw = client.fetch_usage(token, realm)
     except client.UpstreamError as exc:
         if exc.kind == "auth":
-            account.status = "disabled"
+            # D7-6.4：先冷却、连续达到阈值才停用（ban_recheck 复核恢复）
+            from admin import account_health
+            account_health.note_auth_failure(db, account, str(exc.message or exc)[:150])
             db.commit()
         return {"ok": False, "error": exc.to_dict()}
 
+    from admin import account_health
+    account_health.clear_auth_failure(account)   # 用量接口 200：清 401 计数
     quota = quota_of(raw)
 
     # 套餐名（失败不影响额度）

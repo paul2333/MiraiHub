@@ -136,10 +136,13 @@ def _count_failure(db: Session, account: Account, exc: client.UpstreamError) -> 
     account.err_count = int(getattr(account, "err_count", 0) or 0) + 1
     account.last_err_msg = (exc.message or "")[:250]
     account.last_err_at = datetime.utcnow()
-    if exc.kind == "auth" and fails >= PROBE_DISABLE_AFTER:
-        account.status = "disabled"
-        logger.warning("灵犀账号 %s 连续 %d 次鉴权失败，已禁用",
-                       account.id, fails)
+    if exc.kind == "auth":
+        # D7-6.4：统一走 account_health —— 先冷却，连续达到阈值
+        # （ADMIN_AUTH_FAIL_THRESHOLD，默认 3，与原 PROBE_DISABLE_AFTER 相同）才停用，
+        # 停用文案带前缀，ban_recheck 会复核恢复。
+        from admin import account_health
+        if account_health.note_auth_failure(db, account, exc.message or "") == "disabled":
+            logger.warning("灵犀账号 %s 连续鉴权失败，已禁用", account.id)
     try:
         db.commit()
     except Exception:  # noqa: BLE001
@@ -159,8 +162,12 @@ def sync_quota(db: Session, account: Account) -> dict:
         return {"ok": False, "error": exc.to_dict()}
     if int(getattr(account, "consecutive_fails", 0) or 0):
         account.consecutive_fails = 0
-    if (account.status or "") == "disabled":
+    # 人工停用的号不能被一次探活成功自动解封（D7）
+    if ((account.status or "") == "disabled"
+            and (getattr(account, "cool_kind", "") or "") != "manual_disabled"):
         account.status = "active"
+    from admin import account_health
+    account_health.clear_auth_failure(account)
     apply_quota(account, quota)
     try:
         db.commit()

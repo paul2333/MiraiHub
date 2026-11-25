@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -295,10 +295,14 @@ def ban_recheck(realm: str = "", _: bool = Depends(require_admin),
 
 
 @router.get("/export")
-def export(realm: str = "", reveal: int = 0, _: bool = Depends(require_admin),
-           db: Session = Depends(get_db)):
-    return lingxi_accounts.export_records(db, _realm_or_400(realm),
-                                          reveal=bool(int(reveal or 0)))
+def export(request: Request, realm: str = "", reveal: int = 0,
+           _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    from admin import export_guard
+
+    # 完整凭证需二次确认（2026-11-24 第 3 轮，S-4）
+    full = export_guard.guard_secret_export(request, "wps_lingxi export",
+                                            bool(int(reveal or 0)))
+    return lingxi_accounts.export_records(db, _realm_or_400(realm), reveal=full)
 
 
 @router.get("/usage")

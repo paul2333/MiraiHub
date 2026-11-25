@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -35,6 +36,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
+from admin import http_shared
 from admin.client_ip import request_ip
 from admin.db import SessionLocal
 from admin.platform import registry
@@ -396,6 +398,21 @@ def _tail(holder, first, *, stream: bool):
         holder["_iterator"] = None
 
 
+def _abandon_run(result) -> None:
+    """`_run` 的等待方已被取消时的收尾（交给 `http_shared.run_blocking(on_orphan=)`）。
+
+    `_run` 放进线程后，请求可以在它返回前被取消（断连检测、超时、进程排空）；
+    线程照样跑完、拿到账号租约并打开上游连接，却没人接手 —— 这里关掉上游、还租约。
+    """
+    try:
+        _account, holder, _first, _attempted, _ttfb = result
+    except Exception:  # noqa: BLE001
+        return
+    _close(holder.get("_iterator"))
+    _close(holder.get("_resp"))
+    _release(holder)
+
+
 def _release(holder) -> None:
     # 优先用 acquire 时记下的租约键（空 UID 账号 = "id:<id>"），
     # 老 holder（没有 key）才回落 uid。
@@ -430,12 +447,14 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
     from admin.platform.trae.core import solo as trae_solo
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    account = trae_pool.select(db, realm=realm, key_id=getattr(key, "id", None),
-                               account_id=getattr(key, "account_id", None))
+    # P1：选号 / 取凭证都是同步 DB（取凭证可能还要续签打上游），放进线程。
+    account = await asyncio.to_thread(
+        trae_pool.select, db, realm=realm, key_id=getattr(key, "id", None),
+        account_id=getattr(key, "account_id", None))
     if account is None:
         raise GatewayError(503, "号池里没有可用的 Trae 账号（请先导入并确认状态为启用）",
                            kind="server_error", code="no_account")
-    creds = trae_pool.credentials(db, account)
+    creds = await asyncio.to_thread(trae_pool.credentials, db, account)
     started = time.perf_counter()
 
     msg_id = "msg_solo_" + str(int(time.time() * 1000))
@@ -660,15 +679,19 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
         return "data: %s\n\n" % _json.dumps(chunk, ensure_ascii=False)
 
-    try:
-        resp = trae_solo.open_stream(creds, model, messages,
-                                     max_tokens=payload.get("max_tokens") or 0,
-                                     tools=payload.get("tools") or None,
-                                     timeout=_timeout())
-    except Exception as exc:  # noqa: BLE001
-        trae_pool.note_failure(db, account, exc, model=model)
-        raise GatewayError(502, "SOLO 通道调用失败：%s" % str(exc)[:200],
-                           kind="upstream_error") from exc
+    def _open_solo():
+        try:
+            return trae_solo.open_stream(creds, model, messages,
+                                         max_tokens=payload.get("max_tokens") or 0,
+                                         tools=payload.get("tools") or None,
+                                         timeout=_timeout())
+        except Exception as exc:  # noqa: BLE001
+            trae_pool.note_failure(db, account, exc, model=model)
+            raise GatewayError(502, "SOLO 通道调用失败：%s" % str(exc)[:200],
+                               kind="upstream_error") from exc
+
+    # P1：建连 + 等响应头是同步 urllib（超时 600s），不能占着事件循环。
+    resp = await http_shared.run_blocking(_open_solo, on_orphan=_close)
 
     if wants_stream:
         def generator():
@@ -918,13 +941,16 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
         # Anthropic 目标发官方 ping 事件，其余发空增量 data 帧
         # （真实事件，能重置客户端 idle 计时器；开关可回退注释帧）
         return StreamingResponse(
-            bridge.with_pings(
+            # P4：异步桥 —— 不占 anyio 线程令牌；客户端断开后停止读上游并关闭
+            http_shared.async_stream(
                 generator(),
                 ping=bridge.ANTHROPIC_PING if target == "messages" else bridge.CHAT_PING),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    result = trae_solo.collect(resp)
+    # 非流式要在这里读完整段生成：放进线程（P1，原来在事件循环上等完整个回答）
+    result = await http_shared.run_blocking(trae_solo.collect, resp,
+                                            on_orphan=lambda _r: _close(resp))
     try:
         resp.close()
     except Exception:  # noqa: BLE001
@@ -932,9 +958,13 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
     content = result.get("content") or ""
     if not content and not result.get("reasoning"):
         raise GatewayError(502, "SOLO 返回空内容", kind="upstream_error")
-    _bill_solo(db, key, account, model, result.get("usage") or {}, started,
-               request, error="")
-    trae_pool.note_success(db, account)
+
+    def _finish_nonstream():
+        _bill_solo(db, key, account, model, result.get("usage") or {}, started,
+                   request, error="", stream=False)
+        trae_pool.note_success(db, account)
+
+    await asyncio.to_thread(_finish_nonstream)
     finish = result.get("finish_reason") or "stop"
     usage = result.get("usage") or {}
 
@@ -978,7 +1008,7 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
 
 
 def _bill_solo(db, key, account, model, usage, started, request, error="",
-               ttfb_ms=None, end_ms=None):
+               ttfb_ms=None, end_ms=None, stream=True):
     """记账（SOLO 通道）。
 
     `ttfb_ms` 是**首个正文**到达时间，`end_ms` 是**最后一个正文**时间。
@@ -993,11 +1023,12 @@ def _bill_solo(db, key, account, model, usage, started, request, error="",
         from admin.platform import shared
 
         elapsed = int((time.perf_counter() - started) * 1000)
-        ttfb = int(ttfb_ms) if ttfb_ms else elapsed
+        # 非流式没有「首字」：存 NULL，不拿总耗时冒充（N2）
+        ttfb = (int(ttfb_ms) if ttfb_ms else elapsed) if stream else None
         # **latency 取最后一个正文的时刻**，而不是「读完响应」——
         # 后者含有收尾帧、usage 帧与闲聊事件的传输时间。
         latency = int(end_ms) if end_ms else elapsed
-        if ttfb > latency:
+        if ttfb is not None and ttfb > latency:
             ttfb, latency = latency, ttfb
         shared.record_usage(
             db,
@@ -1019,7 +1050,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     db = SessionLocal()
     holder_box: dict = {}
     try:
-        key = _auth(db, request)
+        key = await asyncio.to_thread(_auth, db, request)
         payload = await _json_body(request)
         realm, model = resolve_target(request, payload, key)
         messages = payload.get("messages")
@@ -1060,23 +1091,26 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
             def render(resp, hold):
                 yield protocol.aggregate_openai(resp, hold, allowed)
 
-            account, holder, result, attempted, ttfb = _run(
-                db, realm=realm, model=model, body=body, key=key,
+            # P1：选号 + 建连 + 等首帧全是同步阻塞（urllib，超时 600s），
+            # 必须离开事件循环，否则一个 Trae 请求就让全站冻结。
+            account, holder, result, attempted, ttfb = await http_shared.run_blocking(
+                _run, db, on_orphan=_abandon_run, realm=realm, model=model, body=body, key=key,
                 render=render, sticky_key=sticky, use_case=USE_CASE["/v1/chat/completions"])
             _release(holder)
             if isinstance(result, dict):
                 # 上游会在流内回真名（例如客户端写 `DeepSeek-V3`、上游认
                 # `deepseek-V3`）。展示成真名更利于排障，也便于客户端复制。
                 result["model"] = (holder.get("meta") or {}).get("model") or model
-            _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/chat/completions", started=started)
+            # 非流式没有「首字」：ttfb 存 NULL（N2），记账（同步 DB）放进线程
+            await asyncio.to_thread(_bill, key, account, model, holder, ip, None, attempted,
+                                    "/v1/chat/completions", started=started, request=request)
             return JSONResponse(result or {})
 
         def render_stream(resp, hold):
             yield from protocol.stream_openai(resp, hold, allowed)
 
-        account, holder, first, attempted, ttfb = _run(
-            db, realm=realm, model=model, body=body, key=key,
+        account, holder, first, attempted, ttfb = await http_shared.run_blocking(
+            _run, db, on_orphan=_abandon_run, realm=realm, model=model, body=body, key=key,
             render=render_stream, sticky_key=sticky,
             use_case=USE_CASE["/v1/chat/completions"])
         holder_box["h"] = holder
@@ -1087,10 +1121,10 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
             finally:
                 _release(holder)
                 _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/chat/completions", started=started)
+                      "/v1/chat/completions", started=started, request=request)
 
         return StreamingResponse(
-            bridge.with_pings(generator(), ping=bridge.CHAT_PING),
+            http_shared.async_stream(generator(), ping=bridge.CHAT_PING),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     finally:
@@ -1101,7 +1135,7 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
     started = time.perf_counter()   # _bill 用它算总耗时
     db = SessionLocal()
     try:
-        key = _auth(db, request)
+        key = await asyncio.to_thread(_auth, db, request)
         payload = await _json_body(request)
         chat = protocol.responses_to_chat(payload)
         realm, model = resolve_target(request, chat, key)
@@ -1141,19 +1175,22 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
             def render(resp, hold):
                 yield protocol.aggregate_openai(resp, hold, allowed)
 
-            account, holder, result, attempted, ttfb = _run(
-                db, realm=realm, model=model, body=body, key=key,
+            # P1：选号 + 建连 + 等首帧全是同步阻塞（urllib，超时 600s），
+            # 必须离开事件循环，否则一个 Trae 请求就让全站冻结。
+            account, holder, result, attempted, ttfb = await http_shared.run_blocking(
+                _run, db, on_orphan=_abandon_run, realm=realm, model=model, body=body, key=key,
                 render=render, sticky_key=sticky, use_case=USE_CASE["/v1/responses"])
             _release(holder)
-            _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/responses", started=started)
+            # 非流式没有「首字」：ttfb 存 NULL（N2），记账（同步 DB）放进线程
+            await asyncio.to_thread(_bill, key, account, model, holder, ip, None, attempted,
+                                    "/v1/responses", started=started, request=request)
             return JSONResponse(protocol.chat_to_responses(result or {}, model))
 
         def render_stream(resp, hold):
             yield from protocol.stream_responses(resp, model, hold, allowed)
 
-        account, holder, first, attempted, ttfb = _run(
-            db, realm=realm, model=model, body=body, key=key,
+        account, holder, first, attempted, ttfb = await http_shared.run_blocking(
+            _run, db, on_orphan=_abandon_run, realm=realm, model=model, body=body, key=key,
             render=render_stream, sticky_key=sticky, use_case=USE_CASE["/v1/responses"])
 
         def generator():
@@ -1162,10 +1199,10 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
             finally:
                 _release(holder)
                 _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/responses", started=started)
+                      "/v1/responses", started=started, request=request)
 
         return StreamingResponse(
-            bridge.with_pings(generator(), ping=bridge.CHAT_PING),
+            http_shared.async_stream(generator(), ping=bridge.CHAT_PING),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     finally:
@@ -1176,7 +1213,7 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
     started = time.perf_counter()   # _bill 用它算总耗时
     db = SessionLocal()
     try:
-        key = _auth(db, request)
+        key = await asyncio.to_thread(_auth, db, request)
         payload = await _json_body(request)
         chat = protocol.messages_to_chat(payload)
         realm, model = resolve_target(request, chat, key)
@@ -1214,19 +1251,22 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
             def render(resp, hold):
                 yield protocol.aggregate_openai(resp, hold, allowed)
 
-            account, holder, result, attempted, ttfb = _run(
-                db, realm=realm, model=model, body=body, key=key,
+            # P1：选号 + 建连 + 等首帧全是同步阻塞（urllib，超时 600s），
+            # 必须离开事件循环，否则一个 Trae 请求就让全站冻结。
+            account, holder, result, attempted, ttfb = await http_shared.run_blocking(
+                _run, db, on_orphan=_abandon_run, realm=realm, model=model, body=body, key=key,
                 render=render, sticky_key=sticky, use_case=USE_CASE["/v1/messages"])
             _release(holder)
-            _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/messages", started=started)
+            # 非流式没有「首字」：ttfb 存 NULL（N2），记账（同步 DB）放进线程
+            await asyncio.to_thread(_bill, key, account, model, holder, ip, None, attempted,
+                                    "/v1/messages", started=started, request=request)
             return JSONResponse(protocol.chat_to_messages(result or {}, model))
 
         def render_stream(resp, hold):
             yield from protocol.stream_anthropic(resp, model, hold, allowed)
 
-        account, holder, first, attempted, ttfb = _run(
-            db, realm=realm, model=model, body=body, key=key,
+        account, holder, first, attempted, ttfb = await http_shared.run_blocking(
+            _run, db, on_orphan=_abandon_run, realm=realm, model=model, body=body, key=key,
             render=render_stream, sticky_key=sticky, use_case=USE_CASE["/v1/messages"])
 
         def generator():
@@ -1235,10 +1275,10 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
             finally:
                 _release(holder)
                 _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/messages", started=started)
+                      "/v1/messages", started=started, request=request)
 
         return StreamingResponse(
-            bridge.with_pings(generator(), ping=bridge.ANTHROPIC_PING),
+            http_shared.async_stream(generator(), ping=bridge.ANTHROPIC_PING),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     finally:
@@ -1253,7 +1293,7 @@ async def count_tokens(request: Request) -> JSONResponse:
     """
     db = SessionLocal()
     try:
-        _auth(db, request)
+        await asyncio.to_thread(_auth, db, request)
         payload = await _json_body(request)
         text_parts: list[str] = []
         system = payload.get("system")
@@ -1294,26 +1334,29 @@ async def list_models(request: Request) -> JSONResponse:
     """
     db = SessionLocal()
     try:
-        key = _auth(db, request)
+        key = await asyncio.to_thread(_auth, db, request)
         realm, _model = resolve_target(request, None, key)
-        live_names: set[str] = set()
-        note = ""
-        try:
-            account = trae_pool.select(db, realm=realm, key_id=getattr(key, "id", None),
-                                       account_id=getattr(key, "account_id", None),
-                                       key=key, mark_picked=False)
-            if account is None:
-                note = "号池里没有可用的 Trae 账号，仅返回目录"
-            else:
+        def _probe_live():
+            live: set[str] = set()
+            try:
+                account = trae_pool.select(db, realm=realm, key_id=getattr(key, "id", None),
+                                           account_id=getattr(key, "account_id", None),
+                                           key=key, mark_picked=False)
+                if account is None:
+                    return live, "号池里没有可用的 Trae 账号，仅返回目录"
                 creds = trae_pool.credentials(db, account)
                 rows = client.fetch_model_list(creds, realm)
                 catalog.note_live_rows(realm, rows)
-                live_names = {str(r.get("name") or "") for r in rows}
+                live = {str(r.get("name") or "") for r in rows}
                 _release({"uid": account.uid})
-        except client.UpstreamError as exc:
-            note = "上游模型清单获取失败（%s），仅返回目录" % exc.message
-        except Exception as exc:  # noqa: BLE001
-            note = "上游模型清单获取失败：%s" % exc
+                return live, ""
+            except client.UpstreamError as exc:
+                return live, "上游模型清单获取失败（%s），仅返回目录" % exc.message
+            except Exception as exc:  # noqa: BLE001
+                return live, "上游模型清单获取失败：%s" % exc
+
+        # P1：拉上游模型清单是同步 HTTP，放进线程
+        live_names, note = await asyncio.to_thread(_probe_live)
 
         entries = []
         for item in catalog.realm_models(realm):
@@ -1352,9 +1395,9 @@ async def list_models(request: Request) -> JSONResponse:
 async def balance(request: Request) -> JSONResponse:
     db = SessionLocal()
     try:
-        key = _auth(db, request)
+        key = await asyncio.to_thread(_auth, db, request)
         realm, _ = resolve_target(request, None, key)
-        rows = trae_pool.accounts_for(db, realm)
+        rows = await asyncio.to_thread(trae_pool.accounts_for, db, realm)
         total = sum(int(a.balance_total or 0) for a in rows if a.status == "active")
         remain = sum(int(a.balance_remain or 0) for a in rows if a.status == "active")
         return JSONResponse({
@@ -1384,22 +1427,35 @@ async def _json_body(request: Request) -> dict:
 
 
 def _bill(key, account, model, holder, ip, ttfb_ms, attempted, path,
-          started=None) -> None:
+          started=None, request=None) -> None:
     """记一条用量（独立 session，绝不影响已返回的响应）。
 
     `started` 是请求开始时的 `time.perf_counter()`。用它算**总耗时**，
     和 `ttfb_ms` 分开记 —— 两者相等的话 `latency - ttfb = 0`，
     TPS 只能退回整段计算，真实 200+ tok/s 会被算成 40 多。
+
+    `ttfb_ms=None`（非流式）时首字存 NULL，不再用总耗时冒充（N2）。
+
+    2026-11-24 修：原来这里引用了未定义的 `request` 与 `shared`（NameError 被下面的
+    except 吞掉），**Trae raw chat 通道的用量一条都没落库**。
     """
     try:
+        from admin.platform import shared
+
         usage = holder.get("usage") or {}
         # 总耗时：流式消费完再记账，此刻的时间才是真正的完成时间
         total_ms = (int((time.perf_counter() - started) * 1000)
                     if started else None)
-        ttfb = int(ttfb_ms or 0)
+        ttfb = int(ttfb_ms) if ttfb_ms else None
         # 数据自洽性：总耗时不能小于首包时间
-        if total_ms is not None and total_ms < ttfb:
+        if total_ms is not None and ttfb is not None and total_ms < ttfb:
             total_ms = ttfb
+        effort = ""
+        if request is not None:
+            try:
+                effort = shared.reasoning_effort_of_request(request)
+            except Exception:  # noqa: BLE001
+                effort = ""
         with SessionLocal() as session:
             trae_pool.record_usage(
                 session,
@@ -1410,10 +1466,10 @@ def _bill(key, account, model, holder, ip, ttfb_ms, attempted, path,
                 client_ip=ip,
                 use_case=USE_CASE.get(path, ""),
                 seq=attempted,
-                ttfb_ms=ttfb or total_ms,
+                ttfb_ms=ttfb,
                 latency_ms=total_ms or ttfb,
                 realm=str(holder.get("realm") or ""),
-                reasoning_effort=shared.reasoning_effort_of_request(request),
+                reasoning_effort=effort,
             )
     except Exception:  # noqa: BLE001
         logger.exception("trae 记账失败 path=%s", path)

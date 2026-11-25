@@ -404,7 +404,9 @@ def request_json(method: str, url: str, *, token: str, realm: str = "cn",
     tag = "raccoon#%s" % (account_id if account_id is not None else "-")
     started = time.perf_counter()
     try:
-        with httpx.Client(timeout=TIMEOUT, follow_redirects=True) as client:
+        from admin import http_shared
+        with httpx.Client(follow_redirects=True,
+                          **http_shared.client_kwargs("raccoon", timeout=TIMEOUT)) as client:  # P3：共享连接池 + 共享 TLS 上下文 + 建连 10s（cookie 仍按请求隔离）
             resp = client.request(method, url, headers=headers,
                                   json=json_body, params=params)
     except httpx.HTTPError as exc:
@@ -577,7 +579,9 @@ def open_stream(url: str, *, token: str, realm: str = "cn", json_body=None,
     # 计时起点：**发起请求之前**（不是开始读行时）。httpx 的 send 返回时
     # 已经收下响应头和首批缓冲字节，从那里起算会把 TTFT 记成几十毫秒。
     started = time.perf_counter()
-    client_obj = httpx.Client(timeout=TIMEOUT, follow_redirects=True)
+    from admin import http_shared
+    client_obj = httpx.Client(follow_redirects=True,
+                              **http_shared.client_kwargs("raccoon", timeout=TIMEOUT))  # P3：共享连接池 + 共享 TLS 上下文 + 建连 10s（cookie 仍按请求隔离）
     try:
         request = client_obj.build_request("POST", url, headers=headers,
                                            json=json_body)

@@ -144,10 +144,15 @@ def test(acc_id: int, _: bool = Depends(require_admin),
 
 
 @router.get("/export")
-def export(ids: str = "", _: bool = Depends(require_admin),
-           db: Session = Depends(get_db)):
+def export(request: Request, ids: str = "", mode: str = "plain", reveal: int = 0,
+           _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """导出。默认脱敏（递归打码凭证键）；`mode=backup` / `reveal=1` + 二次确认才给完整凭证。"""
+    from admin import export_guard
+    full = export_guard.guard_secret_export(
+        request, "codearts export", export_guard.wants_secrets(mode == "backup", reveal))
     parsed = [int(part) for part in ids.split(",") if part.strip().isdigit()]
-    return ca.export_accounts(db, parsed or None)
+    result = ca.export_accounts(db, parsed or None)
+    return result if full else export_guard.sanitize(result)
 
 
 @router.get("/models")

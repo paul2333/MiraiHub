@@ -460,7 +460,9 @@ def _new_client(timeout) -> httpx.Client:
     **唯一**的建连点：测试用它注入 `httpx.MockTransport`，于是全部用例离线
     （不触网、不需要真令牌）。生产不需要切换任何开关。
     """
-    return httpx.Client(timeout=timeout)
+    from admin import http_shared
+    # P3：共享连接池 + TLS 上下文 + 建连 10s（cookie 仍按请求隔离）；测试照旧替换本函数注入 MockTransport
+    return httpx.Client(**http_shared.client_kwargs("codar", timeout=timeout))
 
 def request_json(method: str, url: str, *, token: str = "",
                  protocol: str = "chat", json_body=None, params=None,

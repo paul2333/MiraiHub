@@ -396,9 +396,12 @@ def record_usage(db: Session, *, key_id: int, account_id: int, model: str,
             if credits:
                 account.balance_remain = max(0, int(account.balance_remain or 0)
                                              - int(abs(credits)))
+        # 落**落库名** `trae`（与 shared.record_usage 同口径）。原来写对外 id
+        # （trae-cn / trae-intl），但启动迁移每次都会把它们抹回 `trae`，两种写法
+        # 混在库里只会让按 platform 列的筛选时灵时不灵。区信息靠 account_id
+        # （accounts.domain）还原；usage_logs 的 realm 列是中期方案（N4）。
         log = UsageLog(api_key_id=key_id or 0, account_id=account_id or 0,
-                       platform=("trae-cn" if realm == "cn" else
-                                 "trae-intl" if realm == "intl" else PLATFORM),
+                       platform=PLATFORM,
                        model=model or "", credits=credits,
                        prompt_tokens=prompt, completion_tokens=completion,
                        total_tokens=total, cached_tokens=cached,

@@ -205,8 +205,9 @@ def ensure_credential(db: Session, account: Account, *, force: bool = False) -> 
             merged = dict(data)
             merged.update(local)
             return _adopt(account, merged, db)
-        account.status = "disabled"
-        account.last_err_msg = ("续期失败：%s" % exc.message)[:250]
+        # D7-6.4：续期被拒也先冷却，连续达到阈值才停用（ban_recheck 复核恢复）
+        from admin import account_health
+        account_health.note_auth_failure(db, account, ("续期失败：%s" % exc.message)[:150])
         account.last_upstream_error = str(exc.detail or "")[:2000]
         db.commit()
         raise client.UpstreamError(
@@ -286,7 +287,8 @@ def sync_quota(db: Session, account: Account, *, with_models: bool = False) -> d
         account.last_err_msg = str(exc.message or "")[:250]
         account.last_upstream_error = json.dumps(exc.to_dict(), ensure_ascii=False)[:2000]
         if exc.kind in ("auth", "signature_invalid"):
-            account.status = "disabled"
+            from admin import account_health
+            account_health.note_auth_failure(db, account, str(exc.message or "")[:150])
         elif exc.kind == "quota_exceeded":
             account.cool_until = datetime.utcnow() + timedelta(seconds=QUOTA_COOL_SECONDS)
             account.cool_kind = "quota"
@@ -308,8 +310,12 @@ def sync_quota(db: Session, account: Account, *, with_models: bool = False) -> d
         if str(getattr(account, "cool_kind", "") or "") == "quota":
             account.cool_until = None
             account.cool_kind = ""
-        if str(account.status or "") == "disabled":
+        # 人工停用的号不能被一次同步成功自动解封（D7：禁用与解封互相打架）
+        if (str(account.status or "") == "disabled"
+                and str(getattr(account, "cool_kind", "") or "") != "manual_disabled"):
             account.status = "active"
+    from admin import account_health
+    account_health.clear_auth_failure(account)
     db.commit()
     return {"ok": True, "quota": quota}
 

@@ -457,7 +457,7 @@ _CALLBACK_PAGE = """<!DOCTYPE html>
   {copy_block}
   <p class="hint">{hint}</p>
 </div>
-<script>
+<script nonce="{csp_nonce}">
 (function () {{
   var btn = document.getElementById("copyBtn");
   if (!btn) return;
@@ -527,7 +527,22 @@ def _callback_page(ok: bool, title: str, message: str, detail: str = "",
     落在 127.0.0.1 打不开，但**地址栏里那条 URL 带着完整授权码**。
     与其让用户自己去地址栏选中复制（手机上几乎做不到），不如页面直接给按钮，
     点一下就复制好，回控制台自动填进去。
+
+    ## 安全（2026-11-24，S1）
+
+    这个页面挂在**未鉴权**的 `/api/trae/device/callback` 与 `/authorize` 上，
+    参数全部来自 URL。原来 `detail` 原样拼进 HTML（`?error=<img onerror=...>`
+    就是同源反射型 XSS），现在：
+      * `title` / `message` / `detail` / `hint` **全部 HTML 转义**，调用方只能传纯文本；
+      * 页面自带 CSP：脚本只允许本页带 nonce 的那一段内联脚本，不许外连、
+        不许被嵌套（server 中间件对 HTML 响应的 CSP 是 setdefault，不会覆盖这里）。
     """
+    import html as _html
+    import secrets as _secrets
+
+    def esc(value) -> str:
+        return _html.escape(str(value or ""), quote=True)
+
     if ok:
         colors = dict(bg="#f6f7f9", fg="#111827", surface="#ffffff",
                       border="#e5e7eb", muted="#6b7280", subtle="#9ca3af",
@@ -546,9 +561,7 @@ def _callback_page(ok: bool, title: str, message: str, detail: str = "",
     copy_block = ""
     if copy_url:
         # 用 html.escape 防止 URL 里的引号/尖括号打断属性
-        import html as _html
-
-        safe = _html.escape(copy_url, quote=True)
+        safe = esc(copy_url)
         copy_block = (
             '<button id="copyBtn" class="copy" type="button" '
             'data-url="%s">复制这条链接</button>'
@@ -562,18 +575,27 @@ def _callback_page(ok: bool, title: str, message: str, detail: str = "",
             % (safe, safe)
         )
 
+    csp_nonce = _secrets.token_urlsafe(16)
     html_out = _CALLBACK_PAGE.format(
-        title=title, message=message, icon=icon,
-        detail=(f'<div class="detail">{detail}</div>' if detail else ""),
+        title=esc(title), message=esc(message), icon=icon,
+        detail=(f'<div class="detail">{esc(detail)}</div>' if detail else ""),
         copy_block=copy_block,
-        hint=hint or "这个页面可以关闭了，回到控制台会看到结果。",
+        hint=esc(hint or "这个页面可以关闭了，回到控制台会看到结果。"),
+        csp_nonce=csp_nonce,
         bg=colors["bg"], fg=colors["fg"], surface=colors["surface"],
         border=colors["border"], muted=colors["muted"],
         subtle=colors["subtle"], iconBg=colors["iconBg"],
         iconFg=colors["iconFg"], codeBg=colors["codeBg"],
         brand=colors["brand"], okBg=colors["okBg"], okFg=colors["okFg"],
         errBg=colors["errBg"], errFg=colors["errFg"])
-    return HTMLResponse(html_out, status_code=200)
+    csp = ("default-src 'none'; script-src 'nonce-%s'; style-src 'unsafe-inline'; "
+           "img-src data:; base-uri 'none'; form-action 'none'; "
+           "frame-ancestors 'none'" % csp_nonce)
+    return HTMLResponse(html_out, status_code=200, headers={
+        "Content-Security-Policy": csp,
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+    })
 
 
 def _parse_trae_callback(query: dict) -> dict:
@@ -652,11 +674,19 @@ def device_callback(request: Request, code: str = "", state: str = "",
     # ---- 2) 找会话 ----
     key = (nonce or login_trace_id or loginTraceID or state or "").strip()
     session = trae_oauth.get(key) if key else None
-    if session is None:
+    if session is None and _callback_fallback_latest():
         # 上游**不保证**回传 login_trace_id / state（实测常常只有 code）。
-        # 这时退到「最近的未完成会话」—— 用户同一时刻只会发起一次授权，
-        # 直接报「会话已失效」会让真实授权永远完不成。
+        # 旧行为是退到「最近的未完成会话」。2026-11-24（安全 S1）起默认关闭：
+        # 这个回调未鉴权，任何人拿自己的授权码打一下，就能把**他自己的号**
+        # 塞进正在等待的会话（之后落到这个号上的对话他都能在上游历史里看到）。
+        # 匹配不到会话时改走下面的「复制链接 → 控制台提交」流程
+        # （POST /device/callback 有 require_admin + nonce 绑定）。
+        # 确需旧行为（单机桌面版、上游从不回传 state）时设
+        # TRAE_CALLBACK_FALLBACK_LATEST=1。
         session = trae_oauth.latest_pending()
+        if session is not None:
+            logger.warning("Trae 回调未带会话标识，按 TRAE_CALLBACK_FALLBACK_LATEST=1 "
+                           "退到最近的待完成会话 nonce=%s", session.nonce[:8])
 
     # 本页面的完整 URL —— 交给用户复制，服务器端解析后就能完成授权。
     try:
@@ -670,8 +700,8 @@ def device_callback(request: Request, code: str = "", state: str = "",
         if real_code and current_url:
             return _callback_page(
                 False, "还差一步：把这条链接交给服务器",
-                "授权本身已经成功，但这次回调落在了<b>你自己电脑</b>上"
-                "（Trae 只允许本机地址接收回调），服务器没收到。",
+                "授权本身已经成功，但服务器没能把这次回调对应到授权会话"
+                "（可能落在了你自己电脑上，或上游没有带回会话标识）。",
                 detail="",
                 copy_url=current_url,
                 hint="复制后回到控制台，链接会自动填入授权弹窗；"
@@ -680,10 +710,12 @@ def device_callback(request: Request, code: str = "", state: str = "",
             False, "授权会话已失效",
             "这个链接对应的授权已经结束或超时了，请回到控制台重新发起授权。")
     if error:
-        session.deliver(error=error_description or error)
+        # 错误文本来自 URL，只截断后当纯文本用（_callback_page 会转义）。
+        err_text = str(error_description or error)[:300]
+        session.deliver(error=err_text)
         return _callback_page(
             False, "授权未完成",
-            "上游返回了错误，请回到控制台重试。", error_description or error)
+            "上游返回了错误，请回到控制台重试。", err_text)
     if not real_code:
         session.deliver(error="回调缺少授权码")
         return _callback_page(
@@ -695,6 +727,21 @@ def device_callback(request: Request, code: str = "", state: str = "",
     return _callback_page(
         True, "授权完成",
         "账号正在写入号池，请回到控制台查看结果。")
+
+
+def _callback_fallback_latest() -> bool:
+    """GET 回调匹配不到会话时，是否退到「最近的待完成会话」（默认否，见 S1）。"""
+    return os.getenv("TRAE_CALLBACK_FALLBACK_LATEST", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _trace_id_in_callback(parsed_query: dict) -> str:
+    """回调 query（`parse_qs` 结果）里上游原样带回的 login_trace_id（纯函数）。"""
+    for key in ("loginTraceID", "login_trace_id", "loginTraceId"):
+        value = parsed_query.get(key)
+        if value:
+            return str(value[0] or "").strip()
+    return ""
 
 
 class CallbackSubmitIn(BaseModel):
@@ -752,21 +799,24 @@ def device_callback_submit(body: CallbackSubmitIn,
             detail="链接里没有授权码。请确认复制的是**授权完成后跳转页面的地址**，"
                    "不是 Trae 授权页本身的链接。")
 
-    # 会话按 nonce 绑定；链接里带 loginTraceID 时用它交叉校验，防串号
+    # 会话**只按 nonce 绑定**（security 第 6 节第 8 条）：
+    #   * 不带 nonce 时不再退到 `latest_pending()` —— 那会把粘贴的授权码交给
+    #     「最近一个待完成会话」，多人 / 多窗口同时授权时就串号；
+    #   * 链接里带回的 login_trace_id 就是发起时的 nonce（oauth.py 里
+    #     `login_trace_id = self.nonce`），不一致即拒。原来的交叉校验多了一个
+    #     `session.nonce != nonce` 条件 —— `get(nonce)` 取到的会话 nonce 必然相等，
+    #     整个条件恒为假，从来没拦过。`state` 不是我们写的，不参与比对。
     nonce = str(body.nonce or "").strip()
-    trace_in_url = ""
-    for key in ("loginTraceID", "login_trace_id", "state", "nonce"):
-        value = parsed_query.get(key)
-        if value:
-            trace_in_url = str(value[0] or "").strip()
-            break
-    session = trae_oauth.get(nonce) if nonce else None
-    if session is None:
-        session = trae_oauth.latest_pending()
+    if not nonce:
+        raise HTTPException(
+            400, detail="缺少授权会话标识（nonce）。请在发起「授权登录」的同一个弹窗里粘贴回调链接；"
+                        "若弹窗已关闭，请重新点一次「授权登录」")
+    trace_in_url = _trace_id_in_callback(parsed_query)
+    if trace_in_url and trace_in_url != nonce:
+        raise HTTPException(400, detail="这条回调链接不属于本次授权会话，请重新发起")
+    session = trae_oauth.get(nonce)
     if session is None:
         raise HTTPException(404, detail="授权会话已过期，请重新点一次「授权登录」")
-    if nonce and trace_in_url and trace_in_url != nonce and session.nonce != nonce:
-        raise HTTPException(400, detail="这条回调链接不属于本次授权会话，请重新发起")
 
     session.user_info = parsed["user_info"]
     session.deliver(code=parsed["code"], host=parsed["host"])

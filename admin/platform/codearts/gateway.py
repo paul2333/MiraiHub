@@ -45,6 +45,7 @@ import time
 
 from starlette.responses import JSONResponse, StreamingResponse
 
+from admin import http_shared
 from admin.platform import protocol_bridge as bridge
 from admin.platform import shared
 from admin.platform.codearts.core import client, session_window
@@ -222,7 +223,7 @@ async def _forward(body: dict, request) -> JSONResponse:
             db.commit()
         except Exception:  # noqa: BLE001
             db.rollback()
-        _bill(key, account, str(body.get("model") or ""),
+        await asyncio.to_thread(_bill, key, account, str(body.get("model") or ""),
               (result or {}).get("usage"), request=request, started=started,
               body=body)
         return JSONResponse(result)
@@ -304,7 +305,7 @@ async def _forward_stream(body: dict, request):
     while attempts < MAX_ATTEMPTS:
         if time.perf_counter() >= wait_deadline:
             break
-        account = shared.select_account(
+        account = await asyncio.to_thread(shared.select_account,
             db, storage=ca.PLATFORM, realm=realm, key=key, model=model,
             exclude_ids=exclude, min_balance=0,
             # 在途满 ≠ 没有号：返回最闲的那个，让下面的 lease 失败分支排队。
@@ -332,7 +333,7 @@ async def _forward_stream(body: dict, request):
             break
         attempts += 1
         try:
-            credential = ca.ensure_credential(db, account)
+            credential = await asyncio.to_thread(ca.ensure_credential, db, account)
             chunks = client.chat_stream(credential, body,
                                         account_id=int(account.id or 0),
                                         stats=stats)
@@ -342,7 +343,7 @@ async def _forward_stream(body: dict, request):
             # 上游拒绝了请求 → 会话**没有**建立 → 把名额还回去。
             session_window.WINDOW.rollback(uid, slot)
             slot = None
-            shared.note_failure(
+            await asyncio.to_thread(shared.note_failure,
                 db, account, kind=exc.kind, detail=exc.detail or exc.message,
                 status=exc.status, model=model, public_platform=PUBLIC,
                 cool_seconds=(1800 if exc.kind in ("auth", "quota_exceeded",
@@ -392,36 +393,53 @@ async def _forward_stream(body: dict, request):
             # 「Stream ended without finish_reason」并按退避反复重试。
             yield _terminal_frame(model)
         finally:
-            # 会话占位从**流结束**开始计时（上游按空闲算滞留）：
-            # 一次跑了 5 秒的流，占位总时长是 5 + 55，而不是 55。
-            # 不戳这一下，闸门会比上游早放行 ~「流的时长」，实测导致
-            # 放行后仍被 400 TM.00001041 打回。
+            _finish()
+
+    def _finish():
+        # 会话占位从**流结束**开始计时（上游按空闲算滞留）：
+        # 一次跑了 5 秒的流，占位总时长是 5 + 55，而不是 55。
+        # 不戳这一下，闸门会比上游早放行 ~「流的时长」，实测导致
+        # 放行后仍被 400 TM.00001041 打回。
+        try:
+            session_window.WINDOW.touch(account.uid or "", slot)
+        except Exception:  # noqa: BLE001 - 观测性操作，绝不影响收尾
+            logger.debug("CodeArts 会话窗口 touch 失败", exc_info=True)
+        try:
+            shared.release(account)
+            # 流内错误不是「调用成功」：别把坏响应记成绿勾，也别重置
+            # 账号的连续失败计数（但也不惩罚账号，错在请求体/上游）。
+            if not holder.get("error"):
+                shared.note_success(account)
+            db.commit()
+        except Exception:  # noqa: BLE001
             try:
-                session_window.WINDOW.touch(account.uid or "", slot)
-            except Exception:  # noqa: BLE001 - 观测性操作，绝不影响收尾
-                logger.debug("CodeArts 会话窗口 touch 失败", exc_info=True)
-            try:
-                shared.release(account)
-                # 流内错误不是「调用成功」：别把坏响应记成绿勾，也别重置
-                # 账号的连续失败计数（但也不惩罚账号，错在请求体/上游）。
-                if not holder.get("error"):
-                    shared.note_success(account)
-                db.commit()
+                db.rollback()
             except Exception:  # noqa: BLE001
-                try:
-                    db.rollback()
-                except Exception:  # noqa: BLE001
-                    pass
-            _bill(key, account, model, holder.get("usage"), request=request,
-                  started=started, stats=stats, body=body,
-                  error=str(holder.get("error") or ""))
-            db.close()
+                pass
+        _bill(key, account, model, holder.get("usage"), request=request,
+              started=started, stats=stats, body=body,
+              error=str(holder.get("error") or ""))
+        db.close()
+
+    def _release_unstarted():
+        # r3 第 3 项：被协议中继包住、内层 body 一帧都没被拉过时（客户端在
+        # message_start 之后、首帧之前走掉），generator() 从未启动，它的 finally
+        # 不会执行。这里关上游响应（chat_stream 已经打开）并做同样的收尾。
+        holder.setdefault("error", "client_disconnected")
+        try:
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                close()
+        finally:
+            _finish()
 
     # 上游慢思考时整条流可能几十秒无字节；8 秒一帧注释让「链路活着」可见
-    safe = bridge.with_pings(generator(), ping=bridge.CHAT_PING)
-    return StreamingResponse(
+    # P4：异步桥（不占 anyio 令牌；断连后停读上游并 close 生成器）
+    safe = http_shared.async_stream(generator(), ping=bridge.CHAT_PING)
+    response = StreamingResponse(
         safe, media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return bridge.guard_unstarted(response, _release_unstarted)
 
 
 def _terminal_frame(model: str) -> bytes:
@@ -532,7 +550,7 @@ async def list_models(request):
     with SessionLocal() as db:
         shared.authenticate(db, request, platform=PUBLIC)
         realm = _realm(request)
-        account = shared.select_account(
+        account = await asyncio.to_thread(shared.select_account,
             db, storage=ca.PLATFORM, realm=realm, key=shared.key_row(db, request))
         if account is None:
             return JSONResponse({
@@ -540,8 +558,8 @@ async def list_models(request):
                 "data": shared.catalog_from_db(db, ca.PLATFORM),
                 "note": "号池没有可用 CodeArts 账号，仅返回配置目录"})
         try:
-            credential = ca.ensure_credential(db, account)
-            models = client.fetch_models(credential,
+            credential = await asyncio.to_thread(ca.ensure_credential, db, account)
+            models = await asyncio.to_thread(client.fetch_models, credential,
                                          account_id=int(account.id or 0))
         except client.UpstreamError as exc:
             return _fail(exc)
@@ -555,15 +573,15 @@ async def balance(request):
     with SessionLocal() as db:
         shared.authenticate(db, request, platform=PUBLIC)
         realm = _realm(request)
-        account = shared.select_account(
+        account = await asyncio.to_thread(shared.select_account,
             db, storage=ca.PLATFORM, realm=realm, key=shared.key_row(db, request))
         if account is None:
             return JSONResponse({"platform": PUBLIC, "realm": realm,
                                  "reachable": False, "balance": 0,
                                  "note": "号池没有可用账号"}, status_code=503)
         try:
-            credential = ca.ensure_credential(db, account)
-            quota = client.fetch_quota(credential,
+            credential = await asyncio.to_thread(ca.ensure_credential, db, account)
+            quota = await asyncio.to_thread(client.fetch_quota, credential,
                                        account_id=int(account.id or 0))
         except client.UpstreamError as exc:
             return _fail(exc)

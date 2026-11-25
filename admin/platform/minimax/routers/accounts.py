@@ -11,7 +11,7 @@ from __future__ import annotations
 import threading
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from admin.platform.minimax.core import client, paths
@@ -377,9 +377,13 @@ def checkin_all(realm: str = "", _: bool = Depends(require_admin),
 
 
 @router.get("/export")
-def export_accounts(mode: str = "backup", realm: str = "",
+def export_accounts(request: Request, mode: str = "plain", realm: str = "",
                     _: bool = Depends(require_admin), db=Depends(get_db)):
-    """导出（backup=含凭证 / plain=脱敏清单），前端通用导出弹窗用。"""
+    """导出（backup=含凭证，需二次确认 / plain=脱敏清单，默认），前端通用导出弹窗用。"""
+    from admin import export_guard
+    full = export_guard.guard_secret_export(request, "minimax export",
+                                            export_guard.wants_secrets(mode == "backup"))
+    mode = "backup" if full else "plain"
     rows = minimax_accounts.accounts_for(db, realm)
     accounts = []
     for row in rows:
