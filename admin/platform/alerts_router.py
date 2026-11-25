@@ -122,6 +122,44 @@ def _mask(data: dict) -> dict:
     return out
 
 
+def _mask_channels(channels) -> list[dict]:
+    """`config.channels` 打码（2026-11-24 第 3 轮 followups）。
+
+    与 `alerting.channels_summary()` 同口径：`target_masked` 恒有（展示用），
+    `target` 是否打码受 `ALERT_MASK_TARGETS` 控制（默认 1），`masked` 标明 `target` 是否已打码。
+    前端把打码值原样 PUT 回来时，由 `put_config` 用 `restore_masked_targets` 还原。
+    """
+    do_mask = alerting._mask_targets_enabled()
+    out = []
+    for item in channels or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "")
+        raw = str(item.get("target") or "")
+        shown = alerting.mask_target(kind, raw)
+        out.append({
+            "type": kind,
+            "target": shown if do_mask else raw,
+            "target_masked": shown,
+            "masked": bool(do_mask and shown != raw),
+        })
+    return out
+
+
+def _known_channels(db: Session) -> list[dict]:
+    """还原打码值时的原值来源：库里保存的 + 当前生效的。
+
+    只配在 `.env`（`ADMIN_ALERT_CHANNELS`）、从没在界面保存过的渠道不在库里，
+    但 `channels_summary()` 会把它们（打码后）给前端；不并进来的话第一次保存会把它们丢掉。
+    """
+    known = [c for c in (_load(db).get("channels") or []) if isinstance(c, dict)]
+    try:
+        known.extend(alerting.active_channels())
+    except Exception:  # noqa: BLE001 - 取不到生效渠道时只用库里的
+        pass
+    return known
+
+
 def bootstrap() -> None:
     """服务启动时把库里保存的配置灌进 os.environ。
 
@@ -141,8 +179,11 @@ def bootstrap() -> None:
 @router.get("/api/alerts/config")
 def get_config(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
     data = _load(db)
+    config = _mask(data)
+    if "channels" in config:
+        config["channels"] = _mask_channels(config.get("channels"))
     return {
-        "config": _mask(data),
+        "config": config,
         "channels": alerting.channels_summary(),
         "labels": alerting.CHANNEL_LABELS,
         "enabled": bool(data.get("enabled", True)),
@@ -155,11 +196,16 @@ def get_config(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
 @router.put("/api/alerts/config")
 def put_config(body: ConfigIn, _: bool = Depends(require_admin),
                db: Session = Depends(get_db)):
+    # 前端拿到的是打码后的 webhook（`https://host/***abcd`），整表 PUT 回来时
+    # 按 (type, 打码值) 换回原值；换不回的打码项直接丢弃，绝不把 `***` 存成地址。
+    incoming = [{"type": c.type, "target": c.target}
+                for c in body.channels if c.type and c.target]
+    channels = [c for c in alerting.restore_masked_targets(incoming, _known_channels(db))
+                if c.get("type") and c.get("target")]
     data = {
         "enabled": bool(body.enabled),
         "cooldown": max(30, int(body.cooldown or 600)),
-        "channels": [{"type": c.type, "target": c.target}
-                     for c in body.channels if c.type and c.target],
+        "channels": channels,
         "smtp_host": body.smtp_host.strip(),
         "smtp_port": int(body.smtp_port or 465),
         "smtp_user": body.smtp_user.strip(),
@@ -210,5 +256,12 @@ def send_test(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
         "codes": {},
     }
     result = alerting.deliver(event)
+    # 测试结果里的 target 也是原始 webhook：同 channels_summary 口径打码
+    do_mask = alerting._mask_targets_enabled()
+    for item in result.get("results") or []:
+        shown = alerting.mask_target(item.get("type") or "", item.get("target") or "")
+        item["target_masked"] = shown
+        if do_mask:
+            item["target"] = shown
     ok_all = all(r["ok"] for r in result["results"]) and bool(result["results"])
     return {"ok": ok_all, "smtp": alerting.config_summary(), **result}
