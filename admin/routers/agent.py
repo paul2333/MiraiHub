@@ -748,25 +748,46 @@ async def _run_turn(request, db, key, row, text, model, mode, hints=None,
             # meta，然后整轮空白）。这里 getter 只在**成功取到一条**之后才
             # 重建，杜绝取消竞争。
             getter = asyncio.create_task(queue.get())
-            while True:
-                done, _pending = await asyncio.wait(
-                    {call, getter}, return_when=asyncio.FIRST_COMPLETED)
-                if getter in done:
-                    yield _sse(getter.result())
-                    getter = asyncio.create_task(queue.get())
-                    # 调用已结束且队列取空 → 收尾
-                    if call.done() and queue.empty():
-                        break
-                    continue
-                break
-            getter.cancel()
             try:
-                await getter
-            except asyncio.CancelledError:
-                pass
-            while not queue.empty():
-                yield _sse(queue.get_nowait())
-            result = call.result()
+                while True:
+                    done, _pending = await asyncio.wait(
+                        {call, getter}, return_when=asyncio.FIRST_COMPLETED)
+                    if getter in done:
+                        yield _sse(getter.result())
+                        getter = asyncio.create_task(queue.get())
+                        # 调用已结束且队列取空 → 收尾
+                        if call.done() and queue.empty():
+                            break
+                        continue
+                    break
+                getter.cancel()
+                try:
+                    await getter
+                except asyncio.CancelledError:
+                    pass
+                while not queue.empty():
+                    yield _sse(queue.get_nowait())
+                result = call.result()
+            finally:
+                # **取消路径的回收**（优雅退出任务 2）：客户端断开 / 任务被 cancel 时，
+                # 上面那个 `await asyncio.wait(...)` 会带着 CancelledError 跳出，
+                # 而 call / getter 两个 task 仍然活着 —— 请求已经结束、它们还在用
+                # db/key 打上游，既不计入任何租约，也会在事件循环关闭时冒出
+                # "Task was destroyed but it is pending!"。
+                # 这里一律 cancel + gather(return_exceptions=True) 回收：
+                #   * 只有还有 pending 时才 await，正常路径（两个都已结束）无需等待；
+                #   * 不吞 CancelledError / GeneratorExit（BaseException），只把回收本身
+                #     的普通异常记进 debug，绝不改变请求结果。
+                pending = [task for task in (getter, call) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    try:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    except (asyncio.CancelledError, GeneratorExit):
+                        raise
+                    except Exception:  # noqa: BLE001 - 回收失败不改变请求结果
+                        _logger.debug('智能体子任务回收失败', exc_info=True)
             if not result.get('ok'):
                 if not result.get('message', {}).get('content'):
                     yield _sse({'type': 'error',

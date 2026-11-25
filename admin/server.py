@@ -1,7 +1,10 @@
 """管理后台 FastAPI 入口：登录、挂载路由、托管前端静态页、启动时建库建表。"""
+import asyncio
+import gzip as _gzip
 import hashlib
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -21,15 +24,18 @@ from admin.routers import (accounts, credits, groups,
                            model_market_key as model_market_key_router,
                            proxy, proxies, schedules, sessions as sessions_router,
                            stats, sync)
-from admin.ratelimit import (client_ip_from_request, clear_failures,
-                             is_locked, record_failure)
+from admin.ratelimit import (clear_login_delay, client_ip_from_request,
+                             clear_failures, is_locked, note_login_failure,
+                             record_failure, reserve_login_delay)
 from admin.security import (
     create_admin_token,
     hash_password,
+    password_weakness,
     require_admin,
     verify_admin_token,
     verify_password,
 )
+from starlette.concurrency import run_in_threadpool
 from admin.gateway_limits import GatewayAdmissionMiddleware
 from admin.ip_access import IPBlockMiddleware
 from admin.routers import join_invites
@@ -184,10 +190,15 @@ async def _join_gate_middleware(request: Request, call_next):
         or path.startswith("/api/join/invites")
         or path.startswith("/api/open/admin/")
     ):
-        try:
+        def _check() -> bool:
             from admin import join_gate as _jg
             with SessionLocal() as db:
-                allowed = _jg.check_access(db, request.cookies.get(_jg.COOKIE_NAME, ""))
+                return bool(_jg.check_access(db, request.cookies.get(_jg.COOKIE_NAME, "")))
+
+        try:
+            # 第 4 轮 R4-BE-07：同步查库离开事件循环（公开入口，可被刷）。
+            from starlette.concurrency import run_in_threadpool as _rit
+            allowed = await _rit(_check)
         except Exception:  # noqa: BLE001 - 数据库不可用时 fail-closed
             allowed = False
         if not allowed:
@@ -236,25 +247,221 @@ async def _security_headers(request: Request, call_next):
     # 就正常，只有严格 CSP 会断）。Windows 的 WebView2 走自己的脚本通道，
     # 不受这条影响，所以这个问题只在 macOS 上暴露。
     #
-    # 只对桌面壳放行：它固定带 `?desktop=1`（desktop.js 也会补上）。
-    # 普通浏览器打开后台**不带**这个参数，CSP 保持原样。
-    _desktop_shell = (request.query_params or {}).get("desktop") == "1"
+    # 只对桌面壳放行（2026-11-24 第 3 轮，安全 P3 / 审查 S-8e）：原来只认
+    # `?desktop=1`，任何人发一条带这个参数的链接就能让普通浏览器的后台页
+    # CSP 带上 'unsafe-eval'。现在判据见 `_desktop_shell_request()`。
+    _desktop_shell = _desktop_shell_request(request)
     _script_src = ("script-src 'self' 'unsafe-inline' 'unsafe-eval'"
                    if _desktop_shell else "script-src 'self' 'unsafe-inline'")
+    _admin_csp = ("default-src 'self'; "
+                  + _script_src + "; "
+                  "style-src 'self' 'unsafe-inline'; "
+                  "img-src 'self' data: blob:; "
+                  "font-src 'self' data:; "
+                  "connect-src 'self'; "
+                  "media-src 'self' blob:; "
+                  "object-src 'none'; base-uri 'self'; "
+                  "frame-ancestors 'none'; form-action 'self'")
     if _is_html_doc:
-        response.headers.setdefault(
-            "Content-Security-Policy",
-            "default-src 'self'; "
-            + _script_src + "; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: blob:; "
-            "font-src 'self' data:; "
-            "connect-src 'self'; "
-            "media-src 'self' blob:; "
-            "object-src 'none'; base-uri 'self'; "
-            "frame-ancestors 'none'; form-action 'self'",
-        )
+        response.headers.setdefault("Content-Security-Policy", _admin_csp)
+    elif (_p not in _DOCS_PATHS
+          and (response.headers.get("content-type") or "").lower().startswith("text/html")):
+        # 2026-11-24（安全 S1）：原来 CSP 只按路径白名单下发，`/api/*`、`/authorize`
+        # 返回的 HTML（Trae 授权回调页）没有 CSP，回调页一旦有注入就是同源 XSS。
+        # 现在**凡是 HTML 响应都带 CSP**：接口类路径默认不许跑任何脚本；
+        # 页面自己需要脚本时自带 nonce CSP（这里是 setdefault，不会覆盖）。
+        if _p.startswith("/api/") or _p == "/authorize":
+            response.headers.setdefault("Content-Security-Policy", _STRICT_HTML_CSP)
+        else:
+            response.headers.setdefault("Content-Security-Policy", _admin_csp)
     return response
+
+
+#: 桌面壳专用标识（新版壳应在 UA 里带上，或给请求加这个头）。
+DESKTOP_SHELL_UA_TOKEN = "MiraiHub-Desktop"
+DESKTOP_SHELL_HEADER = "X-MiraiHub-Desktop"
+#: 紧急回退：DESKTOP_CSP_QUERY_LEGACY=1 恢复「只要 ?desktop=1 就放宽」的旧判据。
+_DESKTOP_CSP_QUERY_LEGACY = (os.getenv("DESKTOP_CSP_QUERY_LEGACY", "0").strip().lower()
+                             in ("1", "true", "yes", "on"))
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def desktop_shell_request(query_desktop: bool, header_value: str, user_agent: str,
+                          local_runtime: bool, client_host: str, host_header: str,
+                          legacy: bool = False) -> bool:
+    """是否把这次 HTML 请求当作桌面壳（纯函数，便于单测）。
+
+    放宽 'unsafe-eval' 的条件（任一）：
+      1. 请求带桌面壳专用头 `X-MiraiHub-Desktop: 1`，或 UA 含 `MiraiHub-Desktop`
+         —— 跨站链接无法让受害者浏览器带上自定义头 / 改 UA；
+      2. `?desktop=1` **且** 本机客户端运行时（WORKBUDDY_DESKTOP，生产恒 False）
+         **且** 对端与 Host 都是回环地址 —— 兼容现有壳（desktop/app.py 只用
+         `load_url("http://127.0.0.1:<port>/admin?desktop=1")`，不发自定义头，
+         macOS WKWebView 的默认 UA 也没有可识别标记）；
+      3. 运维显式打开 DESKTOP_CSP_QUERY_LEGACY=1 时回到旧判据（只看 ?desktop=1）。
+    """
+    if str(header_value or "").strip() == "1":
+        return True
+    if DESKTOP_SHELL_UA_TOKEN.lower() in str(user_agent or "").lower():
+        return True
+    if not query_desktop:
+        return False
+    if legacy:
+        return True
+    if not local_runtime:
+        return False
+    host = str(host_header or "").strip().lower()
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    else:
+        host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    return (str(client_host or "") in _LOOPBACK_HOSTS) and (host in _LOOPBACK_HOSTS)
+
+
+def _desktop_shell_request(request: Request) -> bool:
+    try:
+        return desktop_shell_request(
+            (request.query_params or {}).get("desktop") == "1",
+            request.headers.get(DESKTOP_SHELL_HEADER) or "",
+            request.headers.get("user-agent") or "",
+            _local_runtime(),
+            request.client.host if request.client else "",
+            request.headers.get("host") or "",
+            legacy=_DESKTOP_CSP_QUERY_LEGACY)
+    except Exception:  # noqa: BLE001 - 判不出来就按普通浏览器（严格 CSP）
+        return False
+
+
+#: 接口类路径返回 HTML 时的兜底 CSP：不许脚本、不许外连、不许被嵌套。
+_STRICT_HTML_CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+                    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
+class ApiGZipMiddleware:
+    """`/api/*` 响应 gzip（前端第 4 批：首屏接口体积）。
+
+    为什么不直接用 Starlette 的 GZipMiddleware：
+      * 它不区分路径，`/v1/*` 网关流式响应也会被包一层（流式 gzip 会攒缓冲，
+        直接拖慢首字）；
+      * 旧版本不排除 `text/event-stream`，SSE 事件会被压缩缓冲卡住。
+    所以这里只做最保守的一种：**只压 `/api/*`、只压声明了 Content-Length 的
+    响应**（JSONResponse 就是这样；它穿过 `@app.middleware("http")` 时会被拆成
+    几段 `more_body=True`，这里按声明长度攒齐再压）。没有 Content-Length 的
+    真流式响应、SSE、超过 8MB 的响应、已编码的响应一律原样透传。
+
+    开关：ADMIN_API_GZIP=0 关闭；ADMIN_API_GZIP_MIN 最小压缩字节数（默认 1024）。
+    """
+
+    _COMPRESSIBLE = ("application/json", "application/javascript", "application/xml",
+                     "text/", "image/svg+xml")
+    #: 声明长度超过它就不攒缓冲（大文件下载之类，压缩收益不抵内存与延迟）。
+    MAX_BUFFER = 8 * 1024 * 1024
+
+    def __init__(self, app, minimum_size: int = 1024, compresslevel: int = 5):
+        self.app = app
+        self.minimum_size = max(0, int(minimum_size))
+        self.compresslevel = compresslevel
+
+    @classmethod
+    def _compressible(cls, ctype: str) -> bool:
+        ctype = (ctype or "").lower()
+        if ctype.startswith("text/event-stream"):
+            return False
+        return (ctype.startswith(cls._COMPRESSIBLE)
+                or "+json" in ctype or "+xml" in ctype)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not str(scope.get("path") or "").startswith("/api/"):
+            return await self.app(scope, receive, send)
+        accept = b""
+        for key, value in scope.get("headers") or ():
+            if key.lower() == b"accept-encoding":
+                accept = value.lower()
+                break
+        if b"gzip" not in accept:
+            return await self.app(scope, receive, send)
+
+        state = {"start": None, "passthrough": False, "chunks": [], "size": 0}
+
+        async def _flush_plain(message=None):
+            state["passthrough"] = True
+            if state["start"] is not None:
+                await send(state["start"])
+            for chunk in state["chunks"]:
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            state["chunks"] = []
+            if message is not None:
+                await send(message)
+
+        async def gzip_send(message):
+            kind = message.get("type")
+            if state["passthrough"]:
+                await send(message)
+                return
+            if kind == "http.response.start":
+                state["start"] = message
+                return
+            start = state["start"]
+            if kind != "http.response.body" or start is None:
+                await _flush_plain(message)
+                return
+            headers = [(k, v) for k, v in (start.get("headers") or [])]
+            lower = {k.lower(): v for k, v in headers}
+            if not state["chunks"] and not state["size"]:
+                # 第一段：决定压不压。
+                ctype = lower.get(b"content-type", b"").decode("latin-1")
+                cache = lower.get(b"cache-control", b"").decode("latin-1").lower()
+                try:
+                    declared = int(lower.get(b"content-length", b"-1"))
+                except ValueError:
+                    declared = -1
+                more = bool(message.get("more_body"))
+                if ((more and not (0 <= declared <= self.MAX_BUFFER))
+                        or (not more and len(message.get("body", b"") or b"") < self.minimum_size)
+                        or 0 <= declared < self.minimum_size
+                        or b"content-encoding" in lower or not self._compressible(ctype)
+                        or int(start.get("status") or 200) in (204, 206, 304)
+                        or "no-transform" in cache):
+                    await _flush_plain(message)
+                    return
+            chunk = message.get("body", b"") or b""
+            if chunk:
+                state["chunks"].append(chunk)
+                state["size"] += len(chunk)
+            if state["size"] > self.MAX_BUFFER:
+                await _flush_plain(None)
+                return
+            if message.get("more_body"):
+                return
+            body = b"".join(state["chunks"])
+            state["chunks"] = []
+            if len(body) < self.minimum_size:
+                state["passthrough"] = True
+                await send(start)
+                await send({"type": "http.response.body", "body": body, "more_body": False})
+                return
+            if len(body) > 1024 * 1024:
+                data = await run_in_threadpool(_gzip.compress, body, self.compresslevel)
+            else:
+                data = _gzip.compress(body, self.compresslevel)
+            if len(data) >= len(body):
+                state["passthrough"] = True
+                await send(start)
+                await send({"type": "http.response.body", "body": body, "more_body": False})
+                return
+            out = [(k, v) for k, v in headers
+                   if k.lower() not in (b"content-length", b"vary")]
+            vary = lower.get(b"vary", b"")
+            if b"accept-encoding" not in vary.lower():
+                vary = (vary + b", Accept-Encoding") if vary else b"Accept-Encoding"
+            out += [(b"content-encoding", b"gzip"),
+                    (b"content-length", str(len(data)).encode()),
+                    (b"vary", vary)]
+            state["passthrough"] = True
+            await send({**start, "headers": out})
+            await send({"type": "http.response.body", "body": data, "more_body": False})
+
+        await self.app(scope, receive, gzip_send)
 
 
 app.add_middleware(
@@ -269,6 +476,17 @@ app.add_middleware(JoinAdmissionMiddleware, max_active=settings.JOIN_MAX_CONCURR
 
 from admin.request_metrics import TimingMiddleware
 app.add_middleware(TimingMiddleware, persist=True)
+
+# 生命周期中间件：原子准入 + 在途计数 + 排空拒绝。
+#
+# **位置是契约**：目标层序从外到内必须是「封禁/IP 防护 → 生命周期 →
+# TimingMiddleware → 原准入队列与业务 dispatch」。add_middleware 是前插
+# （后注册更靠外），所以这一行必须夹在 TimingMiddleware 与 IPBlockMiddleware
+# 之间 —— 封的 IP 仍先拿到 429，排空 503 不进入计时/准入/计费，已准入的
+# 请求（含排队中的）也照样按原限流与超时语义跑完。
+from admin.lifecycle import LifecycleMiddleware, get_lifecycle
+app.add_middleware(LifecycleMiddleware)
+
 app.add_middleware(IPBlockMiddleware)
 
 # 异常行为守卫必须注册在**最后**（= 最外层）。
@@ -279,17 +497,464 @@ app.add_middleware(IPBlockMiddleware)
 # 为什么已有的 `IPBlockMiddleware` 不够：它内部用 `_is_public_gateway_path()`
 # 过滤，只保护 `/v1/*`；而事故中攻击者扫的是 `/api/accounts`，两者路径体系
 # 完全不同，等于完全没有风控。本中间件不区分路径，全站生效。
+# /api 响应 gzip：夹在 IP 封禁与异常守卫之间（守卫仍是最外层，见下）。
+if os.getenv("ADMIN_API_GZIP", "1").strip().lower() not in ("0", "false", "no", "off"):
+    try:
+        _gzip_min = int(os.getenv("ADMIN_API_GZIP_MIN", "1024") or 1024)
+    except ValueError:
+        _gzip_min = 1024
+    app.add_middleware(ApiGZipMiddleware, minimum_size=_gzip_min)
+
 from admin.abuse_guard import AbuseGuardMiddleware
 app.add_middleware(AbuseGuardMiddleware)
 
 
+# ---------------------------------------------------------------------------
+# 生命周期接口（CONTRACT 第 2 节，任务 1 交付）
+# ---------------------------------------------------------------------------
+#
+# 两者的「不被排空拒绝」由 LifecycleMiddleware 的豁免表保证（精确方法+路径），
+# 而不是撒一层 /api/* 的白名单：业务接口在排空时必须收到 503。
+
+
+@app.get("/api/app/ready")
+def app_ready():
+    """匿名、轻量、同源就绪探针。
+
+    等待页、升级闸门与前端都靠它区分「旧代还在排空」与「新代已可接单」。
+    只回 {"ready": bool}：不带代号、不带计数，匿名请求看不到任何后台状态。
+    """
+    ready = get_lifecycle().snapshot()["phase"] == "ready"
+    return JSONResponse({"ready": ready}, status_code=200 if ready else 503,
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/app/lifecycle", dependencies=[Depends(require_admin)])
+def app_lifecycle():
+    """当前生命周期快照（需管理员）。字段固定，不含请求原文/账号/密钥/本机路径。"""
+    return JSONResponse(get_lifecycle().snapshot(),
+                        headers={"Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------------------
+# 就绪发布（任务 2 交付）
+# ---------------------------------------------------------------------------
+#
+# 为什么不能「startup 跑完就发布 ready」：
+#   * `wait_database_ready()` 只证明「能连上」，证明不了「表已经建好」；
+#   * `init_db()` 失败（迁移卡住 / 权限不够 / 库刚被 OOM 杀掉）时进程仍要活着
+#     并给出诊断，但**不能**对外说「可以接单」——否则每个业务请求都撞 500；
+#   * 降级启动后数据库会自己恢复，要用一次**真实**探测把它接回来，而不是等人工
+#     重启；恢复之前迟到的探测也**不许**把准入改回 ready（排空不能被它撤销）。
+#
+# 「可选预热」（客户端版本发现、平台路径覆盖、更新检查、Node 准备）一律不在这里，
+# 它们不挡就绪 —— 就绪只等「必要初始化 + 数据库可用 + 必要表齐」。
+
+#: 就绪所需的最少表：缺任何一张都说明建表/迁移还没跑完。
+READY_REQUIRED_TABLES = ("accounts", "api_keys", "usage_logs",
+                         "request_audits", "schedules", "system_settings")
+
+#: 降级启动后真实 DB 探测的默认参数（可用环境变量收紧/放宽）。
+READINESS_PROBE_TIMEOUT = 5.0
+READINESS_PROBE_INTERVAL = 10.0
+
+
+def _env_float(name: str, default: float) -> float:
+    """读一个浮点环境变量；读不出来就用默认值（绝不因为配置写错卡住启动）。"""
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _required_tables_present(engine=None):
+    """必要表是否都在。返回 (ok, reason)；reason 只进日志与诊断，不进快照。"""
+    from sqlalchemy import inspect as sa_inspect
+
+    from admin.db import engine as default_engine
+
+    target = engine if engine is not None else default_engine
+    try:
+        existing = set(sa_inspect(target).get_table_names())
+    except Exception as exc:  # noqa: BLE001 - 读不到表清单就是「没就绪」
+        return False, "读取表清单失败：%s" % type(exc).__name__
+    missing = [name for name in READY_REQUIRED_TABLES if name not in existing]
+    if missing:
+        return False, "缺少必要表：" + "、".join(missing)
+    return True, ""
+
+
+def _database_probe(engine=None):
+    """真实数据库就绪探测：独立连接 + SELECT 1 + 必要表齐。
+
+    只读：不建表、不改配置、不启动线程池。降级恢复用它判断「现在能不能接单」。
+    """
+    from sqlalchemy import text as sa_text
+
+    from admin.db import engine as default_engine
+
+    target = engine if engine is not None else default_engine
+    try:
+        with target.connect() as connection:
+            connection.execute(sa_text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001 - 探测失败是常态，不是异常路径
+        return False, "数据库连接失败：%s" % type(exc).__name__
+    return _required_tables_present(target)
+
+
+def _probe_with_timeout(probe, timeout: float):
+    """在独立线程里跑一次探测并**给上限**：卡死的连接不许拖住进程。
+
+    为什么不用 `connect_timeout`：库驱动、DNS、连接池排队都可能各自卡住
+    （`pool_timeout` 默认 30 秒），逐个配超时太脆；这里统一用「线程 join 上限」。
+    """
+    box: dict = {}
+
+    def _run():
+        try:
+            box["value"] = probe()
+        except BaseException as exc:  # noqa: BLE001 - 探针自己的异常只算「没就绪」
+            box["error"] = exc
+
+    timeout = max(0.01, float(timeout))
+    thread = threading.Thread(target=_run, name="wb-db-probe", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return False, "探测超时（>%.1fs）" % timeout
+    if "error" in box:
+        return False, "探测异常：%s" % type(box["error"]).__name__
+    value = box.get("value")
+    if isinstance(value, tuple) and len(value) == 2:
+        return bool(value[0]), str(value[1] or "")
+    return bool(value), ""
+
+
+class ReadinessProbe:
+    """降级启动后的真实 DB 就绪探测：**有超时、单飞、限频**。
+
+    * 超时：每次探测自己 join 上限，卡住的连接不会拖死后续尝试；
+    * 单飞：同一时刻只允许一个探测在跑（`poke()` 返回 "busy"），
+      避免每轮都开新连接把降级中的库压垮；
+    * 限频：两次尝试之间至少隔 `min_interval` 秒（返回 "throttled"）；
+    * 排空期间迟到的成功探测**无权**把准入改回 ready：阶段不是 starting 时
+      既不补初始化也不发布就绪（`phase_closed`）。
+
+    恢复成功后只补**一次**初始化（`on_recovered`）再发布 ready；之后
+    `poke()` 直接返回 "phase_closed"。
+    """
+
+    def __init__(self, *, probe=None, on_recovered=None, timeout: float = READINESS_PROBE_TIMEOUT,
+                 min_interval: float = READINESS_PROBE_INTERVAL, lifecycle=None):
+        self._probe = probe if probe is not None else _database_probe
+        self._on_recovered = on_recovered
+        self._timeout = max(0.01, float(timeout))
+        self._min_interval = max(0.0, float(min_interval))
+        self._lifecycle = lifecycle
+        self._lock = threading.Lock()
+        self._busy = False
+        self._stopped = False
+        self._thread = None
+        self._last_attempt = None
+        self.attempts = 0
+        self.recovered = False
+        #: 最近一次探测结论 (ok, reason)；只用于日志与诊断。
+        self.last_result = (False, "")
+
+    # -- 状态 ---------------------------------------------------------------
+
+    @property
+    def lifecycle(self):
+        return self._lifecycle if self._lifecycle is not None else get_lifecycle()
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
+
+    # -- 探测 ---------------------------------------------------------------
+
+    def poke(self) -> str:
+        """跑一次探测。返回 busy/throttled/phase_closed/unavailable/ready/recovery_failed。"""
+        with self._lock:
+            if self._busy:
+                return "busy"
+            if self.lifecycle.snapshot()["phase"] != "starting":
+                # 已经 ready（重复探测）或已经排空/失败：都不该再补初始化。
+                return "phase_closed"
+            now = time.monotonic()
+            if (self._last_attempt is not None
+                    and now - self._last_attempt < self._min_interval):
+                return "throttled"
+            self._busy = True
+            self._last_attempt = now
+            self.attempts += 1
+        try:
+            ok, reason = _probe_with_timeout(self._probe, self._timeout)
+            self.last_result = (ok, reason)
+            if not ok:
+                return "unavailable"
+            # 探测期间可能已经开始排空：迟到的成功探测不许把准入改回 ready。
+            if self.lifecycle.snapshot()["phase"] != "starting":
+                logger.info("数据库已恢复，但本代已经不再等就绪（%s），跳过发布",
+                            self.lifecycle.snapshot()["phase"])
+                return "phase_closed"
+            if self._on_recovered is not None and not self.recovered:
+                try:
+                    self._on_recovered()
+                except Exception:  # noqa: BLE001 - 补初始化失败就继续等下一轮
+                    logger.exception("数据库恢复后补初始化失败，稍后重试")
+                    return "recovery_failed"
+            self.recovered = True
+            self.lifecycle.mark_ready()
+            logger.info("数据库已在降级模式后恢复：必要初始化补跑完成，已发布就绪")
+            return "ready"
+        finally:
+            with self._lock:
+                self._busy = False
+
+    def kick(self) -> bool:
+        """拉起后台探测线程（单飞：已在跑就不重复起）。"""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            self._stopped = False
+            thread = threading.Thread(target=self._loop, name="wb-ready-probe",
+                                      daemon=True)
+            self._thread = thread
+        thread.start()
+        return True
+
+    def stop(self) -> None:
+        """停止后台探测（关闭流程调用；正在跑的那次探测会自己结束）。"""
+        with self._lock:
+            self._stopped = True
+
+    @property
+    def stopped(self) -> bool:
+        with self._lock:
+            return self._stopped
+
+    def _loop(self) -> None:
+        while not self.stopped:
+            status = self.poke()
+            if status in ("ready", "phase_closed"):
+                return
+            # 限频由 poke() 自己把关，这里只负责别空转。
+            deadline = time.monotonic() + max(0.05, self._min_interval)
+            while time.monotonic() < deadline:
+                if self.stopped:
+                    return
+                time.sleep(min(0.2, max(0.02, self._min_interval)))
+
+
+#: 降级启动后的唯一后台探针（多次 startup 复用，不叠加线程）。
+_DEGRADED_PROBE = None
+
+
+def start_degraded_readiness_probe(**kwargs) -> ReadinessProbe:
+    """拉起降级就绪探测（单例）。已有在跑的探针时直接返回它。"""
+    global _DEGRADED_PROBE
+    probe = _DEGRADED_PROBE
+    if probe is not None and probe.running:
+        return probe
+    probe = ReadinessProbe(**kwargs)
+    _DEGRADED_PROBE = probe
+    probe.kick()
+    return probe
+
+
+def _publish_readiness(*, db_ok, init_ok, tables_ok, reason="") -> dict:
+    """就绪发布闸门：必要初始化完成 + 数据库可用 + 必要表齐，缺一不可。"""
+    lifecycle = get_lifecycle()
+    if db_ok and init_ok and tables_ok:
+        snapshot = lifecycle.mark_ready()
+        logger.info("生命周期就绪：instance=%s phase=%s",
+                    snapshot["instance_id"], snapshot["phase"])
+        return snapshot
+    snapshot = lifecycle.snapshot()
+    logger.warning(
+        "暂不发布就绪：db_ok=%s init_ok=%s tables_ok=%s phase=%s %s",
+        db_ok, init_ok, tables_ok, snapshot["phase"], reason)
+    return snapshot
+
+
+def _init_after_database_ready() -> dict:
+    """数据库可用后**必须补**的一次性初始化；启动路径与降级恢复路径共用。
+
+    只做「没有它就不能接单」的那几件事：运行配置覆盖、客户端路径覆盖、历史会话
+    清理、定时调度器、登录后自动任务。可选预热（客户端版本发现、平台路径预热、
+    更新检查）一律不在这里 —— 它们不挡就绪。
+    """
+    done = []
+    try:
+        from admin.runtime_settings import apply_overrides
+        with SessionLocal() as db:
+            applied = apply_overrides(db)
+        if applied:
+            logger.info("运行配置已套用 %d 项覆盖", applied)
+        done.append("runtime_settings")
+    except Exception as exc:  # noqa: BLE001 - 库表异常不影响启动
+        logger.warning("运行配置套用失败：%s", exc)
+    try:
+        from admin import wb_paths
+        overrides = wb_paths.load_into_wb()
+        if any(overrides.values()):
+            logger.info("已应用后台路径设置：%s", overrides)
+        done.append("wb_paths")
+    except Exception:  # noqa: BLE001
+        logger.exception("应用后台路径设置失败（继续用自动扫描）")
+    try:
+        with SessionLocal() as db:
+            session_store.purge(db)
+        done.append("session_purge")
+    except Exception:  # noqa: BLE001
+        logger.exception("清理历史会话失败（不影响启动）")
+    try:
+        from admin.scheduler import start_scheduler
+        start_scheduler()
+        done.append("scheduler")
+    except Exception:  # noqa: BLE001
+        logger.exception("定时调度器启动失败（不影响服务启动）")
+    try:
+        from admin.post_login import resume
+        resume()
+        done.append("post_login")
+    except Exception:  # noqa: BLE001
+        logger.exception("恢复登录后自动任务失败（不影响服务启动）")
+    return {"steps": done}
+
+
+def _log_client_version() -> None:
+    """客户端版本发现：只影响日志与出站 UA 的准确度，**不挡就绪**。
+
+    它要扫盘、读 `resources/app.asar`，最坏情况还要读 22MB 的
+    `cli/dist/codebuddy.js`（见 wb_install 的来源顺序）。原来直接在 startup 里
+    同步跑，慢盘上等于让「就绪」等一次全盘扫描 —— 所以挪到线程里。
+
+    顺序仍然保持「先应用后台路径覆盖、再做版本发现」：否则拿到的还是自动扫描
+    结果，后台改过的安装目录要等下一次发现才生效（见 wb_install._ov 的优先级）。
+    """
+    try:
+        from admin import wb_paths
+        overrides = wb_paths.load_into_wb()
+        if any(overrides.values()):
+            logger.info("已应用后台路径设置：%s", overrides)
+    except Exception:  # noqa: BLE001 - 数据库不可用时继续用自动扫描
+        logger.debug("后台路径设置暂时套用不上（继续用自动扫描）", exc_info=True)
+    try:
+        from wb_install import WB
+        logger.info("客户端版本：%s", WB.describe())
+        if not WB.is_version_dynamic():
+            logger.warning(
+                "未找到本机 WorkBuddy 安装目录，客户端版本退化为兜底值；"
+                "如需与真实客户端一致，请设置 WORKBUDDY_INSTALL_DIR "
+                "或把安装盘符加进 WORKBUDDY_DRIVES"
+            )
+        if getattr(settings, "DEV_TOOLS", True):
+            logger.info("逆向产物目录：%s（开发工具已开启，可在后台一键拆包）",
+                        WB.source_dir())
+    except Exception:  # noqa: BLE001
+        logger.exception("客户端版本发现失败（不影响启动）")
+
+
+# ---------------------------------------------------------------------------
+# 关闭顺序（任务 2 交付）：清理只由这一处承担
+# ---------------------------------------------------------------------------
+
+
+def _shutdown_drain_timeout() -> float:
+    """关闭时等待在途工作归零的兜底上限（秒），0 表示不限时。
+
+    正常路径的「等多久」由用户和进程所有者（控制通道 / 运行器）决定，这里只是
+    「有人直接给进程发信号」时的有序收尾；超时只记日志，不谎报已排空。
+    """
+    return _env_float("ADMIN_SHUTDOWN_DRAIN_TIMEOUT", 60.0)
+
+
 @app.on_event("shutdown")
+async def graceful_shutdown():
+    """关闭顺序的**唯一**承担者：封口 → 等在途归零 → 停止/刷新 → 进程退出。
+
+    为什么必须集中成一处：原来 IP 活动 flush、上游连接池、loop watch 各挂一个
+    shutdown 钩子，顺序取决于装饰器位置，而且**没有任何一处**等「请求结束后仍在
+    继续的工作」（审计落库、后台 Job、刚派发出去的定时任务）。现在的顺序是：
+
+    1. 封口（关准入）：和 `begin()` 用同一把锁，draining 及以后的阶段不重复操作；
+    2. 等 active_requests / active_jobs 归零 —— 请求、子任务、审计都在里面；
+    3. 标记 stopping（对外不再有强制入口，界面进入「正在关闭服务」）；
+    4. 按固定顺序跑原有清理：IP 活动 flush → 上游连接池 → loop watch；
+       阻塞的那些（`ip_activity.flush`）一律丢进线程，不在事件循环里等磁盘；
+    5. 标记 stopped，交给 Uvicorn 完成进程退出。
+    """
+    import asyncio
+    import secrets
+
+    from admin.lifecycle import PHASE_READY, PHASE_STARTING
+
+    lifecycle = get_lifecycle()
+    order = []
+
+    probe = _DEGRADED_PROBE
+    if probe is not None:
+        probe.stop()
+
+    if lifecycle.snapshot()["phase"] in (PHASE_STARTING, PHASE_READY):
+        try:
+            lifecycle.begin("shutdown", "shutdown-" + secrets.token_hex(6))
+        except Exception:  # noqa: BLE001 - 封口失败也要继续按顺序收尾
+            logger.exception("关闭时封口失败（继续收尾）")
+    order.append("sealed")
+
+    timeout = _shutdown_drain_timeout()
+    timed_out = False
+    pending = lifecycle.snapshot()
+    if pending["active_requests"] or pending["active_jobs"]:
+        logger.info(
+            "关闭：仍有 %d 个请求、%d 个后台任务在跑，等它们结束（上限 %.0fs）",
+            pending["active_requests"], pending["active_jobs"], timeout)
+    try:
+        if timeout > 0:
+            await asyncio.wait_for(lifecycle.wait_empty(), timeout)
+        else:
+            await lifecycle.wait_empty()
+    except (asyncio.TimeoutError, TimeoutError):
+        timed_out = True
+        logger.warning("关闭时等待在途工作超时（%.0fs），继续收尾：%s",
+                       timeout, lifecycle.snapshot())
+    order.append("drained")
+
+    lifecycle.mark_stopping()
+
+    await _flush_ip_activity()
+    order.append("ip_activity")
+    await _stop_upstream_connections()
+    order.append("upstream_pool")
+    await _stop_loop_watch()
+    order.append("loop_watch")
+
+    lifecycle.mark_stopped()
+    order.append("stopped")
+    logger.info("关闭顺序完成：%s", " → ".join(order))
+    return {"order": order, "timed_out": timed_out}
+
+
 async def _flush_ip_activity():
+    """把 IP 活动缓冲刷进库（阻塞 I/O，丢线程）。只有 `graceful_shutdown` 调它。"""
     import asyncio
     from admin import ip_activity
-    if ip_activity._task is not None and not ip_activity._task.done():
-        ip_activity._task.cancel()
-        await asyncio.gather(ip_activity._task, return_exceptions=True)
+    task = getattr(ip_activity, "_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     await asyncio.to_thread(ip_activity.flush)
 
 
@@ -349,10 +1014,22 @@ async def _tune_blocking_executor():
         logger.exception("默认线程池调整失败（不影响启动）")
 
 
-@app.on_event("shutdown")
 async def _stop_upstream_connections():
+    """关闭上游连接池。只有 `graceful_shutdown` 调它（清理只由一处承担）。"""
     from admin import upstream_http
     await upstream_http.stop(app)
+    # perf 线的共享 httpx 连接池（admin/http_shared.py）也在这里一并关闭。
+    try:
+        from admin import http_shared
+        http_shared.reset_shared()
+    except Exception:  # noqa: BLE001 - 关闭阶段只记日志
+        logger.exception("关闭共享上游连接池失败")
+    # 第 4 轮：Trae / CodeArts / Qoder 的 urllib 长连接池（admin/http_keepalive.py）。
+    try:
+        from admin import http_keepalive
+        http_keepalive.purge_all("shutdown")
+    except Exception:  # noqa: BLE001
+        logger.exception("清空 urllib 长连接池失败")
 
 
 @app.on_event("startup")
@@ -368,8 +1045,8 @@ async def _start_loop_watch():
         logger.exception("事件循环探针启动失败（不影响服务）")
 
 
-@app.on_event("shutdown")
 async def _stop_loop_watch():
+    """停事件循环探针。只有 `graceful_shutdown` 调它（清理只由一处承担）。"""
     try:
         from admin import loop_watch
         await loop_watch.stop()
@@ -525,6 +1202,33 @@ app.include_router(join_gate_api.router)
 
 @app.on_event("startup")
 def _startup():
+    # 生命周期换代：**每次 lifespan 启动都重建 instance_id**，避免同一个进程里
+    # 重建 app（测试、uvicorn 复用进程、--reload）继承上一次的 draining/stopping。
+    # 这是**本 handler 的第一步**（不是整个 lifespan 的第一步）：真正最早执行的
+    # startup 钩子是 _start_upstream_connections —— 它只安装/预热 SSL 默认上下文，
+    # 不碰生命周期也不接业务。放在这里是因为换代必须早于本 handler 之后的任何
+    # 初始化与任何请求；就绪要到本函数末尾、必要初始化完成之后才发布。
+    try:
+        lifecycle = get_lifecycle()
+        lifecycle.reset()
+    except Exception:  # noqa: BLE001 - 生命周期坏了也不能让服务起不来
+        logger.exception("生命周期复位失败（服务继续，但就绪探针会保持未就绪）")
+
+    # Marvis 出口池硬闸门（**只**在 MARVIS_EGRESS_REQUIRED=1 时才可能抛错）。
+    #
+    # 为什么不放在 marvis.install()：平台装配走 admin.platform.loader 的
+    # 逐项 try/except（「单个平台装配失败不得影响主服务启动」），异常会被吞成
+    # 一条 warning，进程照样起 —— 闸门等于没装。这里在 uvicorn 启动钩子里，
+    # 抛出去就是进程退出，才是部署侧要的「没池就别起」。
+    # 默认（未设 REQUIRED）仍是 WARNING，不拦启动。
+    # 顺序：先换代再装闸门 —— 换代不能因为闸门抛错而漏掉。
+    try:
+        from admin.platform.marvis import check_egress
+    except ImportError:  # marvis 目录被裁剪：本平台的事，不该拖累启动
+        pass
+    else:
+        check_egress(strict=True)
+
     # 启动手机号登录会话的**定时回收**线程。
     #
     # 为什么必须定时回收：原来的 `_gc_locked()` 只在「新建会话」时被调用，
@@ -546,6 +1250,21 @@ def _startup():
     else:
         if settings.ADMIN_USERNAME == "admin" and settings.ADMIN_PASSWORD == "admin123":
             logger.warning("仍在使用 admin/admin123 弱口令，且服务可能监听 0.0.0.0，请尽快更换")
+        # 2026-11-24（安全 S4）：登录锁定默认关闭后，密码强度是主要防线。
+        # 这里只能检查 .env 里的初始密码；后台改过密码时库里只有哈希，
+        # 由首次登录成功时再查一次（_warn_weak_password_once）。
+        try:
+            _weak = password_weakness(settings.ADMIN_PASSWORD, settings.ADMIN_USERNAME)
+        except Exception:  # noqa: BLE001
+            _weak = []
+        if _weak:
+            logger.warning(
+                "ADMIN_PASSWORD（.env 初始密码）偏弱：%s。若后台已改过密码则以库里的为准。"
+                "监听地址 %s:%s", "、".join(_weak), settings.HOST, settings.PORT)
+        if not getattr(settings, "LOGIN_RATE_LIMIT_ENABLED", False):
+            logger.warning(
+                "后台登录失败锁定已关闭（ADMIN_LOGIN_RATE_LIMIT=0）：只保留递增延迟、"
+                "失败告警与 abuse_guard。公网部署请确认密码足够强，或在 nginx 上限制后台来源 IP。")
 
     # 环境画像：出问题时第一眼要能确认「这台到底是 prod 还是 dev」。
     logger.info(
@@ -557,15 +1276,38 @@ def _startup():
 
     # 数据库不可用（例如 MySQL 被 OOM 杀掉正在重启）时**不能**让启动失败：
     # 这里抛异常会让 uvicorn 直接退出进程，nginx 侧变成 502，且需要人工重启。
-    # 改为重试 + 降级启动，进程保持存活，数据库恢复后自动可用。
+    # 改为重试 + 降级启动，进程保持存活；但「就绪」必须等数据库与必要表都可用 ——
+    # 降级期间对外说自己可以接单，只会让每个业务请求撞 500。
     db_ok = wait_database_ready()
+    init_ok = False
     if db_ok:
         try:
-            init_db()
+            init_ok = init_db() is not False
         except Exception:
-            logger.exception("建表/迁移失败，服务继续启动（数据库可用后重启即可）")
+            logger.exception("建表/迁移失败，先不发布就绪（降级模式继续运行）")
+        if init_ok:
+            # api_keys.key_full 旧 base64 → secret_box 密文（幂等；2026-11-24 第 3 轮）。
+            _migrate_key_full = getattr(keys, "migrate_key_full", None)
+            try:
+                _moved = 0
+                if _migrate_key_full is not None:
+                    with SessionLocal() as _kdb:
+                        _moved = _migrate_key_full(_kdb)
+                if _moved:
+                    logger.warning("api_keys.key_full 已加密迁移 %d 条", _moved)
+            except Exception:  # noqa: BLE001 - 迁移失败不挡启动，下次启动再试
+                logger.exception("api_keys.key_full 加密迁移失败（读取仍兼容旧 base64）")
+        if not init_ok:
+            logger.error("建表/迁移未完成：服务先以降级模式运行，后台探测恢复后自动补")
     else:
         logger.error("数据库当前不可用，服务以降级模式启动：请求将返回 503，恢复后自动自愈")
+
+    if db_ok and init_ok:
+        tables_ok, tables_reason = _required_tables_present()
+    else:
+        tables_ok = False
+        tables_reason = "数据库不可用" if not db_ok else "建表/迁移未完成"
+    ready_ok = bool(db_ok and init_ok and tables_ok)
 
     # 首次启动先建表再回填；数据库暂不可用时仍保留后台重试。
     try:
@@ -574,18 +1316,10 @@ def _startup():
     except Exception:
         logger.exception("用量汇总后台回填线程启动失败（统计会自动降级为原表）")
 
-    # 套用「设置 → 运行配置」里保存的覆盖值（exe/apk 没有 .env，全靠这）。
-    # 位置必须在 init_db 之后：首次启动时表还不存在，早跑一次只会打一条
-    # `no such table: system_settings` 的告警，然后覆盖值静默失效到下次重启。
-    if db_ok:
-        try:
-            from admin.runtime_settings import apply_overrides
-            with SessionLocal() as db:
-                applied = apply_overrides(db)
-            if applied:
-                logger.info("运行配置已套用 %d 项覆盖", applied)
-        except Exception as exc:  # 库表异常不影响启动
-            logger.warning("运行配置套用失败：%s", exc)
+    # 「设置 → 运行配置」的覆盖值、后台路径设置、历史会话清理、定时调度器与
+    # 登录后自动任务都归 `_init_after_database_ready()`：它们都要求数据库与必要表
+    # 可用（首次启动时表还不存在，早跑只会打一条 no such table 的告警然后静默失效）。
+    # 降级启动时由后台探测恢复后补跑一次，见本函数末尾。
 
     # 装配流量治理运行态：在途租约上限、会话粘性路由（含后台 GC 线程）。
     # 这些是纯进程内存状态，**不需要数据库**，所以放在 db_ok 判定之外 ——
@@ -614,52 +1348,38 @@ def _startup():
     except Exception:
         logger.debug("客户端路径覆盖预热失败", exc_info=True)
 
-    # 把后台保存的路径覆盖注入 wb_install（安装目录 / 逆向产物目录）。
-    # 必须在下面「客户端版本发现」之前：否则首个请求拿到的还是扫描结果，
-    # 后台改过的安装目录要等一次 refresh 才生效。
-    # 环境变量优先级仍高于这里的覆盖值（见 wb_install._ov）。
-    if db_ok:
-        try:
-            from admin import wb_paths
-            ov = wb_paths.load_into_wb()
-            if any(ov.values()):
-                logger.info("已应用后台路径设置：%s", ov)
-        except Exception:
-            logger.exception("应用后台路径设置失败（继续用自动扫描）")
+    # 客户端版本发现（出站 UA 与桌面事件指纹靠它）只影响日志与准确的 UA，
+    # 但代价可能是扫盘 + 读 22MB 的 codebuddy.js。**不挡就绪**：丢到后台线程。
+    # 显示「兜底」就说明没找到本机安装包，属于需要关注的状态，日志里仍然可见。
+    threading.Thread(target=_log_client_version, name="wb-client-version",
+                     daemon=True).start()
 
-    # 打印客户端版本发现结果：出站 UA 与桌面事件指纹都靠它。
-    # 显示「兜底」就说明没找到本机安装包 —— 服务能跑，但 UA 报的版本
-    # 不一定与真实客户端一致，属于需要关注的状态，所以要在启动日志里可见。
-    try:
-        from wb_install import WB
-        logger.info("客户端版本：%s", WB.describe())
-        if not WB.is_version_dynamic():
-            logger.warning(
-                "未找到本机 WorkBuddy 安装目录，客户端版本退化为兜底值；"
-                "如需与真实客户端一致，请设置 WORKBUDDY_INSTALL_DIR "
-                "或把安装盘符加进 WORKBUDDY_DRIVES"
+    # 必要初始化（运行配置 / 路径覆盖 / 会话清理 / 调度器 / 登录后任务）只在
+    # 「数据库可用 + 建表完成 + 必要表齐」时执行；降级启动由后台探测补跑。
+    if ready_ok:
+        try:
+            init_result = _init_after_database_ready()
+            logger.info("必要初始化完成：%s", "、".join(init_result["steps"]))
+        except Exception:  # noqa: BLE001 - 各步骤自己已经兜底，这里只是最后一道
+            logger.exception("必要初始化失败，暂不发布就绪")
+
+    # 就绪发布（**本函数最后一步**）：只有必要初始化完成且数据库/必要表可用才开。
+    _publish_readiness(db_ok=db_ok, init_ok=init_ok, tables_ok=tables_ok,
+                       reason=tables_reason)
+    if not ready_ok:
+        # 降级启动：后台用有超时 / 单飞 / 限频的**真实** DB 探测重查，恢复后补一次
+        # 所需初始化再发布就绪。排空期间迟到的探测会被 ReadinessProbe 拒掉
+        # （阶段不是 starting 就不补初始化、不发布），所以它无权把准入改回 ready。
+        try:
+            start_degraded_readiness_probe(
+                on_recovered=_init_after_database_ready,
+                timeout=_env_float("ADMIN_READINESS_PROBE_TIMEOUT",
+                                   READINESS_PROBE_TIMEOUT),
+                min_interval=_env_float("ADMIN_READINESS_PROBE_INTERVAL",
+                                        READINESS_PROBE_INTERVAL),
             )
-        if getattr(settings, "DEV_TOOLS", True):
-            logger.info("逆向产物目录：%s（开发工具已开启，可在后台一键拆包）",
-                        WB.source_dir())
-    except Exception:
-        logger.exception("客户端版本发现失败（不影响启动）")
-
-    # 调度器只在数据库可用时启动（否则它每 15s 都会失败一次，纯属噪音）
-    if db_ok:
-        # 会话表清理：只删「过期超过 30 天」的历史行，活跃会话不受影响。
-        try:
-            with SessionLocal() as db:
-                session_store.purge(db)
-        except Exception:
-            logger.exception("清理历史会话失败（不影响启动）")
-        from admin.scheduler import start_scheduler
-        start_scheduler()
-        try:
-            from admin.post_login import resume
-            resume()
-        except Exception:
-            logger.exception("恢复登录后自动任务失败（不影响服务启动）")
+        except Exception:  # noqa: BLE001 - 探针起不来只是不会自动恢复
+            logger.exception("后台数据库就绪探测启动失败（进程继续降级运行）")
 
 
 def _get_stored_hash() -> str:
@@ -718,25 +1438,72 @@ def _login_fingerprint(request) -> str | None:
     return hashlib.sha256("\n".join(sorted(parts)).encode("utf-8", "replace")).hexdigest()[:24] if parts else None
 
 
+#: 进程内只对弱密码告警一次（登录成功时才拿得到明文，见 _warn_weak_password_once）。
+_weak_password_warned = False
+
+
+def _warn_weak_password_once(password: str) -> None:
+    """首次登录成功时检查一次生效密码的强度（库里只有哈希，启动时查不了）。"""
+    global _weak_password_warned
+    if _weak_password_warned:
+        return
+    _weak_password_warned = True
+    try:
+        reasons = password_weakness(password, settings.ADMIN_USERNAME or "")
+    except Exception:  # noqa: BLE001
+        return
+    if reasons:
+        logger.warning(
+            "后台管理员密码偏弱（%s）；登录失败锁定%s。建议在「设置 → 修改密码」"
+            "换成 12 位以上、至少三类字符的强密码。", "、".join(reasons),
+            "已开启" if getattr(settings, "LOGIN_RATE_LIMIT_ENABLED", False) else "已关闭")
+
+
 @app.post("/api/login")
-def login(
+async def login(
     username: str = Form(...),
     password: str = Form(...),
     request: Request = None,
 ):
+    """登录入口（异步外壳）。
+
+    2026-11-24（安全 S4）：先在事件循环里完成「不锁人的递增延迟」
+    （`asyncio.sleep`，**不占线程池**），再把真正的校验（PBKDF2 + 查库，都是
+    阻塞操作）放进线程池。排队过长（同一 IP 并发爆破）直接 429，不校验密码。
+    """
     # 权威 IP：仅当直连对端在 ADMIN_TRUSTED_PROXY_IPS 内时才采信反代头的
     # X-Real-IP / X-Forwarded-For（nginx 侧须 proxy_set_header X-Real-IP
     # $remote_addr 覆写）。否则所有请求看起来都是反代 IP，登录锁会退化成
     # 「全局锁」，任何人打几次错误密码就能把真管理员锁在门外。
     ip = client_ip_from_request(request)
-    fingerprint = _login_fingerprint(request) if request else None
-    locked, wait = is_locked(ip, username, fingerprint)
-    if locked:
+    wait, busy = reserve_login_delay(ip, username)
+    if busy:
+        retry = max(1, int(wait) + 1)
+        logger.warning("后台登录尝试排队过长，直接拒绝 ip=%s username=%s wait=%ds",
+                       ip, username[:40], retry)
         raise HTTPException(
             status_code=429,
-            detail=f"登录尝试过于频繁，请 {wait} 秒后再试",
-            headers={"Retry-After": str(wait)},
+            detail=f"登录尝试过于频繁，请 {retry} 秒后再试",
+            headers={"Retry-After": str(retry)},
         )
+    if wait > 0:
+        await asyncio.sleep(wait)
+    return await run_in_threadpool(_login_sync, username, password, request, ip)
+
+
+def _login_sync(username: str, password: str, request: Request, ip: str):
+    fingerprint = _login_fingerprint(request) if request else None
+    # 登录失败锁定默认关闭（ADMIN_LOGIN_RATE_LIMIT=1 才启用，见 config.py）。
+    # 关闭时仍有：上面的递增延迟、失败告警、abuse_guard 的鉴权失败封禁。
+    rate_limited = bool(getattr(settings, "LOGIN_RATE_LIMIT_ENABLED", False))
+    if rate_limited:
+        locked, wait = is_locked(ip, username, fingerprint)
+        if locked:
+            raise HTTPException(
+                status_code=429,
+                detail=f"登录尝试过于频繁，请 {wait} 秒后再试",
+                headers={"Retry-After": str(wait)},
+            )
     # 未配置凭据时直接拒绝（不能退化成「空口令可登录」）
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
         raise HTTPException(
@@ -746,12 +1513,18 @@ def login(
     if username != settings.ADMIN_USERNAME or not verify_password(password, _get_stored_hash()):
         # 三个维度各自计数：成对键锁「这个 IP × 这个用户名」，
         # IP 全局键兜住换用户名撒网，指纹键兜住换 IP 共用指纹。
-        record_failure(ip, username, fingerprint)
-        logger.warning("后台登录失败 ip=%s username=%s fp=%s", ip, username[:40], fingerprint or "-")
+        if rate_limited:
+            record_failure(ip, username, fingerprint)
+        # 递增延迟 + 全站失败告警（不锁人，限流开关关闭时同样生效）。
+        recent = note_login_failure(ip, username)
+        logger.warning("后台登录失败 ip=%s username=%s fp=%s recent=%d",
+                       ip, username[:40], fingerprint or "-", recent)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     # 密码正确：清空成对与 IP 全局计数（指纹维度也一并清，避免误伤后续正常登录）。
     clear_failures(ip, username, fingerprint)
+    clear_login_delay(ip, username)
     logger.info("后台登录成功 ip=%s fp=%s", ip, fingerprint or "-")
+    _warn_weak_password_once(password)
 
     # ---- 建会话 + 下发 HttpOnly Cookie（响应体里**不再返回 token**）----
     #
@@ -777,6 +1550,11 @@ def login(
 
     token, session_row = _issue_admin_session(
         request, ip=ip, fingerprint=fingerprint, device_id=device_id)
+    if new_device:
+        # 新设备首次登录：值得留痕（被盗密码时第一条线索就在这里）。
+        logger.warning("后台新设备登录成功 ip=%s ua=%s sid=%s", ip,
+                       (request.headers.get("user-agent", "") if request else "")[:120],
+                       session_row.sid[:8])
 
     response = JSONResponse({
         "ok": True,
@@ -786,7 +1564,7 @@ def login(
         # 多设备模式：明确告诉前端「当前在线设备数」，方便它提示
         "multi_device": not settings.SESSION_SINGLE,
     })
-    _attach_auth_cookies(response, request, token, device_id, new_device)
+    _attach_auth_cookies(response, request, token, device_id, new_device, rotate_csrf=True)
     return response
 
 
@@ -833,7 +1611,8 @@ def _issue_admin_session(request: Request, *, ip: str, fingerprint: str | None,
 
 
 def _attach_auth_cookies(response, request: Request, token: str,
-                         device_id: str, new_device: bool) -> None:
+                         device_id: str, new_device: bool,
+                         rotate_csrf: bool = False) -> None:
     """统一下发三枚 Cookie：会话（HttpOnly）、设备（HttpOnly）、CSRF（可读）。
 
     * 会话 Cookie：真正的凭证。`SameSite=Lax` —— 从外部链接点进 `/admin`
@@ -851,7 +1630,12 @@ def _attach_auth_cookies(response, request: Request, token: str,
             key=session_store.DEVICE_COOKIE, value=device_id, httponly=True,
             samesite="lax", secure=https, path="/",
             max_age=max(86400, settings.DEVICE_COOKIE_DAYS * 86400))
-    csrf = request.cookies.get(session_store.CSRF_COOKIE) or session_store.new_csrf_token()
+    # 登录时轮换（2026-11-24 第 3 轮，安全 P3 / S-8b）：原来沿用浏览器里已有的
+    # wb_csrf，同一个值跨会话一直有效（登录前被种下 / 被看到的值登录后照样能用）。
+    # 续期（/api/login/session）不轮换：前端每次请求现读 Cookie，轮换也不会坏，
+    # 但多标签页并发请求时少一次竞态。
+    existing = request.cookies.get(session_store.CSRF_COOKIE) or ""
+    csrf = session_store.new_csrf_token() if (rotate_csrf or not existing) else existing
     response.set_cookie(
         key=session_store.CSRF_COOKIE, value=csrf, httponly=False,
         samesite="strict", secure=https, path="/", max_age=max_age)
@@ -878,6 +1662,65 @@ def _revoke_current_session(request: Request) -> bool:
         db.close()
 
 
+def same_origin_verdict(sec_fetch_site: str, origin: str, referer: str, host: str):
+    """请求是否来自本站（纯函数）：True = 同源/用户直接输入，False = 跨站，None = 判不出。
+
+    优先 `Sec-Fetch-Site`（现代浏览器都会发，脚本改不了）；没有时看 Origin，
+    再看 Referer 的 host 是否等于 Host 头。
+    """
+    from urllib.parse import urlsplit
+
+    site = str(sec_fetch_site or "").strip().lower()
+    if site:
+        return site in ("same-origin", "none")
+    want = str(host or "").strip().lower()
+    for value in (origin, referer):
+        text = str(value or "").strip()
+        if not text or text == "null":
+            if text == "null":
+                return False
+            continue
+        try:
+            got = (urlsplit(text).netloc or "").lower()
+        except ValueError:
+            return False
+        return bool(want) and got == want
+    return None
+
+
+def _request_same_origin(request: Request):
+    return same_origin_verdict(request.headers.get("sec-fetch-site") or "",
+                               request.headers.get("origin") or "",
+                               request.headers.get("referer") or "",
+                               request.headers.get("host") or "")
+
+
+def _logout_allowed(request: Request) -> bool:
+    """POST 退出的 CSRF 判定（2026-11-24 第 3 轮，S-8d）。
+
+    带 CSRF 头且匹配 → 放行（前端 http.ts 自动补）；否则只要求「不是跨站」：
+    确认页的表单提交是同源的。没有会话 Cookie 的请求本来就没什么可退，放行。
+    """
+    from admin.security import csrf_ok
+
+    if not request.cookies.get(session_store.SESSION_COOKIE):
+        return True
+    if not getattr(settings, "CSRF_ENABLED", True) or csrf_ok(request):
+        return True
+    return _request_same_origin(request) is not False
+
+
+def _logout_response(request: Request, as_redirect: bool):
+    revoked = _revoke_current_session(request)
+    logger.info("后台退出登录 revoked=%s", revoked)
+    if as_redirect:
+        response = RedirectResponse(url="/admin", status_code=303)
+    else:
+        response = JSONResponse({"ok": True, "revoked": revoked})
+    _clear_auth_cookies(response)
+    return response
+
+
 @app.post("/api/login/logout")
 @app.post("/outlogin")
 def login_logout(request: Request):
@@ -886,25 +1729,42 @@ def login_logout(request: Request):
     与升级前的区别：原来只 `delete_cookie`，JWT 依旧有效 —— 谁在那之前
     复制过 Cookie，退出之后照样能用到过期。现在 `revoked_at` 一落库，
     同一张令牌在任何设备上都立刻失效。
+
+    2026-11-24：跨站且没带 CSRF 头的退出请求一律 403（登出型 CSRF）。
+    表单提交（确认页）退出后 303 回 /admin，fetch 调用仍回 JSON。
     """
-    revoked = _revoke_current_session(request)
-    logger.info("后台退出登录 revoked=%s", revoked)
-    response = JSONResponse({"ok": True, "revoked": revoked})
-    _clear_auth_cookies(response)
-    return response
+    if not _logout_allowed(request):
+        return JSONResponse(status_code=403, content={"detail": "请求校验失败，请刷新页面后重试"})
+    ctype = (request.headers.get("content-type") or "").lower()
+    return _logout_response(request, ctype.startswith("application/x-www-form-urlencoded"))
+
+
+_OUTLOGIN_CONFIRM_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>退出登录</title>
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f5f6f8;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.c{background:#fff;border-radius:12px;padding:28px 32px;box-shadow:0 4px 24px rgba(0,0,0,.08);
+max-width:360px;text-align:center}button{margin-top:16px;padding:8px 20px;border:0;border-radius:8px;
+background:#e5484d;color:#fff;font-size:14px;cursor:pointer}a{display:block;margin-top:12px;
+color:#666;font-size:13px}</style></head><body><div class="c"><h3>确认退出登录？</h3>
+<p style="color:#666;font-size:14px">这个退出链接来自其它页面，为防止被恶意链接踢下线，需要你确认一次。</p>
+<form method="post" action="/outlogin"><button type="submit">退出登录</button></form>
+<a href="/admin">返回控制台</a></div></body></html>"""
 
 
 @app.get("/outlogin", include_in_schema=False)
 def outlogin_page(request: Request):
-    """浏览器地址栏直接访问的退出入口（GET 便于收藏/书签）。
+    """浏览器地址栏直接访问的退出入口（GET 便于收藏/书签，旧链接兼容）。
 
-    只做「吊销当前会话 + 跳回登录页」；跨站 `<img>` 这类子资源请求不会被
-    浏览器带上 SameSite=Lax 的 Cookie，所以不会被静默踢下线。
+    2026-11-24 第 3 轮（S-8d）：GET 会被跨站顶层导航带上 SameSite=Lax 的会话
+    Cookie（`<a href>`、`location=`），原来直接吊销 = 登出型 CSRF。现在：
+      * 用户在地址栏输入 / 书签 / 站内链接（Sec-Fetch-Site: none / same-origin，
+        或 Referer 同 host）→ 行为不变，吊销并跳回登录页；
+      * 其它情况（跨站或判不出）→ 返回确认页，点按钮以同源 POST 退出。
     """
-    _revoke_current_session(request)
-    response = RedirectResponse(url="/admin", status_code=303)
-    _clear_auth_cookies(response)
-    return response
+    if _request_same_origin(request) is True or not request.cookies.get(session_store.SESSION_COOKIE):
+        return _logout_response(request, True)
+    return HTMLResponse(_OUTLOGIN_CONFIRM_HTML, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/login/session")
@@ -961,7 +1821,13 @@ def change_password(body: PasswordChangeIn, request: Request,
         logger.warning("后台密码已修改，吊销其它会话 %d 条", revoked)
     finally:
         db.close()
-    return {"ok": True, "revoked_sessions": revoked}
+    # 只提示不拦截（拦截会改变现有前端行为）；前端可据此给出「密码偏弱」提示。
+    weak = password_weakness(body.new_password, settings.ADMIN_USERNAME or "")
+    if weak:
+        logger.warning("新设置的后台密码偏弱：%s", "、".join(weak))
+    global _weak_password_warned
+    _weak_password_warned = True
+    return {"ok": True, "revoked_sessions": revoked, "weak_reasons": weak}
 
 
 @app.get("/")
@@ -988,8 +1854,16 @@ def _local_runtime() -> bool:
 
 
 def _is_https(request: Request) -> bool:
-    return (request.url.scheme == "https"
-            or (request.headers.get("x-forwarded-proto") or "").lower() == "https")
+    if request.url.scheme == "https":
+        return True
+    # X-Forwarded-Proto 只采信可信代理发来的（安全审查 S-8c）。
+    if (request.headers.get("x-forwarded-proto") or "").lower() != "https":
+        return False
+    try:
+        from admin.client_ip import is_trusted_proxy
+        return is_trusted_proxy(request.client.host if request.client else "")
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _console_allowed(request: Request) -> bool:

@@ -1,34 +1,33 @@
 ﻿# =============================================================================
-# workbuddy2api 守护脚本（daemon.ps1）
+# workbuddy2api 守护脚本
 # -----------------------------------------------------------------------------
-# 解决的问题：把 `python main.py` 挂在某个终端 / Agent 后台会话里跑，会话结束时
-# 子进程会被连带回收 —— 日志最后一行还是 "200 OK"，但端口没了。
+# 解决的问题：把服务挂在某个终端 / Agent 后台会话里跑，会话结束时子进程会被
+# 连带回收 —— 日志最后一行还是 "200 OK"，但端口没了。
+#
 # 本脚本用 Start-Process -WindowStyle Hidden 让服务脱离当前会话，并循环探活。
 #
-# ⚠️ 三条血泪教训，改这个文件前先读：
-#
-#   1) **全局只能有一个守护**。靠 logs\daemon.<port>.lock 的**独占句柄**实现。
-#      没有它的时候：start-service.bat 每跑一次就多一个守护（旧实现只认
-#      daemon.pid 里那一个，而 pid 文件会被后来者覆盖），三个守护各自探活、
-#      各自拉起 → 12 个 main.py 主管同时在跑，全部抢 8790：
-#      uvicorn 起 → [Errno 10048] → 退出(code=3) → 主管判「崩溃」→ 60s 后再起。
-#      表现就是「无限重启 + 进程越开越多 + 机器卡死」。
-#
-#   2) **「端口没监听」≠「服务挂了」**。uvicorn 重启窗口有 3~10 秒空档。
-#      必须连续 MissThreshold 次（默认 3 次 ≈ 30s）才动手，而且**主管进程
-#      还活着时不要插手** —— 它自己会重生 uvicorn；你插手就是两个主管互相
-#      杀对方的子进程，永远起不来。
-#
-#   3) **-Stop 必须全量清理**：守护 + 端口监听者 + 本端口所有 main.py 主管 +
-#      所有 `uvicorn admin.server:app --port <Port>`。只杀一个，留下的孤儿会
-#      占着端口，下次启动撞 10048，又是一轮风暴。
+# 探活口径（2026-11 起）：
+#   * 不看端口。谁在监听一个端口不能证明进程归属（转发、容器映射、
+#     SO_REUSEADDR 都会骗人），旧实现据此结束监听者，曾把正在跑长请求的实例
+#     连人带连接一起砍掉。
+#   * 一律先问 main.py 自己的所有者状态（python main.py --status --json）：
+#     ready / starting / draining / stopping / unreachable / none。
+#   * 只有"确认没有所有者"才拉起；starting 继续等（慢启动），
+#     draining/stopping 属于主动切换（不干预），unreachable 只记录不处置。
+#   * 停止时先停这一部署的守护循环（校验身份与工作目录），再请求监督器正常
+#     排空并等它真的退出，然后把 main.py 的真实退出码原样向上返回。
+#     不再枚举、也不再强杀任何 python 进程。
 #
 # 用法：
-#   powershell -File scripts\daemon.ps1              前台守护（可见窗口）
-#   powershell -File scripts\daemon.ps1 -Detach      后台隐藏守护（bat 用这个）
-#   powershell -File scripts\daemon.ps1 -Once        确保起来一次，不守护
-#   powershell -File scripts\daemon.ps1 -Stop        停止守护 + 服务 + 全部残留
-#   powershell -File scripts\daemon.ps1 -Status      查看状态
+#   powershell -File scripts\daemon.ps1            启动守护（本进程探活）
+#   powershell -File scripts\daemon.ps1 -Once      只启动一次，不做守护
+#   powershell -File scripts\daemon.ps1 -Stop      停止本部署的服务 + 守护
+#   powershell -File scripts\daemon.ps1 -Status    查看状态
+#   powershell -File scripts\daemon.ps1 -Port 8790 -RunDir D:\tmp\wb-run
+#
+# 退出码（与 main.py 对齐）：
+#   0 已就绪/已完成    4 正在启动或排空（本次不重复启动）
+#   5 没有运行中的所有者    6 状态暂不可用（保留现场，不做破坏性处置）
 # =============================================================================
 param(
     [switch]$Once,
@@ -37,24 +36,27 @@ param(
     [switch]$Detach,
     [int]$Port = 8790,
     [int]$IntervalSec = 10,
-    # 连续探活失败多少次才拉起（默认 3 次 ≈ 30s，避开 uvicorn 重启窗口）
-    [int]$MissThreshold = 3,
-    # 拉起后最多等多久出现监听（秒）
-    [int]$StartupWaitSec = 45
+    [string]$RunDir = "",
+    [int]$WaitTimeout = 0,
+    [int]$StartTimeoutSec = 120
 )
 
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $PSScriptRoot
+$MainPy = Join-Path $Root "main.py"
+if (-not $RunDir) { $RunDir = $env:WB_RUN_DIR }
+$StateDir = if ($RunDir) { Join-Path $RunDir "daemon-state" } else { Join-Path $Root "logs" }
+$PidFile = Join-Path $StateDir "daemon.json"
+$WatchLog = Join-Path $StateDir "daemon.log"
+$SvcLogDir = if ($RunDir) { $StateDir } else { Join-Path $Root "logs" }
+$OutLog = Join-Path $SvcLogDir "service.out.log"
+$ErrLog = Join-Path $SvcLogDir "service.err.log"
 
-# 解释器解析：**不能硬编码 .venv**。
-#
-# 原实现写死 `$Root\.venv\Scripts\python.exe`。但这条仓库既支持 venv 部署、
-# 也支持直接用系统 Python（本机就是后者：`D:\Python\python.exe`）。
-# venv 不存在时 `Start-Process -FilePath <不存在的 exe>` **不报错**，
-# 只是 PID 为空；守护日志里留下「已启动服务 PID=」这么一行空号，
-# 看起来像起过了，实际端口一直没监听 —— 表现就是「重启服务没反应」。
-#
-# 解析顺序：项目 venv → 环境变量 PYTHON → PATH 里的 python → py 启动器。
+# 解释器解析：不能硬编码 .venv。
+# 这条仓库既支持 venv 部署、也支持直接用系统 Python；venv 不存在时
+# Start-Process -FilePath <不存在的 exe> 不报错，只是 PID 为空，日志里留下
+# 「已启动服务 PID=」这么一行空号，看起来像起过了，实际端口一直没监听 ——
+# 表现就是「重启服务没反应」。
 function Resolve-Python {
     $candidates = @(
         (Join-Path $Root ".venv\Scripts\python.exe"),
@@ -72,77 +74,94 @@ function Resolve-Python {
 }
 
 $Python = Resolve-Python
-$PidFile = Join-Path $Root "logs\daemon.pid"
-$LockFile = Join-Path $Root ("logs\daemon.{0}.lock" -f $Port)
-$WatchLog = Join-Path $Root "logs\daemon.log"
-$OutLog = Join-Path $Root "logs\service.out.log"
-$ErrLog = Join-Path $Root "logs\service.err.log"
-$InstanceLock = Join-Path $Root (".workbuddy2api.{0}.lock" -f $Port)
-$script:LockStream = $null
-
 
 function Write-WatchLog([string]$msg) {
     $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $msg
     Write-Host $line
     try {
-        $dir = Split-Path -Parent $WatchLog
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
         Add-Content -Path $WatchLog -Value $line -Encoding UTF8
     } catch { }
 }
 
-function Get-ListenerPid {
-    $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-         Select-Object -First 1
-    if ($c) { return [int]$c.OwningProcess }
-    return 0
-}
-
-# 本端口的「主管」（main.py 监督进程）：用命令行扫。
-#
-# 为什么不读实例锁文件：锁区占前 8 字节，`Get-Content` 连着锁区一起读会被内核
-# 拒掉（实测就是这个原因让「主管存在」永远判成 0）。命令行判据足够准：
-#   * 是 python 进程；
-#   * 命令行里有 main.py，且不含 uvicorn（那是它的子进程，不是主管）；
-#   * 没指定 --port（默认端口），或显式指定了本守护的端口 —— 排除别的端口上的调试实例。
-function Get-SupervisorPids {
-    $portPat = "--port\s+$Port(\s|$)"
-    @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.CommandLine -and
-            $_.CommandLine -match 'main\.py' -and
-            $_.CommandLine -notmatch 'uvicorn' -and
-            ($_.CommandLine -notmatch '--port' -or $_.CommandLine -match $portPat)
-        } | ForEach-Object { [int]$_.ProcessId })
-}
-
-# 所有正在跑的守护（排除自己、排除 -Stop 那种一次性调用）
-function Get-DaemonPids {
-    $me = $PID
-    @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.ProcessId -ne $me -and
-            $_.CommandLine -and
-            $_.CommandLine -match 'daemon\.ps1' -and
-            $_.CommandLine -notmatch '\-Stop' -and
-            $_.CommandLine -notmatch '\-Status'
-        } | ForEach-Object { [int]$_.ProcessId })
-}
-
-# 拿守护单实例锁：返回 $true 表示拿到（$script:LockStream 必须一直活着直到进程退出）
-function Lock-Daemon {
+# 调 main.py：参数原样传入，环境里带上本部署的运行目录。
+# 返回值同时带"真实退出码"和输出行：调用方据此决定下一步，而不是靠端口通不通去猜。
+function Invoke-Main {
+    param([string[]]$Arguments, [switch]$Quiet)
+    if (-not $Python) {
+        Write-WatchLog "找不到 Python 解释器（已试 venv / PYTHON / PATH），无法调用 main.py"
+        return [pscustomobject]@{ Code = 1; Lines = @() }
+    }
+    $saved = $env:WB_RUN_DIR
+    if ($RunDir) { $env:WB_RUN_DIR = $RunDir }
+    $lines = @()
+    $code = 1
     try {
-        $fs = [System.IO.File]::Open($LockFile,
-                                     [System.IO.FileMode]::OpenOrCreate,
-                                     [System.IO.FileAccess]::ReadWrite,
-                                     [System.IO.FileShare]::None)
-        $script:LockStream = $fs
-        $fs.SetLength(0)
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes("$PID")
-        $fs.Write($bytes, 0, $bytes.Length)
-        $fs.Flush()
+        $lines = @(& $Python $MainPy @Arguments 2>&1)
+        $code = [int]$LASTEXITCODE
+    } finally {
+        if ($null -eq $saved) { Remove-Item Env:\WB_RUN_DIR -ErrorAction SilentlyContinue }
+        else { $env:WB_RUN_DIR = $saved }
+    }
+    if (-not $Quiet) {
+        foreach ($line in $lines) { Write-Host "$line" }
+    }
+    return [pscustomobject]@{ Code = $code; Lines = $lines }
+}
+
+function Get-OwnerStatus {
+    $result = Invoke-Main -Arguments @("--status", "--port", "$Port", "--json") -Quiet
+    $status = $null
+    foreach ($line in $result.Lines) {
+        $text = "$line".Trim()
+        if ($text.StartsWith("{")) {
+            try { $status = $text | ConvertFrom-Json } catch { $status = $null }
+            if ($status) { break }
+        }
+    }
+    return [pscustomobject]@{ Code = $result.Code; Status = $status }
+}
+
+function Get-Phase($Snapshot) {
+    if ($Snapshot -and $Snapshot.phase) { return "$($Snapshot.phase)" }
+    return ""
+}
+
+# ---- 守护循环身份：pid + 项目根 + 端口 + 命令行确实还是本脚本 ------------
+function Get-WatchdogRecord {
+    if (-not (Test-Path $PidFile)) { return $null }
+    try { return (Get-Content $PidFile -Raw -ErrorAction Stop | ConvertFrom-Json) } catch { return $null }
+}
+
+function Test-WatchdogRecord {
+    param($Record)
+    if (-not $Record -or -not $Record.pid) { return $false }
+    $wpid = [int]$Record.pid
+    if (-not (Get-Process -Id $wpid -ErrorAction SilentlyContinue)) { return $false }
+    if ($Record.root -and ($Record.root.TrimEnd('\') -ne $Root.TrimEnd('\'))) { return $false }
+    if ($Record.port -and ([int]$Record.port -ne $Port)) { return $false }
+    $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$wpid" -ErrorAction SilentlyContinue
+    if ($cim -and $cim.CommandLine -and ($cim.CommandLine -notmatch 'daemon\.ps1')) { return $false }
+    return $true
+}
+
+function Stop-Watchdog {
+    $record = Get-WatchdogRecord
+    if (-not $record) { return $true }
+    if (-not (Test-WatchdogRecord -Record $record)) {
+        Write-WatchLog "守护记录与本部署不匹配（pid=$($record.pid)）：不结束任何进程，只清理记录"
+        Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+    $wpid = [int]$record.pid
+    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+    if ($wpid -eq $PID) { return $true }
+    try {
+        Stop-Process -Id $wpid -Force -ErrorAction Stop
+        Write-WatchLog "已停止本部署的守护循环 pid=$wpid"
         return $true
     } catch {
+        Write-WatchLog "停止守护循环失败：$($_.Exception.Message)"
         return $false
     }
 }
@@ -151,215 +170,147 @@ function Start-ServiceProcess {
     $env:PYTHONIOENCODING = "utf-8"
     $env:PYTHONUTF8 = "1"
     if (-not $Python) {
-        # 没解释器就别继续了：否则 Start-Process 只会留下一个空 PID，
-        # 守护循环每 10 秒空转一次，日志堆满「已启动服务 PID=」而端口永远不通。
         Write-WatchLog "找不到 Python 解释器（已试 venv / PYTHON / PATH），无法启动服务"
         return $null
     }
     try {
-        $dir = Split-Path -Parent $OutLog
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        if (-not (Test-Path $SvcLogDir)) { New-Item -ItemType Directory -Path $SvcLogDir -Force | Out-Null }
     } catch { }
-
-    $argList = @("main.py")
-    # 只有非默认端口才显式传：默认端口交给 .env（ADMIN_PORT）决定，避免两处打架
-    if ($Port -ne 8790) { $argList += @("--port", "$Port") }
-
-    # -WindowStyle Hidden + Start-Process：完全脱离当前会话/控制台。
-    # 父进程、启动窗口、Agent 会话退出都不会连带回收本服务。
-    $p = Start-Process -FilePath $Python -ArgumentList $argList `
-                       -WorkingDirectory $Root -WindowStyle Hidden `
-                       -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
-                       -PassThru
-    Write-WatchLog "已启动服务 PID=$($p.Id)（$Python $($argList -join ' ')）"
+    $saved = $env:WB_RUN_DIR
+    if ($RunDir) { $env:WB_RUN_DIR = $RunDir }
+    try {
+        # -WindowStyle Hidden + Start-Process：完全脱离当前会话/控制台。
+        $startArgs = @{
+            FilePath               = $Python
+            ArgumentList           = @("main.py", "--port", "$Port")
+            WorkingDirectory       = $Root
+            WindowStyle            = "Hidden"
+            RedirectStandardOutput = $OutLog
+            RedirectStandardError  = $ErrLog
+            PassThru               = $true
+        }
+        $p = Start-Process @startArgs
+    } finally {
+        if ($null -eq $saved) { Remove-Item Env:\WB_RUN_DIR -ErrorAction SilentlyContinue }
+        else { $env:WB_RUN_DIR = $saved }
+    }
+    Write-WatchLog "已启动服务 PID=$($p.Id)（端口 $Port，$Python）"
     return $p
 }
 
-# 全量清理：守护 → 主管 → 监听者 → 残余 uvicorn → 锁文件
-#
-# ⚠️ 顺序不能换：**必须先杀主管（main.py），再杀 uvicorn**。
-# 反过来做的后果现场抓到过：uvicorn 一死，还活着的 main.py 主循环 0.5s 内
-# 就再拉一个（它认为「子进程崩溃要重启」），等轮到杀主管时新 uvicorn 已经绑上
-# 端口了 —— 留下孤儿继续占 8790，下一次启动接着撞 10048。
-function Stop-Everything {
-    $portPat = "--port\s+$Port(\s|$)"
-
-    # 1) 所有守护（锁句柄随进程结束自动释放）
-    foreach ($d in Get-DaemonPids) {
-        Stop-Process -Id $d -Force -ErrorAction SilentlyContinue
-        Write-WatchLog "已停止守护 PID=$d"
+function Wait-UntilReady {
+    $deadline = (Get-Date).AddSeconds($StartTimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 1
+        $snap = Get-OwnerStatus
+        $phase = Get-Phase $snap.Status
+        if ($phase -eq "ready") { return $true }
+        if ($phase -in @("draining", "stopping")) {
+            Write-WatchLog "启动过程中进入 $phase（这是主动切换，不是失败）"
+        }
     }
-    Stop-Process -Id ([int](Get-Content $PidFile -EA SilentlyContinue | Select-Object -First 1)) `
-                 -Force -ErrorAction SilentlyContinue
-    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-
-    # 2) 主管 main.py —— /T 顺带带走它的 uvicorn
-    foreach ($s in Get-SupervisorPids) {
-        & taskkill /PID $s /T /F 2>&1 | Out-Null
-        Write-WatchLog "已停止主管 PID=$s"
-    }
-    Start-Sleep -Milliseconds 300
-
-    # 3) 端口监听者（兜底：主管已死、uvicorn 还绑着）
-    $listenPid = Get-ListenerPid
-    if ($listenPid -gt 0) {
-        & taskkill /PID $listenPid /T /F 2>&1 | Out-Null
-        Write-WatchLog "已停止监听服务 PID=$listenPid"
-    } else {
-        Write-WatchLog "端口 $Port 上没有正在监听的服务"
-    }
-
-    # 4) 本端口剩余 uvicorn（覆盖「没有监听窗口期」里的残留）
-    $left = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.CommandLine -and
-            $_.CommandLine -match 'uvicorn\s+admin\.server:app' -and
-            $_.CommandLine -match $portPat
-        })
-    foreach ($t in $left) {
-        & taskkill /PID $t.ProcessId /T /F 2>&1 | Out-Null
-        Write-WatchLog "已停止残留 uvicorn PID=$($t.ProcessId)"
-    }
-
-    # 5) 实例锁文件：进程都清掉了，锁文件留着只会让下次启动多等一轮
-    Remove-Item $InstanceLock -Force -ErrorAction SilentlyContinue
+    Write-WatchLog "启动超时（$StartTimeoutSec 秒）：请查看 logs\admin.log / service.err.log"
+    return $false
 }
 
 # ---- -Detach：把自己以隐藏窗口重新拉起，当前进程即可退出 ----------------
 # 启动 bat 用这个开关即可避开「路径含空格 + PowerShell 引号」的坑。
 if ($Detach) {
-    # 路径可能含空格（如 "2025College Student..."），必须显式加引号，
-    # 否则 -File 会被按空格拆开，子进程立刻失败且无提示。
     $scriptQuoted = '"' + $PSCommandPath + '"'
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptQuoted,
-                 '-Port', "$Port", '-IntervalSec', "$IntervalSec", '-MissThreshold', "$MissThreshold")
+                 '-Port', "$Port", '-IntervalSec', "$IntervalSec",
+                 '-WaitTimeout', "$WaitTimeout", '-StartTimeoutSec', "$StartTimeoutSec")
+    if ($RunDir) { $argList += @('-RunDir', ('"' + $RunDir + '"')) }
     if ($Once) { $argList += '-Once' }
-    if ($Stop) { $argList += '-Stop' }
-    if ($Status) { $argList += '-Status' }
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden
     exit 0
 }
 
-# ---- -Stop --------------------------------------------------------------
+# ---- -Stop：先停本部署守护拉起，再请求监督器停止并等完成 ---------------
 if ($Stop) {
-    Stop-Everything
-    exit 0
+    Stop-Watchdog | Out-Null
+    $arguments = @("--stop", "--port", "$Port")
+    if ($WaitTimeout -gt 0) { $arguments += @("--wait-timeout", "$WaitTimeout") }
+    $result = Invoke-Main -Arguments $arguments
+    Write-WatchLog "停止请求完成：main.py --stop 退出码 $($result.Code)"
+    exit ([int]$result.Code)
 }
 
 # ---- -Status ------------------------------------------------------------
 if ($Status) {
-    $svcPid = Get-ListenerPid
-    $sup = Get-SupervisorPids
-    $watchdogs = Get-DaemonPids
-    if ($svcPid -gt 0) {
-        Write-Host "服务运行中：监听 PID=$svcPid  端口=$Port"
+    # 注意：不能把快照存进 $status —— 它会和本脚本的 [switch]$Status 撞名
+    # （PowerShell 变量名大小写不敏感，赋值会抛类型转换错误）。
+    $snapshot = Get-OwnerStatus
+    $state = $snapshot.Status
+    if ($state) {
+        Write-Host ("阶段={0}  所有者pid={1}  孩子pid={2}  第{3}代  端口={4}" -f (Get-Phase $state), $state.owner_pid, $state.child_pid, $state.generation, $state.port)
+        if ($state.operation_id) {
+            Write-Host ("进行中的操作 operation_id={0}  剩余 {1} 个请求、{2} 个后台任务" -f $state.operation_id, $state.active_requests, $state.active_jobs)
+        }
     } else {
-        Write-Host "服务未运行（端口 $Port 空闲）"
+        Write-Host "没有运行中的所有者（或状态暂不可用）"
     }
-    if ($sup.Count -gt 0) { Write-Host "主管进程：$($sup -join ', ')" } else { Write-Host "主管进程：无" }
-    if ($watchdogs.Count -gt 0) { Write-Host "守护进程：$($watchdogs -join ', ')" } else { Write-Host "守护进程：无" }
-    exit 0
+    exit ([int]$snapshot.Code)
 }
 
-# ---- -Once --------------------------------------------------------------
+# ---- -Once：只启动一次，且按所有者状态区分三种情形 ----------------------
 if ($Once) {
-    if ((Get-ListenerPid) -gt 0) {
-        Write-WatchLog "端口 $Port 已被占用，跳过启动"
+    $snapshot = Get-OwnerStatus
+    $state = $snapshot.Status
+    $phase = Get-Phase $state
+    if ($phase -eq "ready") {
+        Write-WatchLog ("已在运行（pid {0}，第 {1} 代）：不重复启动" -f $state.owner_pid, $state.generation)
         exit 0
     }
-    Start-ServiceProcess | Out-Null
-    # 轮询等待，而不是 Start-Sleep 8 后一次性判定。
-    #
-    # 固定 8 秒的问题：冷启动要建表、加载平台模块、探测客户端目录，
-    # 实测 10 秒上下才监听。8 秒一刀切会把**成功**报成「启动失败」，
-    # 于是真失败和「只是慢一点」混成同一句话，日志失去判别力。
-    $deadline = (Get-Date).AddSeconds($StartupWaitSec)
-    $svcPid = 0
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 1
-        $svcPid = Get-ListenerPid
-        if ($svcPid -gt 0) { break }
-        # 解释器进程没了就别空等 —— 那是真的起不来
-        if (-not (Get-Process -Name "python" -ErrorAction SilentlyContinue)) { break }
+    if ($phase -eq "starting") {
+        Write-WatchLog "服务正在启动（慢启动可以继续等），等待就绪…"
+        if (Wait-UntilReady) { exit 0 } else { exit 1 }
     }
-    if ($svcPid -gt 0) { Write-WatchLog "启动成功 PID=$svcPid" }
-    else { Write-WatchLog "启动失败，请检查 logs\admin.log / logs\service.err.log" }
-    exit 0
+    if ($phase -in @("draining", "stopping")) {
+        Write-WatchLog "服务正在 $phase（主动切换）：不重复启动，等它完成"
+        exit 4
+    }
+    if ($phase -eq "failed") {
+        Write-WatchLog "上一代启动失败：请查看 logs\admin.log；本次不重复启动"
+        exit 6
+    }
+    if ($snapshot.Code -eq 6) {
+        Write-WatchLog "所有者状态暂不可用：不启动新实例，也不结束任何进程"
+        exit 6
+    }
+    Start-ServiceProcess | Out-Null
+    if (Wait-UntilReady) { exit 0 } else { exit 1 }
 }
 
 # ---- 守护模式 -----------------------------------------------------------
-# 单实例：拿不到锁说明已经有守护在跑。这时**必须直接退出**，否则就是两个
-# 守护轮流拉起 main.py —— 主管互相接管、互相杀子进程，端口永远在抖。
-if (-not (Lock-Daemon)) {
-    Write-Host "已有守护在运行（锁：$LockFile），本次退出。要重启服务请先 -Stop。"
-    exit 0
-}
+New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+$record = @{
+    pid        = $PID
+    root       = $Root
+    workdir    = (Get-Location).Path
+    script     = $PSCommandPath
+    port       = $Port
+    run_dir    = $RunDir
+    started_at = (Get-Date).ToString("o")
+} | ConvertTo-Json
+Set-Content -Path $PidFile -Value $record -Encoding UTF8
+Write-WatchLog "守护启动（每 $IntervalSec 秒问一次所有者状态，端口 $Port）"
 
-$PID | Out-File -FilePath $PidFile -Encoding ASCII -Force
-Write-WatchLog "守护启动（pid=$PID，端口 $Port，间隔 ${IntervalSec}s，阈值 $MissThreshold 次）"
-
-$missCount = 0
-$backoffFactor = 1
-$firstPass = $true
 while ($true) {
-    $svcPid = Get-ListenerPid
-    if ($svcPid -gt 0) {
-        if ($missCount -ne 0) { Write-WatchLog "服务已恢复监听（PID=$svcPid）" }
-        $missCount = 0
-        $backoffFactor = 1
-        $firstPass = $false
-        Start-Sleep -Seconds $IntervalSec
-        continue
-    }
-
-    $missCount++
-    $sup = Get-SupervisorPids
-
-    # 守护刚起来 + 确认**没有主管**在跑 = 「用户刚点了启动」。这时不必等满
-    # 3 次去抖：白等 30 秒只会让 start-service.bat 误报「Start FAILED」。
-    $need = $MissThreshold
-    if ($firstPass -and $sup.Count -eq 0) { $need = 1 }
-
-    if ($missCount -lt $need) {
-        Write-WatchLog "探活失败 $missCount/$need（端口 $Port 无监听）"
-        Start-Sleep -Seconds $IntervalSec
-        continue
-    }
-    $firstPass = $false
-
-    if ($sup.Count -gt 0) {
-        # 主管还活着 → 它自己会重生 uvicorn，别插手。只有长期起不来才强制重建。
-        $hardLimit = $MissThreshold * 4
-        if ($missCount -lt $hardLimit) {
-            Write-WatchLog "端口 $Port 无监听，但主管仍在（$($sup -join ',')），等它自己恢复（$missCount/$hardLimit）"
-            Start-Sleep -Seconds $IntervalSec
-            continue
-        }
-        Write-WatchLog "主管 $($sup -join ',') 连续 $missCount 次探活都不监听，强制重建"
-        foreach ($s in $sup) { & taskkill /PID $s /T /F 2>&1 | Out-Null }
-        Start-Sleep -Seconds 2
+    $snapshot = Get-OwnerStatus
+    $phase = Get-Phase $snapshot.Status
+    if ($phase -eq "ready") {
+        # 健康：什么都不做
+    } elseif ($phase -eq "starting") {
+        Write-WatchLog "服务正在启动（慢启动）：继续等，不重复拉起"
+    } elseif ($phase -in @("draining", "stopping")) {
+        Write-WatchLog "服务正在 $phase（主动切换）：不干预"
+    } elseif ($snapshot.Code -eq 6) {
+        Write-WatchLog "所有者状态暂不可用：保留现场，不启动也不结束任何进程"
     } else {
-        Write-WatchLog "端口 $Port 无监听、无主管，正在拉起（连续 $missCount 次）"
-    }
-
-    Start-ServiceProcess | Out-Null
-    $deadline = (Get-Date).AddSeconds($StartupWaitSec)
-    $okPid = 0
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 1
-        $okPid = Get-ListenerPid
-        if ($okPid -gt 0) { break }
-    }
-
-    if ($okPid -gt 0) {
-        Write-WatchLog "已恢复 PID=$okPid"
-        $missCount = 0
-        $backoffFactor = 1
-    } else {
-        $wait = [Math]::Min(60, $IntervalSec * $backoffFactor)
-        Write-WatchLog "拉起后 ${StartupWaitSec}s 内仍未监听，${wait}s 后再试"
-        $backoffFactor++
-        Start-Sleep -Seconds $wait
+        Write-WatchLog "没有运行中的所有者：拉起服务"
+        Start-ServiceProcess | Out-Null
+        Start-Sleep -Seconds 8
     }
     Start-Sleep -Seconds $IntervalSec
 }
