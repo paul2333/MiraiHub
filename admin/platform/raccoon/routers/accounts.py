@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -189,7 +189,7 @@ def import_accounts(body: ImportIn, _: bool = Depends(require_admin),
 
 
 @router.get("/export")
-def export_accounts(ids: str = "", mode: str = "backup",
+def export_accounts(request: Request, ids: str = "", mode: str = "plain",
                     _: bool = Depends(require_admin),
                     db: Session = Depends(get_db)):
     """导出账号。
@@ -202,9 +202,14 @@ def export_accounts(ids: str = "", mode: str = "backup",
     只给备份模式的话，任何人想「导一份给别人看」都会连带把自己的
     全部 JWT 一起发出去。
     """
+    from admin import export_guard
+
+    # 2026-11-24 第 3 轮（S-4）：默认改 plain；backup 需二次确认。
+    full = export_guard.guard_secret_export(
+        request, "raccoon export", export_guard.wants_secrets(str(mode).lower() == "backup"))
     wanted = _ids_of(ids)
     rows = raccoon_accounts.export_records(db, wanted)
-    if str(mode).lower() == "plain":
+    if not full:
         plain = []
         for row in rows:
             item = dict(row)

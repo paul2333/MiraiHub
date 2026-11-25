@@ -148,10 +148,14 @@ def _client(timeout: float) -> httpx.Client:
     实测在 OpenWrt 上表现为 TLS 握手 `UNEXPECTED_EOF_WHILE_READING` ——
     报错看起来像上游掐连接，实际是客户端超时配置畸形。
     """
+    from admin import http_shared
     return httpx.Client(
-        timeout=httpx.Timeout(connect=20.0, read=timeout,
-                              write=timeout, pool=20.0),
         follow_redirects=True,
+        # P3：共享连接池 + 共享 TLS 上下文 + 建连封顶 10s（cookie 仍按请求隔离）
+        **http_shared.client_kwargs(
+            "wps_lingxi",
+            timeout=httpx.Timeout(connect=20.0, read=timeout,
+                                  write=timeout, pool=20.0)),
     )
 
 
@@ -160,11 +164,29 @@ _TRANSIENT = ("UNEXPECTED_EOF_WHILE_READING", "EOF occurred in violation of prot
               "Connection reset by peer", "Server disconnected", "ConnectError",
               "ReadTimeout", "ConnectTimeout", "RemoteProtocolError",
               "TLS", "SSL")
-_RETRY_TIMES = 4
+def _net_retries() -> int:
+    """网络瞬时错误的重试次数（不含首发）。
+
+    原来固定 4 次尝试、退避 0.4/1.0/1.8/2.6 s，最坏要多等 5.8 s 才报错（perf 审计 2.2）。
+    现在默认重试 2 次（共 3 次尝试，最坏多等 1.4 s）；`WPS_LINGXI_NET_RETRIES=3` 回到旧值。
+    """
+    raw = (os.getenv("WPS_LINGXI_NET_RETRIES", "") or "").strip()
+    try:
+        value = int(raw) if raw else 2
+    except ValueError:
+        value = 2
+    return max(0, min(5, value))
+
+
+_RETRY_TIMES = 1 + _net_retries()
 _BACKOFF = (0.4, 1.0, 1.8, 2.6)
 
 
-def _transient(exc: BaseException) -> bool:
+def _transient(exc: BaseException, *, read_timeout_ok: bool = True) -> bool:
+    # 对话流的首帧读超时**不重试**：上游已经收下了这次生成，重发等于再生成（再计费）
+    # 一次，还要再等一个完整的读超时。建连 / TLS / 复用连接被对端关闭照旧重试。
+    if not read_timeout_ok and isinstance(exc, httpx.ReadTimeout):
+        return False
     text = "%s: %s" % (type(exc).__name__, exc)
     return any(marker in text for marker in _TRANSIENT)
 
@@ -684,6 +706,13 @@ def ensure_run(cookie: str, model: str, *, messages: list | None = None,
             continue
         with _RUNS_LOCK:
             _RUNS[key] = run
+            # 过期条目原来只在失效时 pop，账号多了会一直残留（perf 审计 5.1）：
+            # 超过 64 条时顺手清掉已过 RUN_TTL 的。
+            if len(_RUNS) > 64:
+                now = time.time()
+                for stale in [k for k, v in _RUNS.items()
+                              if now - float(v.get("at") or 0) >= endpoints.RUN_TTL]:
+                    _RUNS.pop(stale, None)
         return run
     if last_error is not None:
         raise last_error
@@ -730,7 +759,7 @@ def chat_stream(cookie: str, run: dict, body: dict, *, model: str,
         except UpstreamError:
             raise
         except Exception as exc:  # noqa: BLE001
-            if not _transient(exc):
+            if not _transient(exc, read_timeout_ok=False):
                 raise UpstreamError("网络错误: %s" % str(exc)[:200], status=0,
                                     kind="network") from exc
             if attempt >= _RETRY_TIMES:

@@ -353,11 +353,13 @@ def _opener(proxy: str | None):
         opener = _OPENERS.get(key)
         if opener is not None:
             return opener
-        if key:
-            handler = urllib.request.ProxyHandler({"http": key, "https": key})
-            opener = urllib.request.build_opener(handler)
-        else:
-            opener = urllib.request.build_opener()
+        # 走 `upstream_http.build_opener`（P3）：共享 TLS 上下文 + **建连短超时**
+        # （ADMIN_UPSTREAM_CONNECT_TIMEOUT，默认 10s）。原来 `timeout=600` 同时是
+        # 建连超时，上游节点一挂就占着线程等 10 分钟。代理语义不变：显式出口走
+        # ProxyHandler；没有出口时 `trust_env=True` 保留「读环境变量（含 no_proxy）」。
+        from admin import upstream_http
+
+        opener = upstream_http.build_opener(True, proxy=key or None)
         _OPENERS[key] = opener
         return opener
 
@@ -482,10 +484,43 @@ def _host_family(host: str) -> str:
     return "default"
 
 
+#: 长连接池里的平台名（开关 `ADMIN_URLLIB_KEEPALIVE_TRAE` / 总开关 `ADMIN_URLLIB_KEEPALIVE`）。
+KEEPALIVE_PLATFORM = "trae"
+
+
 def _open(url: str, data: bytes | None, headers: dict, timeout: float,
-          proxy: str | None = None, method: str = "POST"):
+          proxy: str | None = None, method: str = "POST", account_key: str = ""):
+    """`account_key` 非空且开关打开时走按账号长连接池（r3 第 1 项，默认关）。
+
+    代理语义与 `_opener(proxy)` 一致：显式出口优先，否则读环境变量（含 no_proxy）；
+    出口带认证 / socks 等池不支持的形态时回落原 opener。
+    """
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    if account_key:
+        from admin import http_keepalive
+
+        if http_keepalive.enabled(KEEPALIVE_PLATFORM):
+            resp = http_keepalive.open_request(
+                KEEPALIVE_PLATFORM, req, timeout=timeout, account=account_key,
+                proxy=(proxy or "").strip() or None, trust_env=True)
+            if resp is not None:
+                return resp
     return _opener(proxy).open(req, timeout=timeout)
+
+
+def _keepalive_key(data: dict) -> str:
+    """长连接池的账号键：同一个号的连接才复用（风控特征按号隔离）。"""
+    for value in (data.get("id"), data.get("account_id"), uid_of(data)):
+        if not _blank(value):
+            return str(value).strip()
+    return ""
+
+
+def _delivery_unknown_error(exc) -> "UpstreamError":
+    """请求已写出、连接在响应头前中断：kind 不在 RETRYABLE_KINDS → 不换号、不换主机。"""
+    detail = str(getattr(exc, "detail", "") or exc)[:300]
+    return UpstreamError("delivery_unknown", "上游交付状态未知：请求已发出，连接在收到响应前中断",
+                         502, kind="delivery_unknown", detail="trae delivery_unknown: %s" % detail)
 
 
 # ---------------------------------------------------------------------------
@@ -681,17 +716,23 @@ def open_chat(account, realm=None, body=None, timeout: float = DEFAULT_TIMEOUT,
         hosts = [h for h in hosts if _host_key(h) == pinned] or [only_host]
     last_exc = None
     attempts = []
+    keepalive_key = _keepalive_key(data)
     for host in hosts:
         url = host + PATH_CHAT
         attempts.append(url)
         try:
-            resp = _open(url, raw, headers, timeout, proxy=proxy)
+            resp = _open(url, raw, headers, timeout, proxy=proxy, account_key=keepalive_key)
         except urllib.error.HTTPError as exc:
             raise _http_error(exc)
         except (urllib.error.URLError, socket.timeout, TimeoutError,
                 ConnectionError, OSError) as exc:
+            # 池建连失败是 `http_keepalive.ConnectError`（OSError）：请求没发出，照旧换主机
             last_exc = exc
             continue
+        except Exception as exc:  # noqa: BLE001 - 只拦交付未知（不是 OSError），其余原样上抛
+            if type(exc).__name__ != "DeliveryUnknown":
+                raise
+            raise _delivery_unknown_error(exc) from exc
         try:
             setattr(resp, "_trae_host", host)
         except Exception:

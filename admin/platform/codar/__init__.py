@@ -93,9 +93,8 @@ def install() -> None:
         },
         extra={
             "task_runners": list(_task_runners().keys()),
-            # begin-auth = 微信扫码授权（免客户端换票）；扫描/导入仍然保留
-            "actions": ["begin-auth", "scan", "import", "export",
-                        "checkin", "refresh-quota"],
+            "actions": ["scan", "import", "export", "checkin",
+                        "refresh-quota"],
             "protocols": ["openai_chat_completions", "anthropic_messages"],
             "max_concurrency": 3,
         },

@@ -132,7 +132,9 @@ def request_json(method: str, url: str, *, token: str, realm: str = "cn",
         headers["Content-Type"] = "application/json"
     tag = "minimax#%s" % (account_id if account_id is not None else "-")
     try:
-        with httpx.Client(timeout=TIMEOUT, follow_redirects=True) as client:
+        from admin import http_shared
+        with httpx.Client(follow_redirects=True,
+                          **http_shared.client_kwargs("minimax", timeout=TIMEOUT)) as client:  # P3：共享连接池 + 共享 TLS 上下文 + 建连 10s（cookie 仍按请求隔离）
             resp = client.request(method, url, headers=headers,
                                   json=json_body, params=params)
     except httpx.HTTPError as exc:
@@ -163,7 +165,9 @@ def open_stream(url: str, *, token: str, realm: str = "cn", json_body=None,
     headers["Accept"] = "text/event-stream"
     tag = "minimax#%s" % (account_id if account_id is not None else "-")
     started = time.perf_counter()
-    client = httpx.Client(timeout=TIMEOUT, follow_redirects=True)
+    from admin import http_shared
+    client = httpx.Client(follow_redirects=True,
+                          **http_shared.client_kwargs("minimax", timeout=TIMEOUT))  # P3：共享连接池 + 共享 TLS 上下文 + 建连 10s（cookie 仍按请求隔离）
     try:
         resp = client.send(client.build_request(
             "POST", url, headers=headers, json=json_body), stream=True)
@@ -172,9 +176,13 @@ def open_stream(url: str, *, token: str, realm: str = "cn", json_body=None,
         raise UpstreamError("%s 网络错误（%s）" % (tag, type(exc).__name__),
                             kind="upstream", detail=_redact(str(exc))) from exc
     if resp.status_code >= 400:
-        body = resp.read().decode("utf-8", "replace")
-        resp.close()
-        client.close()
+        try:
+            resp.read()
+        except Exception:  # noqa: BLE001 - 读不到错误体也要关连接（共享池漏关不会被 GC 带走）
+            pass
+        finally:
+            resp.close()
+            client.close()
         raise _error_from_anthropic(resp, tag)
     if stats is not None:
         try:

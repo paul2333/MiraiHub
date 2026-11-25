@@ -24,12 +24,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
 from admin.platform import shared
+from admin import http_shared
 from admin.platform import protocol_bridge as bridge
 from admin.platform.raccoon.core import client
 from admin.platform.raccoon.services import accounts as raccoon_accounts
@@ -529,7 +531,7 @@ async def _forward(body: dict, request) -> JSONResponse:
         except shared.PlatformRejected:
             raise
         except client.UpstreamError as exc:
-            _bill_error(key, request, body, exc)
+            await asyncio.to_thread(_bill_error, key, request, body, exc)
             return _fail(exc)
         shared.release(account)
         shared.note_success(account)
@@ -541,13 +543,13 @@ async def _forward(body: dict, request) -> JSONResponse:
         # 会给客户端一个字面量 `null`，/v1/chat/completions 的调用方解析
         # `choices[0]` 时崩掉。这里转成明确的错误。
         if not isinstance(result, dict):
-            _bill(key, account, str(body.get("model") or ""), {},
+            await asyncio.to_thread(_bill, key, account, str(body.get("model") or ""), {},
                   request=request, started=started, error="empty_upstream")
             return JSONResponse(
                 {"error": {"type": "upstream_error", "code": "empty_response",
                            "message": "小浣熊上游返回空响应"}},
                 status_code=502)
-        _bill(key, account, str(body.get("model") or ""), result,
+        await asyncio.to_thread(_bill, key, account, str(body.get("model") or ""), result,
               request=request, started=started)
         return JSONResponse(result)
     finally:
@@ -605,7 +607,7 @@ async def _forward_stream(body: dict, request):
         started = time.perf_counter()
 
         for _ in range(MAX_ATTEMPTS):
-            account = shared.select_account(
+            account = await asyncio.to_thread(shared.select_account,
                 db, storage=raccoon_accounts.PLATFORM, realm=realm, key=key,
                 model=model, exclude_ids=exclude)
             if account is None:
@@ -615,16 +617,17 @@ async def _forward_stream(body: dict, request):
                 continue
             leased = True
             try:
-                data = raccoon_accounts.ensure_token(db, account)
-                upstream = client.open_stream(
+                data = await asyncio.to_thread(raccoon_accounts.ensure_token, db, account)
+                upstream = await http_shared.run_blocking(client.open_stream,
                     raccoon_accounts.endpoints.llm_base_of(realm) + "/chat/completions",
                     token=raccoon_accounts.token_of(data), realm=realm,
-                    json_body=body, account_id=int(account.id or 0), stats=stats)
+                    json_body=body, account_id=int(account.id or 0), stats=stats,
+                               on_orphan=http_shared.close_quietly)
                 break
             except client.UpstreamError as exc:
                 shared.release(account)
                 leased = False
-                shared.note_failure(
+                await asyncio.to_thread(shared.note_failure,
                     db, account, kind=exc.kind, detail=exc.detail or exc.message,
                     status=exc.status, model=model, public_platform=PUBLIC,
                     cool_seconds=_cool_seconds(exc))
@@ -673,7 +676,7 @@ async def _forward_stream(body: dict, request):
     if upstream is None:
         db.close()
         if last_error is not None:
-            _bill_error(key, request, body, last_error)
+            await asyncio.to_thread(_bill_error, key, request, body, last_error)
             return _fail(last_error)
         raise shared.PlatformRejected(
             503, "小浣熊没有可用账号（请先在控制台导入凭证并确认状态为启用）",
@@ -682,6 +685,7 @@ async def _forward_stream(body: dict, request):
 
     holder: dict = {}
     cleaned = {"done": False}
+    cleanup_lock = threading.Lock()
 
     def cleanup():
         """幂等清理：连接 / 租约 / Session / 记账。
@@ -702,9 +706,10 @@ async def _forward_stream(body: dict, request):
         `BackgroundTask`（响应结束/断开时一定会跑）兜底调用，
         生成器 finally 只作为快路径。
         """
-        if cleaned["done"]:
-            return
-        cleaned["done"] = True
+        with cleanup_lock:   # 第 4 轮：读线程 / 钩子线程 / background 并发判重
+            if cleaned["done"]:
+                return
+            cleaned["done"] = True
         try:
             if upstream is not None:
                 upstream.close()
@@ -757,15 +762,21 @@ async def _forward_stream(body: dict, request):
             # 快路径：正常结束时立即清理
             cleanup()
 
-    return StreamingResponse(
+    # 第 4 轮 R4-BE-05：/v1/messages、/v1/responses 把它交给中继；中继不会跑内层
+    # 响应的 background，一帧没读时 generator 也不会启动 → 钩子兜底（守护线程）。
+    # 第 5 轮（A6）：直连 /v1/chat/completions 时，响应头发送失败会让 __call__ 直接抛出，
+    # background **不会**跑（上面「一定会跑」只对正常结束 / 读流中途断开成立）→
+    # 用 guarded_stream_response，自身 finally 里也调未启动钩子。
+    return bridge.guarded_stream_response(
         # **空闲心跳**：上游排队/限流/慢思考时整条流可能几十秒无字节，
         # 每 8 秒一帧**空增量 data 帧**（真实事件，会被解析并重置客户端
         # idle 计时器；旧注释帧已被证明无效，可用
         # MIRAIHUB_KEEPALIVE_DATA_FRAME=0 回退）。
-        bridge.with_pings(generator(), ping=bridge.CHAT_PING),
-        media_type="text/event-stream",
+        # P4：异步桥（不占 anyio 令牌；断连后停读上游并 close 生成器）
+        http_shared.async_stream(generator(), ping=bridge.CHAT_PING),
+        cleanup, name="raccoon-unstarted",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        # 兜底：客户端断开 / task 被取消时，Starlette 仍会跑 background
+        # 兜底：读流中途客户端断开时 Starlette 仍会跑 background
         background=BackgroundTask(cleanup))
 
 
@@ -970,7 +981,7 @@ async def list_models(request):
     with SessionLocal() as db:
         shared.authenticate(db, request, platform=PUBLIC)
         realm = _realm(request)
-        account = shared.select_account(
+        account = await asyncio.to_thread(shared.select_account,
             db, storage=raccoon_accounts.PLATFORM, realm=realm,
             key=shared.key_row(db, request))
         if account is None:
@@ -979,8 +990,8 @@ async def list_models(request):
                 "data": shared.catalog_from_db(db, raccoon_accounts.PLATFORM),
                 "note": "号池没有可用小浣熊账号，仅返回配置目录"})
         try:
-            data = raccoon_accounts.ensure_token(db, account)
-            models = client.fetch_models(raccoon_accounts.token_of(data), realm,
+            data = await asyncio.to_thread(raccoon_accounts.ensure_token, db, account)
+            models = await asyncio.to_thread(client.fetch_models, raccoon_accounts.token_of(data), realm,
                                          account_id=int(account.id or 0))
         except client.UpstreamError as exc:
             return _fail(exc)
@@ -1024,7 +1035,7 @@ async def balance(request):
     with SessionLocal() as db:
         shared.authenticate(db, request, platform=PUBLIC)
         realm = _realm(request)
-        account = shared.select_account(
+        account = await asyncio.to_thread(shared.select_account,
             db, storage=raccoon_accounts.PLATFORM, realm=realm,
             key=shared.key_row(db, request))
         if account is None:
@@ -1032,10 +1043,10 @@ async def balance(request):
                                  "reachable": False, "models": 0,
                                  "note": "号池没有可用账号"}, status_code=503)
         try:
-            data = raccoon_accounts.ensure_token(db, account)
-            points = client.fetch_points(raccoon_accounts.token_of(data), realm,
+            data = await asyncio.to_thread(raccoon_accounts.ensure_token, db, account)
+            points = await asyncio.to_thread(client.fetch_points, raccoon_accounts.token_of(data), realm,
                                          account_id=int(account.id or 0))
-            models = client.fetch_models(raccoon_accounts.token_of(data), realm,
+            models = await asyncio.to_thread(client.fetch_models, raccoon_accounts.token_of(data), realm,
                                          account_id=int(account.id or 0))
         except client.UpstreamError as exc:
             return _fail(exc)

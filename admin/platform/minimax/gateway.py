@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 
 from fastapi import Request
@@ -27,6 +28,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette.background import BackgroundTask
 from starlette.responses import StreamingResponse
 
+from admin import http_shared
 from admin.platform import protocol_bridge as bridge
 from admin.platform import shared
 from admin.platform.minimax.core import client
@@ -237,7 +239,7 @@ async def _forward_anthropic(body: dict, request) -> JSONResponse:
         except Exception:  # noqa: BLE001
             db.rollback()
         if not isinstance(result, dict):
-            _bill(key, account, str(body.get("model") or ""), {},
+            await asyncio.to_thread(_bill, key, account, str(body.get("model") or ""), {},
                   request=request, started=started, error="empty_upstream")
             return JSONResponse(
                 {"type": "error",
@@ -245,7 +247,7 @@ async def _forward_anthropic(body: dict, request) -> JSONResponse:
                            "message": "MiniMax 上游返回空响应"}},
                 status_code=502)
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
-        _bill(key, account, str(body.get("model") or ""), usage,
+        await asyncio.to_thread(_bill, key, account, str(body.get("model") or ""), usage,
               request=request, started=started)
         return JSONResponse(result)
     finally:
@@ -307,7 +309,7 @@ async def _forward_stream(body: dict, request, *, anthropic_native: bool):
         key = shared.authenticate(db, request, platform=PUBLIC)
         body = {**body, "stream": True}
         for _ in range(MAX_ATTEMPTS):
-            account = shared.select_account(
+            account = await asyncio.to_thread(shared.select_account,
                 db, storage=STORAGE, realm=realm, key=key,
                 model=model, exclude_ids=exclude)
             if account is None:
@@ -317,17 +319,18 @@ async def _forward_stream(body: dict, request, *, anthropic_native: bool):
                 continue
             leased = True
             try:
-                data = minimax_accounts.ensure_token(db, account)
-                upstream = client.open_stream(
+                data = await asyncio.to_thread(minimax_accounts.ensure_token, db, account)
+                upstream = await http_shared.run_blocking(client.open_stream,
                     agent_base(realm) + LLM_MESSAGES_PATH,
                     token=minimax_accounts.token_of(data), realm=realm,
                     json_body=body, account_id=int(account.id or 0),
-                    stats=stats)
+                    stats=stats,
+                               on_orphan=http_shared.close_quietly)
                 break
             except client.UpstreamError as exc:
                 shared.release(account)
                 leased = False
-                shared.note_failure(
+                await asyncio.to_thread(shared.note_failure,
                     db, account, kind=exc.kind, detail=exc.detail or exc.message,
                     status=exc.status, model=model, public_platform=PUBLIC,
                     cool_seconds=(600 if exc.kind in ("auth", "quota") else 0))
@@ -369,11 +372,15 @@ async def _forward_stream(body: dict, request, *, anthropic_native: bool):
 
     holder: dict = {}
     cleaned = {"done": False}
+    cleanup_lock = threading.Lock()
 
     def cleanup():
-        if cleaned["done"]:
-            return
-        cleaned["done"] = True
+        # 第 4 轮：可能同时从读线程（_framed finally）、兜底钩子线程、background
+        # 进来，判重要加锁，否则会重复 release / 重复记账。
+        with cleanup_lock:
+            if cleaned["done"]:
+                return
+            cleaned["done"] = True
         client.close_stream(upstream)
         try:
             shared.release(account)
@@ -436,24 +443,39 @@ async def _forward_stream(body: dict, request, *, anthropic_native: bool):
     # generator —— 在进入 generator 之前直接返回它的 StreamingResponse，
     # cleanup 挂在 background（断连兜底与 native 分支同款）。
     if not anthropic_native:
-        async def _agen():
-            for line in _passthrough_lines(upstream):
-                yield line + b"\n"
+        def _framed():
+            # 第 4 轮 R4-BE-05：收尾挂在读循环本身。以前只挂在外层响应的
+            # background 上：/v1/responses 再套一层 responses_stream_relay 时外层
+            # 根本不跑内层响应的 background → 账号租约不还、不记账；客户端中途
+            # 断开（Starlette 抛 ClientDisconnect）时 background 也不跑。
+            try:
+                for line in _passthrough_lines(upstream):
+                    yield line + b"\n"
+            finally:
+                cleanup()
 
         class _Inner:
-            body_iterator = _agen()
+            # P1：原来是 `async def _agen(): for line in _passthrough_lines(upstream)` ——
+            # 同步读上游发生在事件循环上，整条流期间全站冻结。改走异步桥。
+            body_iterator = http_shared.aiter_sync(_framed())
 
-        resp = bridge.anthropic_upstream_stream_relay(
-            _Inner(), model, prefix="minimax")
+        # 中继一帧没读内层就结束（响应头发送失败 / 客户端早走）：_framed 从未启动，
+        # finally 不会执行 → 钩子在守护线程里收尾（幂等）。
+        inner = bridge.guard_unstarted_detached(_Inner(), cleanup, "minimax-unstarted")
+        resp = bridge.anthropic_upstream_stream_relay(inner, model, prefix="minimax")
         resp.background = BackgroundTask(cleanup)
-        return resp
+        # 被 responses() 再包一层中继时，外层中继调的是这个响应上的钩子。
+        return bridge.guard_unstarted_detached(resp, cleanup, "minimax-unstarted")
 
     def _native_only():
         yield from generator()
 
-    return StreamingResponse(
-        bridge.with_pings(_native_only(), ping=bridge.CHAT_PING),
-        media_type="text/event-stream",
+    # 第 5 轮（A6）：native 直连，响应头发送失败时 background 不跑、生成器不启动 →
+    # guarded_stream_response 自身 finally 调未启动钩子（守护线程里 cleanup，幂等）。
+    return bridge.guarded_stream_response(
+        # P4：异步桥（不占 anyio 令牌；断连后停读上游并 close 生成器）
+        http_shared.async_stream(_native_only(), ping=bridge.CHAT_PING),
+        cleanup, name="minimax-unstarted",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         background=BackgroundTask(cleanup))
 
@@ -556,7 +578,7 @@ async def balance(request: Request):
     with SessionLocal() as db:
         shared.authenticate(db, request, platform=PUBLIC)
         realm = _realm(request)
-        account = shared.select_account(
+        account = await asyncio.to_thread(shared.select_account,
             db, storage=STORAGE, realm=realm,
             key=shared.key_row(db, request))
         if account is None:
@@ -565,8 +587,8 @@ async def balance(request: Request):
                                  "note": "号池没有可用 MiniMax 账号"},
                                 status_code=503)
         try:
-            data = minimax_accounts.ensure_token(db, account)
-            credit = client.fetch_credit_details(
+            data = await asyncio.to_thread(minimax_accounts.ensure_token, db, account)
+            credit = await asyncio.to_thread(client.fetch_credit_details,
                 minimax_accounts.token_of(data), realm,
                 account_id=int(account.id or 0))
         except client.UpstreamError as exc:

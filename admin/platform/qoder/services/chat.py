@@ -310,15 +310,21 @@ def _build_model_server_body(*, model: dict, messages: list[dict],
 
 
 def _plan_iterator(plan: dict):
-    """按 plan["mode"] 选上游迭代器（两条链路产出同形态的 chunk dict）。"""
+    """按 plan["mode"] 选上游迭代器（两条链路产出同形态的 chunk dict）。
+
+    `plan["abort"]`（可选，`http_keepalive.AbortHandle`）：网关在客户端断开时用它
+    打断阻塞读（r3 第 2 项）；没有时行为与原来一致。
+    """
+    abort = plan.get("abort")
     if plan.get("mode") == "model_server":
         return client.iter_model_chat_stream(
             plan["token"], plan["realm"], body=plan["upstream_openai"],
-            account_id=plan.get("account_id", 0))
+            account_id=plan.get("account_id", 0), abort=abort)
     return client.iter_chat_stream(
         plan["token"], plan["realm"], uid=plan["uid"],
         body=plan["upstream"], name=plan["name"], email=plan["email"],
-        machine_id=plan["machine_id"], account_id=plan.get("account_id", 0))
+        machine_id=plan["machine_id"], account_id=plan.get("account_id", 0),
+        abort=abort)
 
 
 # ---------------------------------------------------------------------------

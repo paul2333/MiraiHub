@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from datetime import datetime
 
@@ -45,6 +46,7 @@ from fastapi import Request
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
+from admin import http_shared
 from admin.platform import protocol_bridge as bridge
 from admin.platform import shared
 from admin.platform.codar.core import client, endpoints
@@ -325,7 +327,7 @@ async def _forward_json(body: dict, request, *, upstream: str):
         except Exception:  # noqa: BLE001
             db.rollback()
         usage = result.get("usage") if isinstance(result, dict) else {}
-        _bill(key, account, str(body.get("model") or ""), usage,
+        await asyncio.to_thread(_bill, key, account, str(body.get("model") or ""), usage,
               request=request, started=started, body=body)
         return result
     finally:
@@ -473,6 +475,7 @@ async def _stream(request, body: dict, *, upstream: str, entry: str):
     started = time.perf_counter()
     holder: dict = {}
     cleaned = {"done": False}
+    cleanup_lock = threading.Lock()
     injected = False
     try:
         key = shared.authenticate(db, request, platform=_public(request))
@@ -499,9 +502,11 @@ async def _stream(request, body: dict, *, upstream: str, entry: str):
         raise
 
     def cleanup():
-        if cleaned["done"]:
-            return
-        cleaned["done"] = True
+        # 第 4 轮：读线程 / 兜底钩子线程 / 事件循环三处可能同时进来，判重加锁。
+        with cleanup_lock:
+            if cleaned["done"]:
+                return
+            cleaned["done"] = True
         if resp is not None:
             client.close_stream(resp)
         if uid:
@@ -563,7 +568,8 @@ async def _stream(request, body: dict, *, upstream: str, entry: str):
 
         ping = bridge.ANTHROPIC_PING if anthropic_style else bridge.CHAT_PING
         return StreamingResponse(
-            bridge.with_pings(generator(), ping=ping),
+            # P4：异步桥（不占 anyio 令牌；断连后停读上游并 close 生成器）
+            http_shared.async_stream(generator(), ping=ping),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -590,35 +596,47 @@ async def _stream(request, body: dict, *, upstream: str, entry: str):
                         holder["usage"] = merged
             yield (line if isinstance(line, bytes) else str(line).encode("utf-8"))
 
-    async def _agen():
-        for line in _lines():
-            yield line + b"\n"
+    def _framed():
+        # 第 4 轮：收尾挂在读循环上（在读线程里跑，不占事件循环）；
+        # _with_cleanup 的 finally / background 仍兜底（cleanup 幂等）。
+        try:
+            for line in _lines():
+                yield line + b"\n"
+        finally:
+            cleanup()
 
     class _Inner:
-        body_iterator = _agen()
+        # P1：原来是 `async def _agen(): for line in _lines()` —— 同步读上游发生在
+        # 事件循环上，整条翻译流期间全站冻结。改走异步桥（读上游在独立线程）。
+        body_iterator = http_shared.aiter_sync(_framed())
+
+    def _guarded_inner():
+        # R4-BE-05：中继一帧没读内层时 _framed 不会启动 → 钩子在守护线程收尾。
+        return bridge.guard_unstarted_detached(_Inner(), cleanup, "codar-unstarted")
 
     if upstream == "anthropic" and entry == "openai":
         return _with_cleanup(
-            bridge.anthropic_upstream_stream_relay(_Inner(), model,
+            bridge.anthropic_upstream_stream_relay(_guarded_inner(), model,
                                                    prefix="codar"), cleanup)
 
     if upstream == "chat" and entry == "anthropic":
         return _with_cleanup(
-            bridge.anthropic_stream_relay(_Inner(), model, prefix="codar"),
+            bridge.anthropic_stream_relay(_guarded_inner(), model, prefix="codar"),
             cleanup)
 
     if entry == "responses":
         if upstream == "anthropic":
             inner_relay = bridge.anthropic_upstream_stream_relay(
-                _Inner(), model, prefix="codar")
+                _guarded_inner(), model, prefix="codar")
 
             class _Wrapped:
                 body_iterator = inner_relay.body_iterator
 
-            relay = bridge.responses_stream_relay(_Wrapped(), model,
-                                                  prefix="codar")
+            relay = bridge.responses_stream_relay(
+                bridge.guard_unstarted_detached(_Wrapped(), cleanup, "codar-unstarted"),
+                model, prefix="codar")
         else:
-            relay = bridge.responses_stream_relay(_Inner(), model,
+            relay = bridge.responses_stream_relay(_guarded_inner(), model,
                                                   prefix="codar")
         return _with_cleanup(relay, cleanup)
 
@@ -648,7 +666,8 @@ def _with_cleanup(relay, cleanup):
 
     relay.body_iterator = _gen()
     relay.background = BackgroundTask(cleanup)
-    return relay
+    # 第 4 轮：_gen 一帧没跑（响应头就发送失败）时它的 finally 不执行 → 钩子兜底。
+    return bridge.guard_unstarted_detached(relay, cleanup, "codar-unstarted")
 
 
 # ---------------------------------------------------------------------------
@@ -694,11 +713,8 @@ async def messages(request: Request):
                                  entry="anthropic")
         return await _json_anthropic_native(body, request)
     if body.get("stream"):
-        # 协议转换是**普通函数**，别写成 `await bridge.anthropic_to_openai(...)`：
-        # 那会把 dict 当协程去 await，运行期直接 TypeError。先转好再进流式。
-        converted = bridge.anthropic_to_openai(body)
-        return await _stream(request, converted, upstream="chat",
-                             entry="anthropic")
+        return await _stream(request, bridge.anthropic_to_openai(body),
+                             upstream="chat", entry="anthropic")
     return await _json_anthropic_entry_via_chat(body, request)
 
 
@@ -769,7 +785,7 @@ async def list_models(request: Request):
 
     with SessionLocal() as db:
         key = shared.authenticate(db, request, platform=_public(request))
-        info = codar_accounts.catalog(db, key=key)
+        info = await asyncio.to_thread(codar_accounts.catalog, db, key=key)
     payload = []
     for row in info["rows"]:
         protocol = row.get("protocol") or endpoints.PROTOCOL_CHAT
@@ -807,16 +823,16 @@ async def balance(request: Request):
 
     with SessionLocal() as db:
         key = shared.authenticate(db, request, platform=_public(request))
-        account = shared.select_account(db, storage=STORAGE, realm="cn",
+        account = await asyncio.to_thread(shared.select_account, db, storage=STORAGE, realm="cn",
                                         key=key, ignore_capacity=True)
         if account is None:
             return JSONResponse({"platform": PUBLIC, "reachable": False,
                                  "note": "号池没有启用中的科搭账号"},
                                 status_code=503)
         try:
-            token = codar_accounts.token_for_call(db, account)
+            token = await asyncio.to_thread(codar_accounts.token_for_call, db, account)
             username = codar_accounts.username_of_account(account)
-            points = codar_accounts.read_points(
+            points = await asyncio.to_thread(codar_accounts.read_points,
                 token, username, account_id=int(account.id or 0))
         except client.UpstreamError as exc:
             return _fail(exc)

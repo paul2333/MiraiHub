@@ -82,7 +82,7 @@ def import_account(body: ImportIn, _: bool = Depends(require_admin),
 
 
 @router.get("/export")
-def export(realm: str = "", mode: str = "", reveal: int = 0,
+def export(request: Request, realm: str = "", mode: str = "", reveal: int = 0,
            _: bool = Depends(require_admin), db: Session = Depends(get_db)):
     """导出号池（issue #25：Qoder 国内/国际的导入导出入口都没了）。
 
@@ -96,7 +96,12 @@ def export(realm: str = "", mode: str = "", reveal: int = 0,
     （JSONL，与 `import_batch` 严格对称）—— 这是「导出→导入」能闭环的前提。
     """
     realm = _realm_or_400(realm) or "cn"
-    full = bool(reveal) or str(mode or "").strip().lower() == "backup"
+    from admin import export_guard
+
+    # 完整凭证需二次确认（2026-11-24 第 3 轮，S-4）
+    full = export_guard.guard_secret_export(
+        request, "qoder export",
+        bool(reveal) or str(mode or "").strip().lower() == "backup")
     rows = qoder_accounts.accounts_for(db, realm)
     records: list[dict] = []
     for account in rows:

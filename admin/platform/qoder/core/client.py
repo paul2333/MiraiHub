@@ -77,14 +77,97 @@ class UpstreamError(Exception):
                 "detail": self.detail[:400]}
 
 
+#: 长连接池里的平台名（开关 `ADMIN_URLLIB_KEEPALIVE_QODER` / 总开关 `ADMIN_URLLIB_KEEPALIVE`）。
+KEEPALIVE_PLATFORM = "qoder"
+
+
 def _open(url: str, data: bytes | None, headers: dict,
-          timeout: float, method: str):
+          timeout: float, method: str, *, account_id: int = 0):
+    """`account_id` 非 0 且开关打开时，对话请求走按账号长连接池（r3 第 1 项，默认关）。
+
+    代理语义同 `_upstream_opener()`（读环境变量代理）；池不支持的代理形态回落原 opener。
+    """
     req = urllib.request.Request(url, data=data, method=method)
     for key, value in headers.items():
         req.add_header(str(key), str(value))
     if data:
         req.add_header("Content-Type", "application/json")
-    return urllib.request.urlopen(req, timeout=timeout)
+    if account_id:
+        try:
+            from admin import http_keepalive
+        except Exception:  # noqa: BLE001 - 独立脚本里没有 admin 包
+            http_keepalive = None
+        if http_keepalive is not None and http_keepalive.enabled(KEEPALIVE_PLATFORM):
+            resp = http_keepalive.open_request(KEEPALIVE_PLATFORM, req, timeout=timeout,
+                                               account=int(account_id), proxy=None,
+                                               trust_env=True)
+            if resp is not None:
+                return resp
+    return _upstream_opener().open(req, timeout=timeout)
+
+
+def _is_delivery_unknown(exc) -> bool:
+    return type(exc).__name__ == "DeliveryUnknown"
+
+
+def _delivery_unknown(exc) -> "UpstreamError":
+    """请求已写出、连接在响应头前中断：status=0 → `retryable()` 为 False，不进哨兵。"""
+    return UpstreamError("对话请求交付状态未知（请求已发出，连接在收到响应前中断）",
+                         status=0, kind="delivery_unknown",
+                         detail=str(getattr(exc, "detail", "") or exc)[:200])
+
+
+def _client_gone() -> "UpstreamError":
+    return UpstreamError("客户端已断开，停止读取上游", status=0,
+                         kind="client_disconnected")
+
+
+class _AbortGuard:
+    """把上游响应登记到 `abort` 句柄（见 `http_keepalive.AbortHandle`）。
+
+    `with _AbortGuard(abort, resp) as ok:` —— 退出时先 detach（**早于** `with resp`
+    的 close / 归还连接池），保证消费端的 abort 不会打到别的请求复用的连接上。
+    """
+
+    __slots__ = ("_abort", "_resp")
+
+    def __init__(self, abort, resp):
+        self._abort = abort
+        self._resp = resp
+
+    def __enter__(self) -> bool:
+        if self._abort is None:
+            return True
+        return bool(self._abort.attach(self._resp))
+
+    def __exit__(self, *_exc):
+        if self._abort is not None:
+            self._abort.detach()
+        return False
+
+
+def _aborted(abort) -> bool:
+    return bool(abort is not None and getattr(abort, "aborted", False))
+
+
+_OPENER = None
+
+
+def _upstream_opener():
+    """进程内复用的 opener（P3）：共享 TLS 上下文 + 建连短超时。
+
+    `upstream_http.build_opener(True)` 不装 `ProxyHandler({})`，urllib 会照旧读
+    环境变量代理 —— 与原来裸 `urlopen` 的代理语义一致（只多了建连 10 秒上限）。
+    """
+    global _OPENER
+    if _OPENER is None:
+        try:
+            from admin.upstream_http import build_opener as _build
+
+            _OPENER = _build(True)
+        except Exception:  # noqa: BLE001 - 独立脚本里没有 admin 包时退回默认 opener
+            _OPENER = urllib.request.build_opener()
+    return _OPENER
 
 
 #: 业务码 -> 错误 kind（**区分「账号问题」与「实现问题」**）。
@@ -332,7 +415,7 @@ def _classify_model_server_error(payload: str, status: int):
 
 def iter_model_chat_stream(token: str, realm: str, *, body: dict,
                            timeout: float = 600.0,  # 帧间隔上限（思考静默不掐）
-                           account_id: int = 0):
+                           account_id: int = 0, abort=None):
     """对话流 · **model server 新链路**（2026-11-07）。
 
     `POST {model_base}/model/v1/chat/completions`：标准 OpenAI
@@ -358,7 +441,7 @@ def iter_model_chat_stream(token: str, realm: str, *, body: dict,
         "User-Agent": "Qoder",
     }
     try:
-        resp = _open(url, encoded, headers, timeout, "POST")
+        resp = _open(url, encoded, headers, timeout, "POST", account_id=account_id)
     except urllib.error.HTTPError as exc:
         # HTTP 层错误（401/403/402/5xx）：同样先过一遍载荷分类——
         # 「无套餐」可能以 HTTP 402/403 + pricingUrl 载荷出现，
@@ -372,11 +455,31 @@ def iter_model_chat_stream(token: str, realm: str, *, body: dict,
                 detail=payload[:400]) from exc
         raise err from exc
     except Exception as exc:  # noqa: BLE001
+        if _is_delivery_unknown(exc):
+            raise _delivery_unknown(exc) from exc
         note_sentinel(realm, account_id, "network", detail=str(exc)[:200])
         raise UpstreamError("对话请求网络失败", status=0, kind="network",
                             detail=str(exc)[:200]) from exc
 
-    with resp:
+    with resp, _AbortGuard(abort, resp) as attached:
+        if not attached:
+            raise _client_gone()
+        try:
+            yield from _model_events(resp, realm, account_id)
+        except UpstreamError:
+            raise
+        except Exception:
+            # 消费端 abort 打断了阻塞读（socket 被 shutdown）：按客户端断开收尾
+            if _aborted(abort):
+                raise _client_gone() from None
+            raise
+        if _aborted(abort):
+            raise _client_gone()
+
+
+def _model_events(resp, realm: str, account_id: int):
+    """model server SSE → chunk dict（从 `iter_model_chat_stream` 拆出来，逻辑不变）。"""
+    if True:
         # 标准 SSE 事件聚合：**同一个事件可以拆成多个 `data:` 行**（SSE 规范
         # 规定以 \n 连接后才是完整载荷）。上游的收尾帧（finish + usage +
         # telemetry，好几百字符）实测会被拆成 2~3 行 —— 按行单独
@@ -461,7 +564,7 @@ def iter_model_chat_stream(token: str, realm: str, *, body: dict,
 def iter_chat_stream(token: str, realm: str, *, uid: str, body: dict,
                      name: str = "", email: str = "",
                      machine_id: str = "", timeout: float = 600.0,  # 帧间隔上限（思考静默不掐）
-                     account_id: int = 0):
+                     account_id: int = 0, abort=None):
     """对话流（需要 COSY 签名 + 请求体编码）。
 
     产出**已拆信封**的内层 chunk（OpenAI `chat.completion.chunk`）。
@@ -483,15 +586,35 @@ def iter_chat_stream(token: str, realm: str, *, uid: str, body: dict,
     headers["Accept"] = "text/event-stream"
 
     try:
-        resp = _open(url, encoded, headers, timeout, "POST")
+        resp = _open(url, encoded, headers, timeout, "POST", account_id=account_id)
     except urllib.error.HTTPError as exc:
         raise _json_error(exc, "对话请求", account_id, realm) from exc
     except Exception as exc:  # noqa: BLE001
+        if _is_delivery_unknown(exc):
+            raise _delivery_unknown(exc) from exc
         note_sentinel(realm, account_id, "network", detail=str(exc)[:200])
         raise UpstreamError("对话请求网络失败", status=0, kind="network",
                             detail=str(exc)[:200]) from exc
 
-    with resp:
+    with resp, _AbortGuard(abort, resp) as attached:
+        if not attached:
+            raise _client_gone()
+        try:
+            yield from _envelope_events(resp, payload_realm=realm, account_id=account_id)
+        except UpstreamError:
+            raise
+        except Exception:
+            if _aborted(abort):
+                raise _client_gone() from None
+            raise
+        if _aborted(abort):
+            raise _client_gone()
+
+
+def _envelope_events(resp, *, payload_realm: str, account_id: int):
+    """COSY 信封 SSE → 内层 chunk dict（从 `iter_chat_stream` 拆出来，逻辑不变）。"""
+    realm = payload_realm
+    if True:
         for raw_line in resp:
             line = raw_line.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):

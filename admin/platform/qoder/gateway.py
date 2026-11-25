@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 
 from starlette.responses import JSONResponse, StreamingResponse
@@ -339,6 +340,173 @@ async def balance(request):
 
 
 # ---------------------------------------------------------------------------
+# 流式：断开即停（G7 / perf 线建议）
+# ---------------------------------------------------------------------------
+async def _aclose_quietly(iterator) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except Exception:  # noqa: BLE001 - 清理异常不能覆盖响应结果
+        pass
+
+
+def _stream_body(source, state: dict):
+    """同步 SSE 生成器 → StreamingResponse 的 body。
+
+    原来是 `bridge.with_pings(generator())`：同步迭代器由 starlette 线程池驱动，
+    客户端断开后生产线程不知道，会把上游整段读完才释放账号、记账。
+    现在走 `http_shared.async_stream`：消费端一走就置 stop，生产线程在下一片
+    到来时停止读上游并 close 生成器（→ finally 立即释放账号 + 记账）。
+    `ADMIN_STREAM_OFFLOAD=0` 时 async_stream 返回旧的同步心跳包装，原样交回。
+
+    `state["iterated"]` 记录 body 是否被迭代过：从未迭代（响应头没发出去客户端
+    就走了）时生成器的 finally 不会执行，由 `_OwnedStream` 兜底清理。
+    """
+    from admin import http_shared
+
+    src = http_shared.async_stream(source, ping=bridge.CHAT_PING)
+    if not hasattr(src, "__aiter__"):
+        state["iterated"] = True    # 旧写法：清理语义与改动前一致
+        return src
+
+    async def body():
+        state["iterated"] = True
+        completed = False
+        try:
+            async for piece in src:
+                yield piece
+            completed = True
+        finally:
+            if not completed:
+                # r3 第 2 项：客户端走了而上游还没出字时，生产线程阻塞在 recv 上，
+                # 只置 stop 要等下一片数据（或 600 秒读超时）才退出。这里**同步**
+                # （任何 await 之前——取消状态下 await 会立刻再抛 CancelledError）
+                # shutdown 上游 socket，读线程立即返回 → 生成器 finally 释放账号、记账。
+                _abort_upstream(state)
+            await _aclose_quietly(src)
+
+    return body()
+
+
+def _abort_upstream(state: dict) -> None:
+    abort = state.get("abort")
+    if abort is None:
+        return
+    try:
+        abort()
+    except Exception:  # noqa: BLE001 - 兜底清理不能覆盖响应结果
+        logger.debug("qoder 打断上游读失败", exc_info=True)
+
+
+class _OwnedStream(StreamingResponse):
+    """响应结束（含客户端断开）时 aclose body；body 从未被迭代时调 `on_unstarted`。"""
+
+    def __init__(self, content, *, state: dict, on_unstarted=None, **kwargs):
+        super().__init__(content, **kwargs)
+        self._state = state
+        self._on_unstarted = on_unstarted
+
+    def release_if_unstarted(self) -> bool:
+        """`protocol_bridge.UNSTARTED_HOOK`：被中继包住时内层 `__call__` 不会执行，
+        中继结束时调这个钩子；body 从未被迭代才收尾（`finish` 本身只执行一次）。"""
+        if self._state.get("iterated") or self._on_unstarted is None:
+            return False
+        self._on_unstarted()
+        return True
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await _aclose_quietly(self.body_iterator)
+            if not self._state.get("iterated") and self._on_unstarted is not None:
+                try:
+                    self._on_unstarted()
+                except Exception:  # noqa: BLE001
+                    logger.exception("qoder 流式兜底清理失败")
+
+
+def _once(fn):
+    """只执行一次（生成器 finally 与兜底清理二选一）。
+
+    生成器 finally 在生产线程、兜底清理在事件循环线程，所以加锁判重。
+    """
+    done = []
+    lock = threading.Lock()
+
+    def run():
+        with lock:
+            if done:
+                return
+            done.append(1)
+        fn()
+
+    return run
+
+
+def _owned_sse(plan, *, account, key, request, started, want_usage: bool = True):
+    """返回 `(body, state, finish)`：账号释放 + 记账只做一次，客户端断开即停读上游。"""
+    usage_holder: dict = {}
+
+    @_once
+    def finish():
+        shared.release(account)
+        _bill(key, account, plan.get("model_name", ""),
+              usage_holder.get("usage") or {}, request=request,
+              started=started,
+              # 真实首字/末字时刻（stream_openai 写回 holder）。
+              # 不传就会退回「整段耗时」，TPS 永远算不出来。
+              ttfb_ms=int(usage_holder.get("ttfb_ms") or 0),
+              latency_ms=int(usage_holder.get("total_ms") or 0),
+              error=str(usage_holder.get("error") or ""))
+
+    def generator():
+        try:
+            yield from qoder_chat.stream_openai(plan, want_usage=want_usage,
+                                                holder=usage_holder)
+        except client.UpstreamError as exc:
+            usage_holder["error"] = exc.kind or "upstream_error"
+            yield _sse_error(exc)
+        except GeneratorExit:
+            usage_holder.setdefault("error", "client_disconnected")
+            raise
+        except Exception:
+            usage_holder.setdefault("error", "stream_interrupted")
+            raise
+        finally:
+            finish()
+
+    state: dict = {}
+    # r3 第 2 项：上游响应登记到这个句柄，客户端断开时 `_stream_body` 用它打断阻塞读
+    from admin import http_keepalive
+
+    handle = http_keepalive.AbortHandle()
+    plan["abort"] = handle
+
+    def abort():
+        usage_holder.setdefault("error", "client_disconnected")
+        handle.abort()
+        # 兜底：Windows 上 shutdown 打不断另一线程里阻塞的 recv（Linux 可以），
+        # 读线程要等读超时才退出。宽限期后由定时线程直接收尾（`finish` 只执行一次，
+        # 读线程先到则这里是空操作）；不在事件循环上做 DB 记账。
+        timer = threading.Timer(ABORT_RELEASE_GRACE_S, finish)
+        timer.daemon = True
+        timer.start()
+
+    state["abort"] = abort
+    return _stream_body(generator(), state), state, finish
+
+
+#: 客户端断开后，读线程多久没收尾就由定时线程直接释放账号 + 记账（秒）。
+ABORT_RELEASE_GRACE_S = 2.0
+
+
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+# ---------------------------------------------------------------------------
 # /v1/chat/completions
 # ---------------------------------------------------------------------------
 async def chat_completions(request):
@@ -397,28 +565,10 @@ async def chat_completions(request):
         # `NameError: free variable 'started' referenced before assignment`
         # （客户端看到 400「请求失败」，日志里连请求都没记上）。
         started = time.perf_counter()
-        usage_holder: dict = {}
-
-        def generator():
-            try:
-                yield from qoder_chat.stream_openai(plan, want_usage=want_usage,
-                                                    holder=usage_holder)
-            except client.UpstreamError as exc:
-                yield _sse_error(exc)
-            finally:
-                shared.release(account)
-                _bill(key, account, plan.get("model_name", ""),
-                      usage_holder.get("usage") or {}, request=request,
-                      started=started,
-                      # 真实首字/末字时刻（stream_openai 写回 holder）。
-                      # 不传就会退回「整段耗时」，TPS 永远算不出来。
-                      ttfb_ms=int(usage_holder.get("ttfb_ms") or 0),
-                      latency_ms=int(usage_holder.get("total_ms") or 0))
-
-        return StreamingResponse(
-            bridge.with_pings(generator(), ping=bridge.CHAT_PING),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        body_iter, state, finish = _owned_sse(plan, account=account, key=key, request=request,
+                                              started=started, want_usage=want_usage)
+        return _OwnedStream(body_iter, state=state, on_unstarted=finish,
+                            media_type="text/event-stream", headers=dict(_SSE_HEADERS))
     finally:
         db.close()
 
@@ -490,28 +640,11 @@ async def messages(request):
                   result.get("usage") or {}, request=request, started=started)
             return JSONResponse(bridge.openai_to_anthropic(result, model_name))
 
-        usage_holder: dict = {}
-
-        def generator():
-            try:
-                yield from qoder_chat.stream_openai(plan, want_usage=True,
-                                                    holder=usage_holder)
-            except client.UpstreamError as exc:
-                yield _sse_error(exc)
-            finally:
-                shared.release(account)
-                _bill(key, account, plan.get("model_name", ""),
-                      usage_holder.get("usage") or {}, request=request,
-                      started=started,
-                      # 真实首字/末字时刻（stream_openai 写回 holder）。
-                      # 不传就会退回「整段耗时」，TPS 永远算不出来。
-                      ttfb_ms=int(usage_holder.get("ttfb_ms") or 0),
-                      latency_ms=int(usage_holder.get("total_ms") or 0))
-
-        inner = StreamingResponse(
-            bridge.with_pings(generator(), ping=bridge.CHAT_PING),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        body_iter, state, finish = _owned_sse(plan, account=account, key=key, request=request,
+                                              started=started, want_usage=True)
+        # 中继会在客户端断开时 aclose inner.body_iterator（→ 停读上游、释放账号）
+        inner = _OwnedStream(body_iter, state=state, on_unstarted=finish,
+                             media_type="text/event-stream", headers=dict(_SSE_HEADERS))
         return bridge.anthropic_stream_relay(inner, model_name, prefix="qoder")
     finally:
         db.close()
@@ -569,28 +702,11 @@ async def responses(request):
                   result.get("usage") or {}, request=request, started=started)
             return JSONResponse(bridge.openai_to_responses(result, model_name))
 
-        usage_holder: dict = {}
-
-        def generator():
-            try:
-                yield from qoder_chat.stream_openai(plan, want_usage=True,
-                                                    holder=usage_holder)
-            except client.UpstreamError as exc:
-                yield _sse_error(exc)
-            finally:
-                shared.release(account)
-                _bill(key, account, plan.get("model_name", ""),
-                      usage_holder.get("usage") or {}, request=request,
-                      started=started,
-                      # 真实首字/末字时刻（stream_openai 写回 holder）。
-                      # 不传就会退回「整段耗时」，TPS 永远算不出来。
-                      ttfb_ms=int(usage_holder.get("ttfb_ms") or 0),
-                      latency_ms=int(usage_holder.get("total_ms") or 0))
-
-        inner = StreamingResponse(
-            bridge.with_pings(generator(), ping=bridge.CHAT_PING),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        body_iter, state, finish = _owned_sse(plan, account=account, key=key, request=request,
+                                              started=started, want_usage=True)
+        # 中继会在客户端断开时 aclose inner.body_iterator（→ 停读上游、释放账号）
+        inner = _OwnedStream(body_iter, state=state, on_unstarted=finish,
+                             media_type="text/event-stream", headers=dict(_SSE_HEADERS))
         return bridge.responses_stream_relay(inner, model_name, prefix="qoder")
     finally:
         db.close()
