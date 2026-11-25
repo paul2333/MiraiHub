@@ -18,6 +18,9 @@ NOTICE = "\u7cfb\u7edf\u5347\u7ea7\u66f4\u65b0\u4e2d\uff0c\u8bf7\u7a0d\u5019"
 HOP = {b'connection', b'keep-alive', b'proxy-authenticate',
        b'proxy-authorization', b'te', b'trailer', b'transfer-encoding', b'upgrade'}
 STREAM_PATHS = {'/v1/chat/completions', '/v1/responses', '/v1/messages'}
+# 真实 readiness：判 200 + JSON ready===true。版本接口只说明进程活着，
+# 排空中的旧代也能回 200，所以不能拿它判“可以切流量”。
+READY_PATH = '/api/app/ready'
 
 
 class ClosingStreamingResponse(StreamingResponse):
@@ -47,6 +50,23 @@ def clean_headers(headers):
         if key.lower() == b'connection':
             excluded.update(token.strip().lower() for token in value.split(b','))
     return [(key, value) for key, value in headers if key.lower() not in excluded]
+
+
+def ready_from_response(response):
+    """把 readiness 探针的响应折成布尔：只认 200 + JSON 且 ready 为布尔真值。
+
+    旧镜像没有 /api/app/ready（404）、降级启动回 503、或者上游网关把响应换成
+    HTML，这里全部落到 False —— 宁可多等一轮，也不把“探针 404”当成就绪。
+    """
+    if response is None or response.status_code != 200:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get('ready') is True
 
 
 def error_payload(message, code='system_upgrading'):
@@ -91,16 +111,40 @@ class UpgradeGate:
             return False
 
     async def backend_ready(self):
+        """判真实 readiness，而不是“进程还在”。
+
+        版本接口返回 200 也可能是排空中的旧代或数据库降级的进程；只有
+        GET /api/app/ready 的 200 + body.ready===true 才代表能接业务。
+        """
         async with self.probe_lock:
             if time.monotonic() - self.probe_at < .25:
                 return self.ready
+            if self.client is None:
+                self.ready = False
+                self.probe_at = time.monotonic()
+                return self.ready
             try:
-                response = await self.client.get(self.backend + '/api/app/version', timeout=2)
-                self.ready = response.status_code == 200
-            except httpx.HTTPError:
+                response = await self.client.get(self.backend + READY_PATH, timeout=2)
+                self.ready = ready_from_response(response)
+            except (httpx.HTTPError, ValueError):
                 self.ready = False
             self.probe_at = time.monotonic()
             return self.ready
+
+    async def ready_probe(self):
+        """轻量 readiness 探针：升级窗口有效时立即回未就绪，绝不排队。
+
+        等待页每 1-8 秒来一次这个探针；把它排进 180 秒等待队列，等于让探针
+        自己等自己。这里既不占 pending 预算，也不进 wait_ready。
+        """
+        headers = {'Cache-Control': 'no-store'}
+        if self.upgrading():
+            return JSONResponse({'ready': False}, status_code=503,
+                                headers={**headers, 'Retry-After': '3'})
+        if await self.backend_ready():
+            return JSONResponse({'ready': True}, status_code=200, headers=headers)
+        return JSONResponse({'ready': False}, status_code=503,
+                            headers={**headers, 'Retry-After': '3'})
 
     async def wait_ready(self, deadline):
         while time.monotonic() < deadline:
@@ -113,6 +157,9 @@ class UpgradeGate:
         if request.url.path == '/__upgrade_health':
             return JSONResponse({'ok': True, 'pending': self.pending,
                                  'upgrading': self.upgrading()})
+        if request.url.path == READY_PATH and request.method in ('GET', 'HEAD'):
+            # 只拦截探针本身；POST 等其它方法照旧走队列/转发（后端会按原语义回 405）。
+            return await self.ready_probe()
         if self.pending >= self.max_pending:
             return JSONResponse(error_payload(NOTICE), status_code=503,
                                 headers={'Retry-After': '3'})
