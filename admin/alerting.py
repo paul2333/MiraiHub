@@ -413,16 +413,85 @@ def reset_cooldown() -> None:
         _sent_at.clear()
 
 
-def channels_summary() -> list[dict]:
-    """给控制台用的渠道列表（**不返回**密码等敏感值）。"""
+def mask_target(kind: str, target: str) -> str:
+    """渠道目标打码（2026-11-24 第 3 轮，S-4）。
+
+    webhook 地址本身就是凭证（钉钉 access_token、飞书 hook id、企微 key 都在
+    URL 里），拿到就能往群里发消息：只保留 `scheme://host/` + 末 4 位。
+    邮件收件人不是凭证，原样返回。
+    """
+    from urllib.parse import urlsplit
+
+    text = str(target or "").strip()
+    if not text or (kind or "").lower() == "email":
+        return text
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        parts = None
+    tail = text[-4:] if len(text) > 12 else ""
+    if parts is not None and parts.scheme and parts.netloc:
+        host = parts.netloc.rsplit("@", 1)[-1]
+        return "%s://%s/***%s" % (parts.scheme, host, tail)
+    return "***" + tail
+
+
+def is_masked_target(target: str) -> bool:
+    return "***" in str(target or "")
+
+
+def restore_masked_targets(incoming: list[dict], stored: list[dict]) -> list[dict]:
+    """PUT 回来的渠道里如果是打码值，按 (type, 打码值) 换回已保存的原值；
+    找不到原值的打码项丢弃（绝不把 `***` 当地址存进去）。供 alerts_router 保存时调用。"""
+    # 同一打码串可能对应多个原值（同 host、末 4 位相同）：按保存顺序依次取用，
+    # 同一原值不重复使用。
+    originals: dict = {}
+    seen_raw = set()
+    for item in stored or []:
+        kind = str(item.get("type") or "")
+        raw = str(item.get("target") or "")
+        if raw and (kind, raw) not in seen_raw:
+            seen_raw.add((kind, raw))
+            originals.setdefault((kind, mask_target(kind, raw)), []).append(raw)
+    out = []
+    for item in incoming or []:
+        kind = str(item.get("type") or "")
+        target = str(item.get("target") or "")
+        if is_masked_target(target):
+            pool = originals.get((kind, target)) or []
+            if not pool:
+                continue
+            target = pool.pop(0)
+        out.append({"type": kind, "target": target})
+    return out
+
+
+#: 开关：ALERT_MASK_TARGETS=1 时 channels_summary / config.channels / 测试结果的 target 打码。
+#: 默认 1（2026-11-24 第 3 轮 followups）：alerts_router.put_config 已在保存前调用
+#: restore_masked_targets，前端把打码值原样整表 PUT 回来会被换回原值。
+#: 设为 0 可回退到「target 回原值」（target_masked 照常提供）。
+def _mask_targets_enabled() -> bool:
+    return os.getenv("ALERT_MASK_TARGETS", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def channels_summary(mask: bool | None = None) -> list[dict]:
+    """给控制台用的渠道列表（**不返回**密码等敏感值）。
+
+    新增 `target_masked`（打码后的展示串，恒有）与 `masked`（`target` 本身是否已打码）。
+    """
+    do_mask = _mask_targets_enabled() if mask is None else bool(mask)
     out = []
     for channel in active_channels():
         kind = channel.get("type") or ""
+        raw = channel.get("target") or ""
+        shown = mask_target(kind, raw)
         out.append({
             "type": kind,
             "label": CHANNEL_LABELS.get(kind, kind),
-            "target": channel.get("target") or "",
-            "enabled": bool(channel.get("target")),
+            "target": shown if do_mask else raw,
+            "target_masked": shown,
+            "masked": bool(do_mask and shown != raw),
+            "enabled": bool(raw),
         })
     return out
 
