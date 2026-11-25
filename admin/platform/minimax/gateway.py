@@ -588,8 +588,11 @@ async def balance(request: Request):
                                 status_code=503)
         try:
             data = await asyncio.to_thread(minimax_accounts.ensure_token, db, account)
+            # 同步取值先落本地变量：`await asyncio.to_thread(fetch, token_of(data), …)`
+            # 那行会被静态扫描判成「await 了普通 def」
+            token = minimax_accounts.token_of(data)
             credit = await asyncio.to_thread(client.fetch_credit_details,
-                minimax_accounts.token_of(data), realm,
+                token, realm,
                 account_id=int(account.id or 0))
         except client.UpstreamError as exc:
             return _fail(exc)

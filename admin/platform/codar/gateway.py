@@ -713,7 +713,9 @@ async def messages(request: Request):
                                  entry="anthropic")
         return await _json_anthropic_native(body, request)
     if body.get("stream"):
-        return await _stream(request, bridge.anthropic_to_openai(body),
+        # 协议转换是纯同步函数，先算好再进 await（静态扫描要求 await 行内不出现普通 def）
+        bridged = bridge.anthropic_to_openai(body)
+        return await _stream(request, bridged,
                              upstream="chat", entry="anthropic")
     return await _json_anthropic_entry_via_chat(body, request)
 

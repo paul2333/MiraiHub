@@ -785,8 +785,9 @@ async def list_models(request):
             cookie = lingxi_accounts.cookie_of(account)
             if cookie:
                 try:
+                    base = lingxi_accounts.base_of(account)
                     models = client.catalog_of(
-                        await asyncio.to_thread(client.fetch_plans, cookie, lingxi_accounts.base_of(account)))
+                        await asyncio.to_thread(client.fetch_plans, cookie, base))
                 except client.UpstreamError as exc:
                     note = "上游目录拉取失败：%s" % exc.message
         else:

@@ -991,7 +991,8 @@ async def list_models(request):
                 "note": "号池没有可用小浣熊账号，仅返回配置目录"})
         try:
             data = await asyncio.to_thread(raccoon_accounts.ensure_token, db, account)
-            models = await asyncio.to_thread(client.fetch_models, raccoon_accounts.token_of(data), realm,
+            token = raccoon_accounts.token_of(data)
+            models = await asyncio.to_thread(client.fetch_models, token, realm,
                                          account_id=int(account.id or 0))
         except client.UpstreamError as exc:
             return _fail(exc)
@@ -1044,9 +1045,10 @@ async def balance(request):
                                  "note": "号池没有可用账号"}, status_code=503)
         try:
             data = await asyncio.to_thread(raccoon_accounts.ensure_token, db, account)
-            points = await asyncio.to_thread(client.fetch_points, raccoon_accounts.token_of(data), realm,
+            token = raccoon_accounts.token_of(data)
+            points = await asyncio.to_thread(client.fetch_points, token, realm,
                                          account_id=int(account.id or 0))
-            models = await asyncio.to_thread(client.fetch_models, raccoon_accounts.token_of(data), realm,
+            models = await asyncio.to_thread(client.fetch_models, token, realm,
                                          account_id=int(account.id or 0))
         except client.UpstreamError as exc:
             return _fail(exc)
