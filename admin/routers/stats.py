@@ -9,12 +9,13 @@
 - 请求数则统计全部调用（含失败），用于反映真实负载。
 """
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import func, case, or_
+from sqlalchemy import and_, func, case, or_
 from sqlalchemy.orm import Session
 
 from admin.db import get_db
@@ -147,7 +148,7 @@ def _model_pool_stats_agg(db: Session, model: str):
         usable = (a.status == "active" and not cooling and row is None
                   and not _looks_login_dead(a, now)
                   and (free or (a.balance_remain or 0) > 0)
-                  and not POOL.inflight.full(POOL.key_for(a), POOL.limit_for(a)))
+                  and not POOL.inflight.full(a.uid or "", settings.MAX_IN_FLIGHT))
         entry = {"id": a.id, "name": a.name or a.uid or f"#{a.id}",
                  "uid": (a.uid or "")[:12], "status": a.status,
                  "usable": usable, "cooling": cooling,
@@ -231,30 +232,45 @@ def _ok_filter(q):
     return q.filter(UsageLog.error_kind.in_(_OK_KINDS))
 
 
-def platform_labels(db: Session) -> dict[str, str]:
-    """落库平台名 -> 展示名（含国内/国际两个区的区分）。
+def _strip_realm_suffix(label: str) -> str:
+    """`Trae 国内版` -> `Trae`，`Qoder 中国版` -> `Qoder`（落库名标签用）。"""
+    base = str(label or "")
+    for suffix in (" 国内版", " 国际版", " 中国版", "国内版", "国际版", "中国版"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)].strip()
+    return base
 
-    `usage_logs.platform` 存的是**落库名**（registry 里的 storage 平台），
-    而界面要的是产品名 + 区域（例如「某产品 国内版 / 国际版」）。
-    这里一次性把 registry 里的 id 与 storage_platform 都映射到 label，
-    两个区共用一个 storage 时用「id 优先」的写法兜底。
+
+def platform_labels(db: Session) -> dict[str, str]:
+    """落库平台名 / 对外 id -> 展示名。
+
+    `usage_logs.platform` 与汇总表存的是**落库名**（`trae` / `qoder`），一个落库名
+    可能对应两个区（`trae-cn` + `trae-intl`）。原实现用 `setdefault(storage, label)`
+    让 `trae` 取到第一个登记的「Trae 国内版」—— 国际版的流量于是全部显示成
+    国内版（platform_scoping_review P1-6 / N4）。
+
+    现在：
+      * 对外 id（`trae-cn` / `qoder-intl`）-> 各自的标签；
+      * 多区共用的落库名 -> 「产品名（两区合计）」，**不冒充任何一个区**；
+      * 单区平台落库名 = 对外 id，标签就是平台名。
+    `qoder` 既是落库名又是中国区 id：日志里的 `qoder` 行是两区合计，按落库名语义标注。
     """
     from admin.platform import registry
 
     labels: dict[str, str] = {}
+    by_storage: dict[str, list] = {}
     for spec in registry.all_platforms(enabled_only=False):
         label = getattr(spec, "label", "") or spec.id
-        realms = getattr(spec, "realms", None) or []
-        storage = spec.storage()
-        if realms:
-            for realm in realms:
-                key = "%s-%s" % (storage, realm.key)
-                labels.setdefault(key, "%s %s" % (label, realm.label))
-            # 没有区信息的老行只显示产品名，不冒充某个区
-            labels.setdefault(storage, label)
+        labels.setdefault(str(spec.id).lower(), label)
+        by_storage.setdefault(str(spec.storage() or "").lower(), []).append(spec)
+    for storage, specs in by_storage.items():
+        if not storage:
+            continue
+        if len(specs) > 1:
+            base = _strip_realm_suffix(getattr(specs[0], "label", "") or storage)
+            labels[storage] = "%s（两区合计）" % (base or storage)
         else:
-            labels.setdefault(storage, label)
-            labels.setdefault(spec.id, label)
+            labels.setdefault(storage, getattr(specs[0], "label", "") or storage)
     labels.setdefault("", "未知平台")
     return labels
 
@@ -262,25 +278,69 @@ def platform_labels(db: Session) -> dict[str, str]:
 def _platform_filter(filters: list, db: Session, platform: str, realm: str) -> None:
     """按平台收窄 where（就地追加）。
 
-    两条来源必须**取并集**：
+    不带区时两条来源**取并集**：
       · `usage_logs.platform` —— 写入时就带着，能覆盖「没有账号」的失败请求
         （准入拒绝 / 无号 503 / 超时）。只按 account_id 筛会把这类行全部漏掉，
         用户在日志里看不到 503 就是这么来的；
       · `account_id in (该平台账号)` —— 兼容历史行（platform 列为空）。
+
+    **带区时（`realm=intl`）不能再并 `platform='trae'`**：落库名是两区合计，
+    并进来区筛选就失效了（P1-6 / N4）。短期口径：只认
+    「该区的账号」+「platform 列恰好写着该区对外 id 的行」。区信息只在账号上，
+    `account_id=0` 的失败行在区筛选下看不到 —— 中期要给 usage_logs 加 realm 列。
     """
     from sqlalchemy import or_
 
     from admin.platform import registry
 
-    values = {platform}
-    for spec in registry.all_platforms(enabled_only=False):
-        if spec.storage() == platform:
-            values.add(spec.id)
+    # 允许直接传对外 id（`trae-intl`）：先归一成 (落库名, 区)。
+    parsed_platform, parsed_realm = platform_scope.parse(platform)
+    if parsed_platform:
+        platform = parsed_platform
+        realm = realm or parsed_realm
+    realm = (realm or "").strip().lower()
+    specs = [spec for spec in registry.all_platforms(enabled_only=False)
+             if str(spec.storage() or "").lower() == platform]
     scope_ids = platform_scope.account_ids(db, platform, realm)
-    clauses = [UsageLog.platform.in_(sorted(values))]
+    if realm:
+        values = {str(spec.id).lower() for spec in specs
+                  if (spec.realm or "") == realm and str(spec.id).lower() != platform}
+    else:
+        values = {platform} | {str(spec.id).lower() for spec in specs}
+    clauses = []
+    if values:
+        clauses.append(UsageLog.platform.in_(sorted(values)))
     if scope_ids:
         clauses.append(UsageLog.account_id.in_(scope_ids))
+    if not clauses:
+        # 指定了平台 / 区却一个来源都没有：必须是空结果，不能退化成「不过滤」。
+        filters.append(UsageLog.id < 0)
+        return
     filters.append(or_(*clauses))
+
+
+def _floor_time(value, step: int):
+    """把时间戳**向下**取整到 `step` 秒（缓存键稳定用；保留 tzinfo）。
+
+    前端每次传的 `start` 都精确到秒（甚至毫秒），原样进缓存键就永远不命中、
+    单飞也合并不了（R1 6.2 / P8）。向下取整只会让窗口最多早 `step` 秒，
+    统计口径可以接受。
+    """
+    if value is None or not isinstance(value, datetime) or step <= 1:
+        return value
+    epoch = value.replace(tzinfo=None)
+    seconds = epoch.hour * 3600 + epoch.minute * 60 + epoch.second
+    floored = seconds - seconds % step
+    return value.replace(hour=floored // 3600, minute=(floored % 3600) // 60,
+                         second=floored % 60, microsecond=0)
+
+
+def _ceil_time(value, step: int):
+    """向上取整（结束时间用，避免把最后不足 `step` 秒的数据截掉）。"""
+    if value is None or not isinstance(value, datetime) or step <= 1:
+        return value
+    floored = _floor_time(value, step)
+    return floored if floored == value else floored + timedelta(seconds=step)
 
 
 def _model_display_map(db: Session) -> dict[str, str]:
@@ -389,6 +449,9 @@ def usage_stats(
     # ── 统一筛选条件 ────────────────────────────────────────────────────
     # 只构造一次，保证概览/分布/趋势三个口径完全一致 ——
     # 分开写很容易出现「卡片数字和图表对不上」的经典问题。
+    # 缓存键量化：start/end 取整到分钟（P8）。
+    start = _floor_time(start, 60)
+    end = _ceil_time(end, 60)
     filters = _time_filters(days, start, end)
     if key_id is not None:
         filters.append(UsageLog.api_key_id == key_id)
@@ -557,9 +620,10 @@ def _usage_aggregates(db, filters, *, days, granularity, key_id, model,
         .order_by(func.coalesce(func.sum(UsageLog.credits), 0.0).desc())
         .all()
     )
-    key_names = {k.id: k.name for k in db.query(ApiKey).all()}
-    account_names = {a.id: a.name or a.uid or f"账号 #{a.id}"
-                     for a in db.query(Account).all()}
+    # 只取三列：整行会把 `auth_json` 这类大字段一起读出来（几百个账号就是几 MB）。
+    key_names = {kid: name for kid, name in db.query(ApiKey.id, ApiKey.name).all()}
+    account_names = {aid: name or uid or f"账号 #{aid}"
+                     for aid, name, uid in db.query(Account.id, Account.name, Account.uid).all()}
     # ── 账号分布：SQL 侧只取 Top 8，其余合并成「其他」────────────────────
     # 池子上千时把几百行明细全量吐给前端，环形图会挤成一坨（图例每行 2.8%
     # 的占比毫无信息量），payload 也跟着膨胀。这里在 SQL 里 LIMIT 取大头，
@@ -751,13 +815,17 @@ def usage_filter_options(
     2026-11-07 加共享缓存（30s）：这条要跑 3 个 group_by + 全量 Account 表，
     却在使用记录面板每次切换筛选时都重打一遍；选项晚 30 秒无感知。
     """
+    # 下拉选项晚几分钟无感知：start/end 量化到 10 分钟，缓存 120 秒（P8）。
+    start = _floor_time(start, 600)
+    end = _ceil_time(end, 600)
+
     def _compute():
         return _usage_filter_options_agg(db, days, start, end)
 
     return _shared_cached(
         _shared_cache_key("usage_options", (days, start.isoformat() if start else "",
                                             end.isoformat() if end else "")),
-        _compute, ttl=30.0)
+        _compute, ttl=120.0)
 
 
 def _usage_filter_options_agg(db, days, start, end):
@@ -787,10 +855,12 @@ def _usage_filter_options_agg(db, days, start, end):
         .all() if r[0]
     ]
     keys = [
-        {"id": k.id, "name": k.name}
-        for k in db.query(ApiKey).order_by(ApiKey.id.asc()).all()
+        {"id": kid, "name": name}
+        for kid, name in db.query(ApiKey.id, ApiKey.name).order_by(ApiKey.id.asc()).all()
     ]
-    account_names = {a.id: a.name or a.uid or f"账号 #{a.id}" for a in db.query(Account).all()}
+    # 只读三列（整行带 auth_json，194 个号就是几 MB 的无用 IO）
+    account_names = {aid: name or uid or f"账号 #{aid}"
+                     for aid, name, uid in db.query(Account.id, Account.name, Account.uid).all()}
     accounts = [{"id": aid, "name": account_names.get(aid) or f"已删除账号 #{aid}"}
                 for (aid,) in db.query(UsageLog.account_id).filter(*filters, UsageLog.account_id.isnot(None))
                 .group_by(UsageLog.account_id).order_by(func.count(UsageLog.id).desc()).all()]
@@ -884,10 +954,15 @@ def dashboard_stats(
     platform: str = "",
     model: str = "",
     top_models: int = Query(default=6, ge=1, le=12),
+    window: str = Query(default="rolling"),
     _: bool = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """数据看板：一屏拿齐 KPI / 性能健康 / 消耗分布 / 调用分析。
+
+    `window=day` 时按北京时间自然日取窗（与概览同口径）；默认仍是滚动窗口。
+    返回体带 `scope: "gateway"`：这是**全网关**口径（不读 X-Platform），
+    前端据此在卡片上标注「全网关」。耗时字段单位见 `units`（全部毫秒）。
 
     `days` 是**滚动窗口**（近 N 个 24 小时），与 `/usage` 的 `days` 一致。
     小时粒度只在 7 天内有效：再长就自动降级成按天 —— 30 天 × 24 桶 = 720 根
@@ -899,107 +974,317 @@ def dashboard_stats(
     platform = (platform or "").strip().lower()
     if platform in ("all", "*"):
         platform = ""
+    # 对外 id（`trae-intl`）先归一成 (落库名, 区)：汇总表存的是落库名，
+    # 原来直接拿 `trae-intl` 去比，汇总段查不到、原表段又能查到，两段对不上。
+    realm = ""
+    if platform:
+        parsed, parsed_realm = platform_scope.parse(platform)
+        if parsed:
+            platform, realm = parsed, parsed_realm
+            # 单区平台的 realm 没有区分意义，不要因此退化到原表
+            if realm and not _storage_has_realms(platform):
+                realm = ""
     model = (model or "").strip()
+    window = "day" if str(window or "").strip().lower() in ("day", "today", "natural") else "rolling"
 
-    key = _shared_cache_key("dashboard", (days, granularity, platform, model, top_models))
+    key = _shared_cache_key("dashboard", (days, granularity, platform, realm, model,
+                                          top_models, window))
     ttl = _stats_ttl_for_days(days)
     return _shared_cached(
         key,
-        lambda: _dashboard_agg(db, days, granularity, platform, model, top_models),
+        lambda: _dashboard_agg(db, days, granularity, platform, model, top_models,
+                               realm=realm, window=window),
         ttl,
     )
 
 
+#: 模型广场时段状态的阈值。前端配色与图例只认这几个状态名，不再自己判一遍。
+#:   up   绿 —— 这一格有成功调用，成功率 ≥ 99.5%
+#:   warn 黄 —— 有调用但成功率 97%~99.5%，抖过
+#:   down 红 —— 有调用但成功率 < 97%，这一格基本用不了
+#:   off  红描边 —— 这一格没有请求、但有账号在冷却（确定性不可用）
+#:   idle 灰 —— 没有请求也没有冷却记录（没流量 ≠ 坏了）
+_MARKET_UP_RATE = 0.995
+_MARKET_WARN_RATE = 0.97
+#: 中国没有夏令时，固定 +08:00 就是准确值（与 model_limits.CN_TIME 同口径）。
+_CN_OFFSET = timedelta(hours=8)
+
+
+def _market_bucket_size(hours: int) -> int:
+    """一格多宽：始终铺 24~29 格，且只用 1/2/3/4/6 小时整档。
+
+    为什么不让 7 天也按 1 小时铺 168 格：卡片上的色块最小约 3px，168 格在
+    300px 宽的卡里会糊成一条渐变带，反而看不出「几点坏了」—— 状态轴的意义
+    是「一眼找到坏的那格」，不是把原始小时数全倒出来。
+    """
+    for limit, size in ((24, 1), (48, 2), (72, 3), (96, 4), (168, 6)):
+        if hours <= limit:
+            return size
+    return 6
+
+
+def _market_grid(end: datetime, hours: int, bucket_hours: int):
+    """按**北京时间**切格，返回 `[(start_utc, end_utc)]`（旧→新，半开区间）。
+
+    为什么要换时区：格子边界必须落在本地整点。直接按 UTC 切，3 小时档会得到
+    17:00 / 20:00 这类标签，用户没法把它和「早上 8 点那格」对上。
+    """
+    step = timedelta(hours=bucket_hours)
+    local_end = end + _CN_OFFSET
+    anchor = local_end.replace(minute=0, second=0, microsecond=0)
+    anchor = anchor.replace(hour=(anchor.hour // bucket_hours) * bucket_hours)
+    align_end = anchor + step
+    # ⚠️ 两端必须在**同一个时区系**里相减：混用本地时间与 UTC 会凭空多出 8 小时，
+    # 24 小时窗口切成 33 格 —— 这个坑第一版就踩了（格数看起来像「多出来一段」）。
+    local_start = end - timedelta(hours=hours) + _CN_OFFSET
+    span = align_end - local_start
+    count = max(1, int(math.ceil(span.total_seconds() / step.total_seconds())))
+    first = align_end - step * count
+    return [((first + step * i) - _CN_OFFSET,
+             (first + step * (i + 1)) - _CN_OFFSET) for i in range(count)]
+
+
+def _market_bucket_text(lo: datetime, hi: datetime, bucket_hours: int):
+    """一格的短标签 + 完整区间（都按北京时间显示）。"""
+    local_lo = lo + _CN_OFFSET
+    local_hi = hi + _CN_OFFSET
+    if bucket_hours >= 24:
+        return local_lo.strftime("%m-%d"), local_lo.strftime("%m-%d") + " 全天"
+    label = local_lo.strftime("%H:%M")
+    left = local_lo.strftime("%m-%d %H:%M")
+    right = (local_hi.strftime("%H:%M") if local_hi.date() == local_lo.date()
+             else local_hi.strftime("%m-%d %H:%M"))
+    return label, left + "–" + right
+
+
+def _cell_coverage(lo: datetime, hi: datetime, start: datetime, end: datetime) -> float:
+    """一格有多少落在统计窗口里（0~1）。
+
+    首尾两格常常是「半格」：窗口起点落在 18:57，第一格 18:00–19:00 只有 3 分钟
+    有数据。前端据此把那格画淡，不让人误以为它也统计满了一小时。
+    """
+    span = (hi - lo).total_seconds()
+    if span <= 0:
+        return 0.0
+    inner = (min(hi, end) - max(lo, start)).total_seconds()
+    return round(max(0.0, min(1.0, inner / span)), 4)
+
+
+def _market_slot() -> dict:
+    return {"requests": 0, "successes": 0, "tokens": 0, "credits": 0.0,
+            "latency_sum": 0, "latency_count": 0,
+            "ttfb_sum": 0, "ttfb_count": 0, "tps_sum": 0.0, "tps_count": 0}
+
+
+def _storage_has_realms(storage: str) -> bool:
+    """这个落库平台是否有多个区（trae / qoder）。"""
+    from admin.platform import registry
+
+    count = sum(1 for spec in registry.all_platforms(enabled_only=False)
+                if str(spec.storage() or "").lower() == storage)
+    return count > 1
+
+
+#: 本地时区偏移（与概览 `_day_start` 同口径，统一由 `rollup.local_offset()` 提供，
+#: 环境变量 ADMIN_STATS_TZ_OFFSET_HOURS，默认 +8）。usage_logs.created_at 存 UTC。
+#: `_CN_OFFSET` 在上方已按「模型广场按北京时间切格」的需要定义（同为 +08:00），
+#: 这里不再重复赋值，只保留说明与 `_dashboard_range`。
+
+
+def _dashboard_range(days: int, window: str = "rolling") -> tuple[datetime, datetime]:
+    """看板时间窗（UTC naive）。
+
+    * `rolling`（默认，老行为）：近 N×24 小时；
+    * `day`：北京时间自然日，从 N-1 天前的 00:00 起到现在 —— 与概览
+      `/api/overview` 的「今日 / 近 N 天」同一口径（N5：概览一屏三种时间窗）。
+    """
+    from admin import rollup as rollup_mod
+
+    end = datetime.utcnow()
+    if window == "day":
+        return rollup_mod.local_day_start(max(1, days) - 1, now=end), end
+    return end - timedelta(days=max(1, days)), end
+
+
 @router.get("/model-market")
 def model_market(hours: int = Query(default=24, ge=1, le=168),
+                 bucket_hours: int = Query(default=0, ge=0, le=24),
                  _: bool = Depends(require_admin),
                  db: Session = Depends(get_db)):
     """模型广场：**每个模型一张卡**要的全部数字（参考 new-api 的模型广场）。
 
-    卡片上要的是「这东西现在能不能用、多少钱、快不快」。数据来源三处：
+    卡片上要的是「这东西现在能不能用、多少钱、快不快」。数据来源四处：
 
       · 近 N 小时用量 —— 小时汇总表（`usage_rollups`），只读几行；
+      · 时段状态轴 —— 同一批小时行按格折叠，一格一个状态（见 `_MARKET_*`）；
       · 定价 —— `model_configs.credit_multiplier`（0 = 免费）；
       · 可用性 —— 活跃账号数 − 该模型当前处于冷却的账号数。
 
-    返回按**归一后的模型**聚合（同一个模型在多平台是同一个模型，价格与可用性
-    分平台列在 `platforms` 里），前端据此画卡片/列表。
+    **状态轴的判据**：先用真实请求说话（有流量就按成功率给 up/warn/down），
+    只有「这一格没有请求」时才用冷却记录区分 off（确定不可用）与 idle（没流量）。
+    冷却表没有开始时间，用 `updated_at` 当起点，所以它只做兜底、不做主证据。
+
+    `bucket_hours` 显式指定格的宽度；不传就按窗口自动挑（24h→1 格 1 小时，
+    7 天→6 小时），保证格数落在 24 上下。
     """
     from admin import rollup as rollup_mod
     from admin.model_alias import canonical_key, display_name
 
     hours = max(1, min(int(hours or 24), 168))
-    end = datetime.utcnow()
-    start = end - timedelta(hours=hours)
+    step = int(bucket_hours or 0) or _market_bucket_size(hours)
+    step = max(1, min(step, 24))
+    now = datetime.utcnow()
+    grid = _market_grid(now, hours, step)
+    grid_start = grid[0][0]
+    # 统计窗口仍然是正好 `hours` 小时；网格只负责「把窗口切成整点的格」。
+    # 两端那格因此可能只覆盖一部分（partial），这是刻意的：宁可标出来，
+    # 也不要为了凑整把窗口偷偷拉长一小时（卡片上「24h 请求」必须真的 24h）。
+    start = max(grid_start, now - timedelta(hours=hours))
+    end = min(now, grid[-1][1])
+    slots = len(grid)
+    labels_for = [_market_bucket_text(lo, hi, step) for lo, hi in grid]
 
     def _compute():
         labels = platform_labels(db)
         model_labels = _model_display_map(db)
+
+        def _pull(covered):
+            # `iter_buckets` 是生成器：异常可能发生在**迭代时**（不是创建时），
+            # 所以在 list() 外面兜住，才能真正退回原表。
+            return list(rollup_mod.iter_buckets(db, start, end, covered))
+
         try:
-            rollup_mod.ensure_coverage(db, budget=0.4)
+            rollup_mod.ensure_coverage(db, budget=0.4, blocking=False)
             covered = rollup_mod.coverage(db)
-            rows = rollup_mod.window_rows(db, start, end, covered)
+            rows = _pull(covered)
             source = "rollup"
         except Exception as exc:  # noqa: BLE001 - 汇总层故障时退回原表
             logger.warning("模型广场读汇总表失败，降级原表：%s", exc)
-            covered = (None, None)
-            rows = rollup_mod.window_rows(db, start, end, covered)
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            rows = _pull((None, None))
             source = "raw"
 
         # 定价（同模型可能多个平台不同价，全部列出来）
+        #
+        # 2026-11-24 N3（ui_review_round3 A1/A2、platform_scoping P1-7）：
+        #   * 一条 model_configs 按 `_entry_targets` 展开成 `(对外 id, 区)`，Trae 国内 /
+        #     国际不再都叫 `trae`；
+        #   * 按 `(对外 id, 区, 归一模型)` **去重**：同一模型 system/user 两行、
+        #     Marvis 可读名与槽位名两行时，只留一条（优先 level=system）；
+        #   * 倍率 < 0 是「该平台没有倍率概念、按上游用量计量」的约定，不是负价：
+        #     单条给 `metered=true`、`price_label="按量"`，`min_multiplier` 只在
+        #     非负倍率里取（全是按量时为 None），前端不会再显示 `×-1.00`。
         from admin.models import ModelConfig
+        from admin.platform.models_router import _entry_targets
 
+        config_rows = (db.query(ModelConfig.platform, ModelConfig.model_id,
+                                ModelConfig.credit_multiplier, ModelConfig.level)
+                       .filter(ModelConfig.enabled == 1).all())
+        intl_twins = set()
+        for plat, mid, _mult, _level in config_rows:
+            text_id = str(mid or "")
+            if text_id.lower().endswith(":intl"):
+                intl_twins.add((str(plat or "").lower(), text_id[:-5].lower()))
         pricing: dict[str, list] = {}
-        for config in db.query(ModelConfig).filter(ModelConfig.enabled == 1).all():
-            mid = config.model_id or ""
+        chosen: dict[tuple, dict] = {}
+        for plat, mid, mult, level in config_rows:
+            storage = (plat or "").lower()
+            mid = mid or ""
             key = canonical_key(mid, model_labels.get(mid) or "")
-            pricing.setdefault(key, []).append({
-                "platform": (config.platform or "").lower(),
-                "platform_label": labels.get((config.platform or "").lower())
-                                  or (config.platform or "未知平台"),
-                "model_id": mid,
-                "multiplier": float(config.credit_multiplier or 0),
-                "free": not config.credit_multiplier,
-            })
+            base = mid[:-5] if mid.lower().endswith(":intl") else mid
+            try:
+                targets = _entry_targets({
+                    "platform": storage, "model_id": mid,
+                    "_has_intl_twin": (storage, base.lower()) in intl_twins})
+            except Exception:  # noqa: BLE001 - 展开失败按落库名单条处理
+                targets = [(storage, "")]
+            value = float(mult or 0)
+            for pid, realm in targets or [(storage, "")]:
+                pid = str(pid or storage).lower()
+                entry = {
+                    "platform": storage,
+                    "platform_id": pid,
+                    "realm": realm or "",
+                    "platform_label": labels.get(pid) or labels.get(storage)
+                                      or (storage or "未知平台"),
+                    "model_id": mid,
+                    "multiplier": value if value >= 0 else None,
+                    "metered": value < 0,
+                    "free": value == 0,
+                    "price_label": ("按量" if value < 0 else
+                                    "免费" if value == 0 else "×%g" % value),
+                    "level": level or "",
+                }
+                dedupe = (pid, realm or "", key)
+                previous = chosen.get(dedupe)
+                if previous is not None:
+                    # system 行优先；同级保留先到的那条
+                    if previous.get("level") == "system" or entry["level"] != "system":
+                        continue
+                    pricing[key].remove(previous)
+                chosen[dedupe] = entry
+                pricing.setdefault(key, []).append(entry)
 
         # 可用性：活跃账号 − 冷却中的账号（模型级冷却）
         from admin.models import Account, AccountModelCooldown
 
         active: dict[str, int] = {}
-        now = datetime.utcnow()
+        reference = datetime.utcnow()
         for platform, count in db.query(Account.platform, func.count(Account.id)).filter(
                 Account.status == "active",
-                or_(Account.cool_until.is_(None), Account.cool_until <= now)).group_by(
+                or_(Account.cool_until.is_(None), Account.cool_until <= reference)).group_by(
                 Account.platform).all():
             active[(platform or "").lower()] = int(count or 0)
-        exhausted: dict[str, int] = {}
-        for model_name, count in db.query(
+        # 冷却按 (平台, 模型) 计：同名模型在不同平台互不扣减（P1-7 ④）。
+        exhausted: dict[tuple[str, str], int] = {}
+        try:
+            cooled_rows = (db.query(Account.platform, AccountModelCooldown.model,
+                                    func.count(AccountModelCooldown.id))
+                           .join(Account, Account.id == AccountModelCooldown.account_id)
+                           .filter(AccountModelCooldown.until > now)
+                           .group_by(Account.platform, AccountModelCooldown.model).all())
+        except Exception:  # noqa: BLE001 - 关联失败退回按模型名统计
+            cooled_rows = [("*", model_name, count) for model_name, count in db.query(
                 AccountModelCooldown.model, func.count(AccountModelCooldown.id)).filter(
-                AccountModelCooldown.until > now).group_by(
-                AccountModelCooldown.model).all():
-            exhausted[model_name or ""] = int(count or 0)
+                AccountModelCooldown.until > now).group_by(AccountModelCooldown.model).all()]
+        for plat, model_name, count in cooled_rows:
+            exhausted[((plat or "").lower(), model_name or "")] = int(count or 0)
 
+        def _blocked(platforms, models) -> int:
+            total_count = 0
+            for (plat, model_name), count in exhausted.items():
+                if model_name in models and (plat == "*" or plat in platforms):
+                    total_count += count
+            return total_count
+
+        # ── 按格折叠 ────────────────────────────────────────────────────────
         items: dict[str, dict] = {}
-        for (plat, mid), values in rows.items():
+        for hour, plat, mid, values in rows:
             key = canonical_key(mid, model_labels.get(mid) or "")
-            entry = items.setdefault(key, {
-                "key": key,
-                "name": display_name(key, model_labels.get(mid) or mid or "未知模型"),
-                "requests": 0, "successes": 0, "tokens": 0, "credits": 0.0,
-                "latency_sum": 0, "latency_count": 0,
-                "ttfb_sum": 0, "ttfb_count": 0, "completion_tokens": 0,
-                "tps_sum": 0.0, "tps_count": 0,
-                "platforms": set(), "models": set(),
-            })
-            for name in ("requests", "successes", "tokens", "credits",
-                         "latency_sum", "latency_count", "ttfb_sum",
-                         "ttfb_count", "completion_tokens", "tps_sum", "tps_count"):
-                entry[name] += values.get("total_tokens" if name == "tokens" else name) or 0
+            entry = items.get(key)
+            if entry is None:
+                entry = items[key] = {
+                    "key": key,
+                    "name": display_name(key, model_labels.get(mid) or mid or "未知模型"),
+                    "slots": [_market_slot() for _ in range(slots)],
+                    "platforms": set(), "models": set(), "traffic_platforms": set(),
+                }
+            pos = int((hour - grid_start).total_seconds() // (step * 3600))
+            if 0 <= pos < slots:
+                slot = entry["slots"][pos]
+                for name in ("requests", "successes", "latency_sum", "latency_count",
+                             "ttfb_sum", "ttfb_count", "tps_sum", "tps_count",
+                             "credits", "tokens"):
+                    slot[name] += values.get("total_tokens" if name == "tokens" else name) or 0
             entry["platforms"].add(plat)
+            entry["traffic_platforms"].add(plat)
             entry["models"].add(mid)
 
         # 已配置但窗口内没有流量的模型也要出现在广场里（显示「0 次调用」），
-# 否则用户会以为「这个模型没被收录」。
+        # 否则用户会以为「这个模型没被收录」。
         for key, prices in pricing.items():
             if key in items:
                 continue
@@ -1007,44 +1292,126 @@ def model_market(hours: int = Query(default=24, ge=1, le=168),
             items[key] = {
                 "key": key,
                 "name": display_name(key, model_labels.get(first) or first or "未知模型"),
-                "requests": 0, "successes": 0, "tokens": 0, "credits": 0.0,
-                "latency_sum": 0, "latency_count": 0,
-                "ttfb_sum": 0, "ttfb_count": 0, "completion_tokens": 0,
-                "tps_sum": 0.0, "tps_count": 0,
+                "slots": [_market_slot() for _ in range(slots)],
                 "platforms": {item["platform"] for item in prices},
                 "models": {item["model_id"] for item in prices},
+                "traffic_platforms": set(),
             }
+
+        # 冷却记录 → 每格「几个账号在冷却」。只在无流量的格子上用（见 _compute 注释）。
+        cooling: dict[str, list] = {}
+        cool_rows = db.query(AccountModelCooldown.model,
+                             AccountModelCooldown.updated_at,
+                             AccountModelCooldown.until).filter(
+            AccountModelCooldown.until > start).all()
+        for mid, since, until in cool_rows:
+            key = canonical_key(mid or "", model_labels.get(mid) or "")
+            arr = cooling.get(key)
+            if arr is None:
+                arr = cooling[key] = [0] * slots
+            lo = since or ((until or start) - timedelta(hours=1))
+            hi = until or end
+            for pos, (b_lo, b_hi) in enumerate(grid):
+                if lo < b_hi and hi > b_lo:
+                    arr[pos] += 1
 
         out = []
         for key, entry in items.items():
-            req = int(entry["requests"])
-            ok = int(entry["successes"])
             prices = pricing.get(key, [])
-            platforms = sorted(entry["platforms"])
+            # **平台 = 流量平台 ∪ 定价平台**（N3 / A1）：原来有流量的模型只列
+            # 「近 N 小时跑过的平台」，71 个模型里 25 个因此只显示 1 个平台。
+            platforms = sorted(set(entry["platforms"])
+                               | {item["platform"] for item in prices})
+            models = set(entry["models"]) | {item["model_id"] for item in prices}
+            platform_ids = sorted({item["platform_id"] for item in prices}
+                                  | {plat for plat in entry["traffic_platforms"]
+                                     if plat and not any(item["platform"] == plat
+                                                         for item in prices)})
             capacity = sum(active.get(plat, 0) for plat in platforms) if platforms else 0
-            blocked = sum(exhausted.get(mid, 0) for mid in entry["models"])
+            # 冷却按「平台 × 模型」计（#115 的口径）：同名模型在不同平台互不扣减。
+            blocked = _blocked(set(platforms), models)
+            priced = [item["multiplier"] for item in prices
+                      if item["multiplier"] is not None]
+            metered = bool(prices) and not priced
+            cool_cells = cooling.get(key) or [0] * slots
+
+            timeline = []
+            total = _market_slot()
+            counts = {"ok": 0, "warn": 0, "down": 0, "off": 0, "idle": 0}
+            for pos, (b_lo, b_hi) in enumerate(grid):
+                slot = entry["slots"][pos]
+                for name, value in slot.items():
+                    total[name] += value
+                req = int(slot["requests"])
+                ok = int(slot["successes"])
+                rate = (ok / req) if req else None
+                cool = int(cool_cells[pos])
+                if req:
+                    state = ("up" if rate >= _MARKET_UP_RATE
+                             else "warn" if rate >= _MARKET_WARN_RATE else "down")
+                    counts["ok" if state == "up" else ("warn" if state == "warn" else "down")] += 1
+                elif cool:
+                    state = "off"
+                    counts["off"] += 1
+                else:
+                    state = "idle"
+                    counts["idle"] += 1
+                timeline.append({
+                    "state": state,
+                    "requests": req,
+                    "success_rate": round(rate, 4) if rate is not None else None,
+                    "avg_latency_ms": (int(round(slot["latency_sum"] / slot["latency_count"]))
+                                       if slot["latency_count"] else 0),
+                    "tokens": int(slot["tokens"]),
+                    "credits": round(float(slot["credits"]), 4),
+                    "cooling": cool,
+                    "coverage": _cell_coverage(b_lo, b_hi, start, end),
+                    "partial": b_lo < start or b_hi > end,
+                })
+
+            measured = counts["ok"] + counts["warn"] + counts["down"]
+            req = int(total["requests"])
+            ok = int(total["successes"])
             out.append({
                 "key": key,
                 "name": entry["name"],
                 "platforms": platforms,
                 "platform_labels": [labels.get(plat) or plat or "未知平台" for plat in platforms],
-                "models": sorted(entry["models"]),
+                "platform_ids": platform_ids,
+                "traffic_platforms": sorted(entry["traffic_platforms"]),
+                "models": sorted(models),
                 "requests": req,
                 "success_rate": round(ok / req, 4) if req else None,
-                "tokens": int(entry["tokens"]),
-                "credits": round(float(entry["credits"]), 4),
-                "avg_latency_ms": (int(round(entry["latency_sum"] / entry["latency_count"]))
-                                   if entry["latency_count"] else 0),
-                "avg_ttfb_ms": (int(round(entry["ttfb_sum"] / entry["ttfb_count"]))
-                                if entry["ttfb_count"] else 0),
-                "tps": (round(entry["tps_sum"] / entry["tps_count"], 2)
-                        if entry["tps_count"] else 0.0),
+                "tokens": int(total["tokens"]),
+                "credits": round(float(total["credits"]), 4),
+                "avg_latency_ms": (int(round(total["latency_sum"] / total["latency_count"]))
+                                   if total["latency_count"] else 0),
+                "avg_ttfb_ms": (int(round(total["ttfb_sum"] / total["ttfb_count"]))
+                                if total["ttfb_count"] else 0),
+                "tps": (round(total["tps_sum"] / total["tps_count"], 2)
+                        if total["tps_count"] else 0.0),
                 "pricing": prices,
-                "free": bool(prices) and all(item["free"] for item in prices),
-                "min_multiplier": min((item["multiplier"] for item in prices), default=0.0),
+                "free": bool(priced) and all(value == 0 for value in priced)
+                        and len(priced) == len(prices),
+                # 只在非负倍率里取最小值；全部「按量」时为 None（前端渲染「按量」）
+                "min_multiplier": min(priced) if priced else None,
+                "metered": metered,
+                "price_label": ("按量" if metered else
+                                "免费" if priced and max(priced) == 0 else
+                                ("×%g" % min(priced)) if priced else "—"),
                 "active_accounts": capacity,
                 "exhausted_accounts": blocked,
                 "available": bool(prices) and (capacity - blocked > 0),
+                # `available` 需要「有定价」才成立（没定价就没法说它「能用」）。
+                # 前端要区分「没配置价格」和「账号都不可用」，所以单列一个配置位。
+                "configured": bool(prices),
+                # 时段状态轴：一格一个状态，长度 = `buckets` 的长度。
+                "timeline": timeline,
+                "cells": counts,
+                # 可用率 = 有流量的格里「没掉到 97% 以下」的占比（分母只含有流量的格）。
+                "uptime": (round((counts["ok"] + counts["warn"]) / measured, 4)
+                           if measured else None),
+                "measured_cells": measured,
             })
 
         out.sort(key=lambda item: (-item["requests"], item["name"]))
@@ -1052,18 +1419,46 @@ def model_market(hours: int = Query(default=24, ge=1, le=168),
             "window_hours": hours,
             "start": start.isoformat() + "Z",
             "end": end.isoformat() + "Z",
+            # 状态轴的格定义：前端只消费这一份，不自己再推一遍时间边界。
+            "bucket_hours": step,
+            "buckets": [{"label": labels_for[i][0], "tip": labels_for[i][1],
+                         "start": lo.isoformat() + "Z", "end": hi.isoformat() + "Z",
+                         "coverage": _cell_coverage(lo, hi, start, end),
+                         "partial": lo < start or hi > end}
+                        for i, (lo, hi) in enumerate(grid)],
             "source": source,
             "items": out,
             "total": len(out),
             "available_models": sum(1 for item in out if item["available"]),
+            # 耗时字段单位：*_ms 全部是毫秒，tps 是 tokens/秒（N1 文档化）
+            "units": {"avg_latency_ms": "ms", "avg_ttfb_ms": "ms", "tps": "tokens/s"},
+            "scope": "gateway",
         }
 
-    key = _shared_cache_key("model_market", (hours,))
+    key = _shared_cache_key("model_market", (hours, step))
     return _shared_cached(key, _compute, ttl=30.0)
 
 
 def _dashboard_agg(db: Session, days: int, granularity: str, platform: str,
-                   model: str, top_models: int) -> dict:
+                   model: str, top_models: int, *, realm: str = "",
+                   window: str = "rolling") -> dict:
+    result = _dashboard_agg_inner(db, days, granularity, platform, model, top_models,
+                                  realm=realm, window=window)
+    if isinstance(result, dict):
+        result.setdefault("window", {})["kind"] = window
+        result.setdefault("filters", {})["realm"] = realm
+        # 口径标注（N5）：看板永远是全网关数据，只有显式 ?platform= 才收窄。
+        result["scope"] = "gateway"
+        result["platform_scoped"] = False
+        # 单位文档化：所有 *_ms 字段都是毫秒（前端 fmtDuration 直接按 ms 渲染）。
+        result["units"] = {"avg_latency_ms": "ms", "avg_ttfb_ms": "ms",
+                           "tps": "tokens/s", "throughput_tps": "tokens/s"}
+    return result
+
+
+def _dashboard_agg_inner(db: Session, days: int, granularity: str, platform: str,
+                         model: str, top_models: int, *, realm: str = "",
+                         window: str = "rolling") -> dict:
     """数据看板聚合入口：优先读小时级汇总表，异常时降级为原表扫描。
 
     为什么要有这条降级路径：汇总表是「加速层」，它的写入/回填任何一环出问题，
@@ -1083,26 +1478,31 @@ def _dashboard_agg(db: Session, days: int, granularity: str, platform: str,
     try:
         # 同步补一小段缺口（最多 0.4 秒）：让首次请求就能用上汇总表。
         # 更长的历史由 server 启动时的后台线程补齐，绝不阻塞请求。
-        rollup_mod.ensure_coverage(db, budget=0.4)
-        return _dashboard_from_rollup(db, days, granularity, platform, model, top_models)
+        if realm:
+            # 汇总表没有区维度：带区筛选只能走原表（按该区账号过滤）。
+            return _dashboard_from_raw(db, days, granularity, platform, model, top_models,
+                                       realm=realm, window=window)
+        rollup_mod.ensure_coverage(db, budget=0.4, blocking=False)
+        return _dashboard_from_rollup(db, days, granularity, platform, model, top_models,
+                                      window=window)
     except Exception as exc:  # noqa: BLE001 - 汇总层永远不能把看板带崩
         logger.warning("汇总表读取失败，降级为原表聚合：%s", exc)
         try:
             db.rollback()
         except Exception:  # noqa: BLE001
             pass
-        return _dashboard_from_raw(db, days, granularity, platform, model, top_models)
+        return _dashboard_from_raw(db, days, granularity, platform, model, top_models,
+                                   realm=realm, window=window)
 
 
 def _dashboard_from_rollup(db: Session, days: int, granularity: str, platform: str,
-                           model: str, top_models: int) -> dict:
+                           model: str, top_models: int, *, window: str = "rolling") -> dict:
     """汇总表版本：只读 `小时数 × 模型数` 行，30 天窗口也是毫秒级。"""
     from admin import rollup as rollup_mod
 
     labels = platform_labels(db)
     model_labels = _model_display_map(db)
-    end = datetime.utcnow()
-    start = end - timedelta(days=max(1, days))
+    start, end = _dashboard_range(days, window)
     minutes = max(1.0, (end - start).total_seconds() / 60.0)
 
     def _label_platform(value: str) -> str:
@@ -1308,12 +1708,12 @@ def _error_breakdown(db: Session, start: datetime, end: datetime, **filters) -> 
 
 
 def _dashboard_from_raw(db: Session, days: int, granularity: str, platform: str,
-                        model: str, top_models: int) -> dict:
+                        model: str, top_models: int, *, realm: str = "",
+                        window: str = "rolling") -> dict:
     labels = platform_labels(db)
     model_labels = _model_display_map(db)
 
-    end = datetime.utcnow()
-    start = end - timedelta(days=max(1, days))
+    start, end = _dashboard_range(days, window)
     minutes = max(1.0, (end - start).total_seconds() / 60.0)
 
     def _label_platform(value: str) -> str:
@@ -1324,11 +1724,14 @@ def _dashboard_from_raw(db: Session, days: int, granularity: str, platform: str,
 
     filters = [UsageLog.created_at >= start, UsageLog.created_at <= end]
     if platform:
-        _platform_filter(filters, db, platform, "")
+        _platform_filter(filters, db, platform, realm)
     if model:
         filters.append(UsageLog.model == model)
 
     ok = UsageLog.error_kind.in_(_OK_KINDS)
+    # 首字只认流式样本（N2，与汇总表同一条件，见 rollup.ttfb_valid_clause）
+    from admin import rollup as _rollup_mod
+    ttfb_ok = _rollup_mod.ttfb_valid_clause()
 
     # ── 概览（KPI 行 + 性能健康）─────────────────────────────────────────
     total_req = db.query(func.count(UsageLog.id)).filter(*filters).scalar() or 0
@@ -1342,7 +1745,7 @@ def _dashboard_from_raw(db: Session, days: int, granularity: str, platform: str,
             func.coalesce(func.sum(UsageLog.cached_tokens), 0),
             func.coalesce(func.sum(UsageLog.credits), 0.0),
             func.avg(UsageLog.latency_ms),
-            func.avg(UsageLog.ttfb_ms),
+            func.avg(case((ttfb_ok, UsageLog.ttfb_ms), else_=None)),
             func.coalesce(func.sum(UsageLog.latency_ms), 0),
         ).filter(*filters, ok).one()
     )
@@ -1380,7 +1783,7 @@ def _dashboard_from_raw(db: Session, days: int, granularity: str, platform: str,
             func.sum(case((ok, UsageLog.total_tokens), else_=0)),
             func.sum(case((ok, UsageLog.credits), else_=0.0)),
             func.avg(case((ok, UsageLog.latency_ms), else_=None)),
-            func.avg(case((ok, UsageLog.ttfb_ms), else_=None)),
+            func.avg(case((and_(ok, ttfb_ok), UsageLog.ttfb_ms), else_=None)),
             func.sum(case((ok, UsageLog.completion_tokens), else_=0)),
             func.sum(case((ok, UsageLog.latency_ms), else_=0)),
         )
@@ -1540,6 +1943,64 @@ def _dashboard_from_raw(db: Session, days: int, granularity: str, platform: str,
     }
 
 
+@router.get("/rollup/status")
+def rollup_status(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """汇总表水位与一次性重建标记（排障用，只读）。"""
+    from admin import rollup as rollup_mod
+    from admin.models import SystemSetting
+
+    covered_from, covered_to = rollup_mod.coverage(db)
+    marker = db.get(SystemSetting, rollup_mod.REBUILD_MARKER)
+    return {"covered_from": covered_from.isoformat() + "Z" if covered_from else None,
+            "covered_to": covered_to.isoformat() + "Z" if covered_to else None,
+            "rebuild_marker": rollup_mod.REBUILD_MARKER,
+            "rebuilt_at": (marker.value if marker is not None else None)}
+
+
+@router.get("/db-health")
+def db_health(_: bool = Depends(require_admin)):
+    """数据库运行状况（只读，P7）：方言、连接池、SQLite 参数、`database is locked` 次数。
+
+    「锁升级失败被吞、这次用量就丢了」原来没有任何可观测入口；现在引擎层
+    `handle_error` 会计数并打 WARNING，这里能直接看到最近一次的时间和语句类型。
+    """
+    from admin import db as db_mod
+
+    stats = getattr(db_mod, "lock_error_stats", None)
+    return stats() if callable(stats) else {"available": False}
+
+
+@router.get("/retention")
+def retention_preview(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """数据保留策略预览（只读）：每张表按当前配置「将删除多少行」。
+
+    开关 `ADMIN_RETENTION_ENABLED=1` 打开后，后台每天最多执行一轮，
+    见 admin/retention.py。
+    """
+    from admin import retention
+
+    return retention.preview(db)
+
+
+@router.post("/rollup/rebuild")
+def rollup_rebuild(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """手动重建小时汇总表（幂等）。
+
+    只清「原表还在」的那段汇总、把水位退回；真正的重算由后台回填线程完成
+    （每轮 30 秒预算，5 分钟一轮），期间看板自动降级走原表，数字仍然正确。
+    重建后统计缓存会自然过期（TTL ≤ 60 秒）。
+    """
+    from admin import rollup as rollup_mod
+
+    result = rollup_mod.rebuild(db, reason="管理员手动触发")
+    try:
+        # 先补最近 2 秒能补的尾部，让看板尽快用回汇总表
+        rollup_mod.ensure_coverage(db, budget=2.0)
+    except Exception as exc:  # noqa: BLE001 - 补不完交给后台线程
+        logger.info("重建后的即时回填未完成（交给后台）：%s", exc)
+    return {"ok": True, **result}
+
+
 @router.get("/memory")
 def memory_stats(_: bool = Depends(require_admin)):
     """进程内存现状：RSS + 各内存缓存的实际条目数 / 上限。
@@ -1549,4 +2010,26 @@ def memory_stats(_: bool = Depends(require_admin)):
     或缩短 TTL，而不是继续往上堆。
     """
     from admin import process_memory
-    return process_memory.snapshot()
+    snap = process_memory.snapshot()
+    # 上游连接池观测（perf / gateway 线新增）：读失败不影响内存快照本身。
+    pools: dict = {}
+    try:
+        from admin import http_shared
+        pools["shared"] = http_shared.stats()
+    except Exception as exc:  # noqa: BLE001
+        pools["shared"] = {"error": str(exc)[:120]}
+    try:
+        from admin.platform.marvis.core import http_pool as _marvis_pool
+        if hasattr(_marvis_pool, "stats"):
+            pools["marvis"] = _marvis_pool.stats()
+    except Exception as exc:  # noqa: BLE001
+        pools["marvis"] = {"error": str(exc)[:120]}
+    # 第 4 轮：urllib 长连接池（Trae / CodeArts / Qoder，按平台一项；没用过的平台不出现）。
+    try:
+        from admin import http_keepalive
+        pools["urllib_keepalive"] = http_keepalive.stats()
+    except Exception as exc:  # noqa: BLE001
+        pools["urllib_keepalive"] = {"error": str(exc)[:120]}
+    if isinstance(snap, dict):
+        snap = {**snap, "upstream_pools": pools}
+    return snap

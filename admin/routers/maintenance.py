@@ -124,6 +124,11 @@ def backup(request: Request):
     if engine.dialect.name != "sqlite":
         logger.warning("备份被拒 数据库=%s 只有 sqlite 支持在线备份", engine.dialect.name)
         raise HTTPException(409, "当前数据库不支持页面在线备份，请使用数据库管理工具或 mysqldump 完成一致性备份")
+    # 备份文件含**全量账号凭据与 API Key**：必须二次确认才允许下载。
+    # 闸门放在 409 之后 —— MySQL 部署不会先弹确认框再告诉用户不支持。
+    from admin.export_guard import guard_secret_export
+
+    guard_secret_export(request, "db backup", True)
     fd, name = tempfile.mkstemp(prefix="workbuddy-backup-", suffix=".db")
     os.close(fd)
     path = Path(name)

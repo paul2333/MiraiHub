@@ -317,8 +317,11 @@ def run_growth_plan(db, *, budget_seconds=180, progress=None, now=None, lease=No
     try:
         from admin.scheduler import growth_eligible
         # 企业版没有成长计划，混进来只会每天白跑一轮
+        # 只巡检 WorkBuddy 账号（D2）：成长计划是 WorkBuddy 专属玩法
+        from admin.platform.workbuddy import scoping as wb_scope
         accounts = growth_eligible(
-            db.query(Account).filter(Account.status == "active").order_by(Account.id).all())
+            wb_scope.filter_workbuddy(db.query(Account).filter(Account.status == "active"))
+            .order_by(Account.id).all())
         cursor_state = _read(db, _CURSOR_KEY)
         cursor = _number(cursor_state.get("id"))
         outstanding = cursor_state.get("remaining") or []

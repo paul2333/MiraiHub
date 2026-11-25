@@ -52,6 +52,7 @@ PATHS = (
 
 PUBLIC = ka.PLATFORM
 STORAGE = ka.STORAGE
+#: 换号重试次数（换一个账号的票再试）。上游抖动不走这条，见 `_RETRY_BACKOFF`。
 MAX_ATTEMPTS = 2
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -289,7 +290,15 @@ def _call_once(db, request, key, body: dict, ref: client.ModelRef, protocol: str
     except client.UpstreamError as exc:
         if account is not None:
             shared.release(account)
-            if exc.kind in ("auth", "server", "rate_limit"):
+            # ⚠️ **只有「这个号的问题」才换号并记失败**。
+            #
+            # `server` / `network` 是上游整体抖动（实测 `500 internal_error
+            # upstream request failed` 是瞬时的，同一秒重试就通）——
+            # 对这类错误排除账号有两个坏处：
+            #   1. 只有 1 个号时，排除后就没候选了，白白把好号标脏；
+            #   2. 换号也没用，同一个上游换谁的票都一样 500。
+            # 所以这类交给 `_call()` 做**退避重试**，不在这里记失败。
+            if exc.kind in ("auth", "permission", "quota", "rate_limit"):
                 shared.note_failure(db, account, kind=exc.kind,
                                     detail=str(exc.message)[:200],
                                     status=exc.status, model=ref.id,
@@ -309,15 +318,40 @@ def _call_once(db, request, key, body: dict, ref: client.ModelRef, protocol: str
     return result
 
 
+#: 上游瞬时故障的退避序列（秒）。实测 `500 internal_error` 多半一次就过。
+_RETRY_BACKOFF = (0.0, 0.8, 2.0)
+
+
 def _call(db, request, key, body: dict, ref: client.ModelRef, protocol: str) -> dict:
+    """调上游，带**分类型重试**。
+
+    | 错误类型 | 处理 |
+    |---|---|
+    | `auth` / `permission` / `quota` / `rate_limit` | **换号**（换一个账号的票） |
+    | `server` / `network` / `protocol` | **原地退避重试**（同一个号，因为不是号的问题） |
+    | `no_account` | 直接抛（没有候选了） |
+
+    这条区分是 2026-11-20 修的：原来 `server` 也被当成「号的问题」，
+    只有 1 个号时排除掉就再也选不出来，于是「上游抖一下 → 整平台 500」。
+    """
     exclude: set[int] = set()
     last: client.UpstreamError | None = None
-    for _ in range(MAX_ATTEMPTS):
+    for attempt in range(len(_RETRY_BACKOFF)):
         try:
             return _call_once(db, request, key, body, ref, protocol, exclude)
         except client.UpstreamError as exc:
             last = exc
-            if exc.kind in ("no_account", "permission", "quota"):
+            if exc.kind == "no_account":
+                break
+            if exc.kind in ("server", "network", "protocol"):
+                # 上游抖动：退避后重试同一个号
+                delay = _RETRY_BACKOFF[attempt]
+                if delay:
+                    time.sleep(delay)
+                continue
+            # auth / permission / quota / rate_limit：换号再试（exclude 已在
+            # `_call_once` 里加过，下一轮会选到别的号）
+            if attempt >= 1:
                 break
     raise last or client.UpstreamError("上游不可用", status=502, kind="server")
 

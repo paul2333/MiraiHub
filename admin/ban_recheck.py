@@ -12,9 +12,12 @@
      * 现有探测（保活的 fetch_models、登录校验的 fetch_balance）打的都是
        余额/模型列表接口 —— 这些接口对风控号**常常照样放行**，探测「成功」
        证明不了「还能用模型」。
-2. 所以复核先真调余额/账号信息这两条已认证端点；任一成功就证明凭证仍
-   有效并自动恢复。只有两条都明确 401/403 才记录为登录态失效。可信探测
-   遇到网关/网络异常时，才退回一次最小模型请求作补充证据。
+2. 所以复核先真调余额/账号信息这两条已认证端点，确认「登录态还在」；
+   **解封必须以真实模型探测成功为准**（修复批次 3 · D7，审查 L-2）——
+   原实现只要余额/资料接口放行就解封，而这两个接口对风控号常常照样放行，
+   结果 11140 号每 30 分钟被解封一次、再被用户请求撞回去，反复上下线。
+   只有两条可信探测都明确 401/403 才记录为登录态失效。
+   `ADMIN_BAN_RECHECK_REQUIRE_MODEL=0` 可退回旧行为（可信探测通过即解封）。
 
 做什么
 ------
@@ -35,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -51,13 +55,25 @@ _backoff: dict[int, list] = {}
 _backoff_lock = threading.Lock()
 
 
+def _require_model_probe() -> bool:
+    """解封是否必须真实模型探测成功（默认是）。"""
+    raw = os.getenv("ADMIN_BAN_RECHECK_REQUIRE_MODEL", "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
 def _probe_model(db) -> str | None:
-    """挑探测用的模型：优先免费非图像模型，其次任一启用模型。"""
-    from admin.routers.models import _get_enabled_models, _get_free_models
-    free = _get_free_models(db)
+    """挑探测用的模型：优先免费非图像模型，其次任一启用模型。
+
+    只在 **WorkBuddy 自己的**模型清单里挑（D3）：原来跨平台取，可能挑中
+    Qoder 的 `dfmodel` / Marvis 的 `main-auto` 发给腾讯上游 —— 探测必然失败，
+    失败还会被当成「仍被风控」记退避。
+    """
+    from admin.platform.workbuddy import scoping as wb_scope
+
+    free = wb_scope.free_models(db, "workbuddy")
     if free:
         return sorted(free)[0]
-    enabled = _get_enabled_models(db)
+    enabled = wb_scope.enabled_models(db, "workbuddy")
     return sorted(enabled)[0] if enabled else None
 
 
@@ -294,8 +310,12 @@ def run_ban_recheck(db) -> dict:
                 "retry_after": max(1, POOL.waf.remaining()),
                 "summary": "出口保护期间暂停封号复核"}
 
+    from admin.platform.workbuddy import scoping as wb_scope
+
     now = datetime.utcnow()
-    rows = db.query(Account).all()
+    # 复核用的是 WorkBuddy 协议（`backend.AccountSession` + 11140 判据），
+    # 只看 WorkBuddy 账号（D2）；其它平台的登录态复核见 `_recheck_platform_auth`。
+    rows = wb_scope.filter_workbuddy(db.query(Account)).all()
     candidates = [(a, _should_probe(a, now)) for a in rows]
     candidates = [(a, why) for a, (yes, why) in candidates if yes]
 
@@ -316,17 +336,29 @@ def run_ban_recheck(db) -> dict:
 
             time.sleep(_humanize.human_gap(gap, floor=gap * 0.4))
             trusted = probe_trusted_auth(acc.auth_json)
-            if trusted["ok"]:
+            if trusted["ok"] and not _require_model_probe():
                 _clear_backoff(acc.id)
                 _unban(db, acc)
                 unbanned.append(f"#{acc.id}")
                 _logger.info("ban_recheck: trusted balance/profile probe restored id=%s uid=%s",
                              acc.id, (acc.uid or "")[:12])
                 continue
-            if trusted["kind"] == "transport":
+            if trusted["ok"]:
+                # 登录态确认还在，但这证明不了「还能用模型」（风控号的余额接口照样放行）。
+                # 解封以 1 token 的真实模型探测为准（D7）。
+                if not model:
+                    skipped += 1
+                    continue
+                result = probe_model_capability(acc.auth_json, acc.uid or "", model)
+                if not result["ok"] and result["kind"] != "account_fault":
+                    # 可信探测已证明凭证有效，模型路由的 401 / 网关错误属于不确定证据：
+                    # 不判登录态死亡、不记退避，本轮跳过。
+                    skipped += 1
+                    continue
+            elif trusted["kind"] == "transport":
                 skipped += 1
                 continue
-            if trusted["kind"] == "session_dead":
+            elif trusted["kind"] == "session_dead":
                 # The two authenticated probes are authoritative.  Do not let
                 # a model route that happens to return 200 override a pair of
                 # explicit 401/403 responses from the account's own endpoints.
@@ -375,11 +407,75 @@ def run_ban_recheck(db) -> dict:
         # transport / 其它瞬时故障：本轮白跑，不改任何状态、不计退避。
         skipped += 1
 
+    platform_restored = _recheck_platform_auth(db)
+
     summary = f"封号复核：解封 {len(unbanned)} 个，仍封 {len(still_banned)} 个"
     if dead:
         summary += f"，登录态失效 {dead} 个（待重登）"
     if skipped:
         summary += f"，{skipped} 个跳过"
+    if platform_restored:
+        summary += f"，其它平台登录态复核恢复 {len(platform_restored)} 个"
     return {"task": "ban_recheck", "ok": True,
             "unbanned": unbanned, "still_banned": still_banned,
-            "session_dead": dead, "skipped": skipped, "summary": summary}
+            "session_dead": dead, "skipped": skipped,
+            "platform_restored": platform_restored, "summary": summary}
+
+
+def _recheck_platform_auth(db, *, limit: int = 20) -> list[str]:
+    """非 WorkBuddy 平台「登录态被拒而自动停用」的号：用平台自己的健康检查复核（D7）。
+
+    只处理 `account_health.note_auth_failure` 停用的号（`cool_kind=session_dead`
+    且错误文案以 `AUTH_FAIL_PREFIX` 开头）—— 人工停用、其它原因停用的号一律不碰，
+    所以在各平台接入 `note_auth_failure` 之前这里不会改动任何现有数据。
+    健康检查通过即恢复 active；不通过保持现状（不加重处罚）。
+    每轮最多 `limit` 个；同一个号两次复核间隔按 `_record_banned` 的指数退避。
+    `ADMIN_BAN_RECHECK_PLATFORMS=0` 关闭。
+    """
+    raw = os.getenv("ADMIN_BAN_RECHECK_PLATFORMS", "1").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return []
+    from sqlalchemy import not_
+
+    from admin import account_health
+    from admin.models import Account
+    from admin.platform.workbuddy import scoping as wb_scope
+
+    restored: list[str] = []
+    try:
+        rows = (db.query(Account)
+                .filter(Account.status == "disabled", Account.cool_kind == "session_dead",
+                        not_(wb_scope.workbuddy_cond()))
+                .order_by(Account.id).all())
+    except Exception:  # noqa: BLE001 - 复核失败不影响主流程
+        _logger.exception("ban_recheck: 读取其它平台停用账号失败")
+        return []
+    checked = 0
+    for acc in rows:
+        if checked >= limit:
+            break
+        if not (acc.last_err_msg or "").startswith(account_health.AUTH_FAIL_PREFIX):
+            continue
+        if _probe_wait_seconds(acc.id) > 0:
+            continue
+        checked += 1
+        _record_banned(acc.id)   # 先记一次探测时间：失败时按指数退避，成功时下面清掉
+        try:
+            res = account_health.check_account(db, acc)
+        except Exception:  # noqa: BLE001
+            _logger.exception("ban_recheck: 平台健康检查异常 id=%s", acc.id)
+            continue
+        if not res.get("healthy"):
+            continue
+        acc.status = "active"
+        acc.cool_kind = ""
+        acc.cool_until = None
+        acc.session_dead_fails = 0
+        acc.last_err_at = None
+        acc.last_err_msg = ""
+        db.commit()
+        _clear_backoff(acc.id)
+        restored.append(f"#{acc.id}")
+        _logger.info("ban_recheck: 平台登录态复核通过，恢复 id=%s platform=%s",
+                     acc.id, acc.platform)
+    return restored

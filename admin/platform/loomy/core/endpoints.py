@@ -131,11 +131,25 @@ CRED_FILE = "auth-session.json"
 OPENCODE_CONFIG = "opencode/opencode.json"
 
 
-def auth_headers(token: str, version: str = "1.0.0") -> dict:
+def auth_headers(token: str, version: str = "") -> dict:
     """鉴权头。
 
     ⚠️ `traceparent` 缺失时上游不报错、**直接挂到超时** ——
     这类「静默挂死」最难查（源码注释里有实测记录）。
+
+    ## `loomy-version` / `User-Agent` 必须像客户端（2026-11-20）
+
+    官方客户端把 `loomy-version` 设成**自己真实的版本号**
+    （`utils/app-version.js`：`app.getVersion()`，当前安装是 `0.9.39`），
+    请求由 opencode 运行时（Bun 1.3.13）发出。
+
+    网关原来写死 `1.0.0` + 默认 UA（`Python-urllib/3.10`）—— 在上游看来
+    这是一个**不存在的客户端版本**、一个**非客户端运行时**，全部号还是
+    同一个出口 IP。风控侧最省事的判据就是这两条，且号一旦被标记，
+    表现是「模型目录里只剩 spark」（`no_provider_error`），
+    而不是登录失效 —— 与 2026-11-14 起 10 个号的实际遭遇完全一致。
+
+    所以这里改成：版本读本机客户端真值，UA 跟运行时一致，都可配置。
     """
     return {
         "Authorization": "Bearer " + token,
@@ -143,8 +157,102 @@ def auth_headers(token: str, version: str = "1.0.0") -> dict:
         "Accept": "application/json",
         "traceparent": "00-%s-%s-01" % (secrets.token_hex(16),
                                         secrets.token_hex(8)),
-        "loomy-version": version,
+        "loomy-version": version or client_version(),
+        "User-Agent": user_agent(),
+        "Accept-Encoding": "gzip, deflate",
     }
+
+
+#: 官方客户端版本号的兜底值（读不到安装目录时用）。
+#: 来源：`<安装目录>/resources/app.asar.unpacked/package.json` 的 `version`
+#: 或 `<configRoot>/opencode/last-app-version.txt`。
+FALLBACK_CLIENT_VERSION = "0.9.39"
+#: opencode 运行时的 Bun 版本（`resources/opencode/win32-x64/opencode.exe`
+#: 内嵌 `Bun/1.3.13`）。客户端发模型请求的就是它，UA 跟它对齐。
+FALLBACK_USER_AGENT = "Bun/1.3.13"
+
+_version_cache: dict = {"value": "", "at": 0.0}
+
+
+def _config_root_candidates() -> list:
+    """本机 Loomy 配置根：`%PUBLIC%\\Loomy\\<sha256(username)[:12]>`。
+
+    这里只做「找得到就用」，找不到不报错 —— 版本号只是风控告白的细节，
+    不该成为网关启动的硬依赖。
+    """
+    import hashlib
+    import os
+    import pathlib
+
+    roots = []
+    for key in ("PUBLIC", "ALLUSERSPROFILE"):
+        base = os.getenv(key) or ""
+        if not base:
+            continue
+        parent = pathlib.Path(base) / "Loomy"
+        if not parent.is_dir():
+            continue
+        try:
+            user = os.getlogin()
+        except Exception:  # noqa: BLE001 - 无控制台/服务账号下取不到
+            user = os.getenv("USERNAME") or ""
+        if user:
+            digest = hashlib.sha256(user.encode()).hexdigest()[:12]
+            roots.append(parent / digest)
+        try:
+            roots.extend(p for p in parent.iterdir() if p.is_dir())
+        except OSError:
+            pass
+    return roots
+
+
+def client_version() -> str:
+    """`loomy-version` 的真值：本机安装的客户端版本。
+
+    优先级：`ADMIN_LOOMY_CLIENT_VERSION` 环境变量 → 客户端自己写的
+    `opencode/last-app-version.txt` → `app.asar.unpacked/package.json`
+    → `FALLBACK_CLIENT_VERSION`。结果缓存 10 分钟（客户端升级后自动跟上）。
+    """
+    import json
+    import os
+    import time
+
+    now = time.time()
+    if _version_cache["value"] and now - _version_cache["at"] < 600:
+        return str(_version_cache["value"])
+
+    value = (os.getenv("ADMIN_LOOMY_CLIENT_VERSION") or "").strip()
+    if not value:
+        for root in _config_root_candidates():
+            stamp = root / "opencode" / "last-app-version.txt"
+            try:
+                text = stamp.read_text(encoding="utf-8").strip()
+            except OSError:
+                text = ""
+            if text and len(text) < 32:
+                value = text
+                break
+            pkg = (root.parent.parent / "resources" / "app.asar.unpacked"
+                   / "package.json")
+            try:
+                data = json.loads(pkg.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            version = str((data or {}).get("version") or "").strip()
+            if version:
+                value = version
+                break
+    value = value or FALLBACK_CLIENT_VERSION
+    _version_cache.update({"value": value, "at": now})
+    return value
+
+
+def user_agent() -> str:
+    """模型请求的 UA：默认与客户端运行时（Bun）一致，可被环境变量覆盖。"""
+    import os
+
+    return (os.getenv("ADMIN_LOOMY_USER_AGENT") or "").strip() \
+        or FALLBACK_USER_AGENT
 
 
 def points_headers(token: str) -> dict:
@@ -153,10 +261,11 @@ def points_headers(token: str) -> dict:
     ⚠️ 与 chat 链路不同：**只带 `token`**，不带 `Authorization`。
     实测带 Bearer 也能通，但官方只发这一个头，保持一致最稳。
     """
-    return {"token": token, "Accept": "application/json"}
+    return {"token": token, "Accept": "application/json",
+            "User-Agent": user_agent()}
 
 
-def chat_headers(token: str, version: str = "1.0.0", session_id: str = "") -> dict:
+def chat_headers(token: str, version: str = "", session_id: str = "") -> dict:
     """chat 链路的完整请求头：鉴权 + **归因头**。
 
     官方客户端（`utils/request-headers.js`）对每个模型请求都注入
