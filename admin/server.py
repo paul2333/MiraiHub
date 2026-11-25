@@ -1287,9 +1287,12 @@ def _startup():
             logger.exception("建表/迁移失败，先不发布就绪（降级模式继续运行）")
         if init_ok:
             # api_keys.key_full 旧 base64 → secret_box 密文（幂等；2026-11-24 第 3 轮）。
+            _migrate_key_full = getattr(keys, "migrate_key_full", None)
             try:
-                with SessionLocal() as _kdb:
-                    _moved = keys.migrate_key_full(_kdb)
+                _moved = 0
+                if _migrate_key_full is not None:
+                    with SessionLocal() as _kdb:
+                        _moved = _migrate_key_full(_kdb)
                 if _moved:
                     logger.warning("api_keys.key_full 已加密迁移 %d 条", _moved)
             except Exception:  # noqa: BLE001 - 迁移失败不挡启动，下次启动再试
